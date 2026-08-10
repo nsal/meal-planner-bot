@@ -217,6 +217,53 @@ def test_lambda_build_configuration() -> None:
     assert function_globals["Architectures"] == ["arm64"]
 
 
+def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
+    """Secrets enter Lambda through Secrets Manager references."""
+    template = _load_template()
+    parameters = template["Parameters"]
+    secret_parameters = {
+        "TelegramBotTokenSecretName",
+        "TelegramWebhookSecretName",
+        "LlmApiKeySecretName",
+    }
+
+    assert secret_parameters <= parameters.keys()
+    assert (
+        not {
+            "TelegramBotTokenParameter",
+            "TelegramWebhookSecretParameter",
+            "LlmApiKeyParameter",
+        }
+        & parameters.keys()
+    )
+    for parameter_name in secret_parameters:
+        assert parameters[parameter_name]["Type"] == "String"
+        assert "NoEcho" not in parameters[parameter_name]
+        assert "Default" not in parameters[parameter_name]
+
+    variables = template["Globals"]["Function"]["Environment"]["Variables"]
+    for variable_name in (
+        "TELEGRAM_BOT_TOKEN",
+        "LLM_API_KEY",
+    ):
+        dynamic_reference = variables[variable_name]
+        assert isinstance(dynamic_reference, list)
+        assert (
+            dynamic_reference[0]
+            == "{{resolve:secretsmanager:${SecretName}:SecretString}}"
+        )
+
+    assert "TELEGRAM_WEBHOOK_SECRET" not in variables
+    bot_variables = template["Resources"]["BotFunction"]["Properties"]
+    bot_variables = bot_variables["Environment"]["Variables"]
+    webhook_reference = bot_variables["TELEGRAM_WEBHOOK_SECRET"]
+    assert isinstance(webhook_reference, list)
+    assert (
+        webhook_reference[0]
+        == "{{resolve:secretsmanager:${SecretName}:SecretString}}"
+    )
+
+
 def test_python_314_project_contract() -> None:
     """Project metadata and static analysis target the deployment Python."""
     project = _load_project_metadata()

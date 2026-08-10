@@ -72,7 +72,7 @@
 
 - Build both Lambda functions from the repository root with SAM's uv build
   support so the application package and locked dependencies are included.
-- Keep only SSM SecureString parameter names in deploy configuration and use
+- Keep only Secrets Manager secret names in deploy configuration and use
   secure dynamic references for the Lambda environment.
 - Authenticate every webhook with Telegram's secret header before parsing or
   performing side effects.
@@ -140,7 +140,7 @@ confirmed edit -> confirmed / pending -> refresh grocery
 
 - **Implementation Steps**: Python code, tests, SAM configuration, acceptance
   checks, README updates, and plan tracking in this repository.
-- **Post-Completion**: create actual SecureString values, deploy a test stack,
+- **Post-Completion**: create actual Secrets Manager secrets, deploy a test stack,
   register the webhook secret with Telegram, manually exercise the bot, and
   link the implementation commit or PR from the GitHub issue.
 
@@ -179,19 +179,19 @@ confirmed edit -> confirmed / pending -> refresh grocery
 - Modify: `tests/test_bot_handler.py`
 - Modify: `tests/test_template.py`
 
-- [ ] add required webhook-secret configuration with non-empty validation
-- [ ] compare the case-insensitive API Gateway header value with
+- [x] add required webhook-secret configuration with non-empty validation
+- [x] compare the case-insensitive API Gateway header value with
   `hmac.compare_digest` before decoding the request body
-- [ ] return a controlled forbidden response without initializing AWS or LLM
+- [x] return a controlled forbidden response without initializing AWS or LLM
   clients when the secret is missing or incorrect
-- [ ] replace plain token/key parameters with SSM SecureString parameter-name
+- [x] replace plain token/key parameters with Secrets Manager secret-name
   inputs and secure dynamic references
-- [ ] add an SSM-backed parameter for the Telegram webhook secret
-- [ ] write tests for valid, missing, malformed, differently cased, and
+- [x] add a Secrets Manager-backed secret name for the Telegram webhook secret
+- [x] write tests for valid, missing, malformed, differently cased, and
   incorrect webhook-secret headers
-- [ ] write template tests proving no secret value is accepted as a plain
+- [x] write template tests proving no secret value is accepted as a plain
   CloudFormation parameter
-- [ ] run the focused config, handler, and template tests before Task 3
+- [x] run the focused config, handler, and template tests before Task 3
 
 ### Task 3: Enforce clean domain and LLM-output invariants
 
@@ -421,7 +421,7 @@ confirmed edit -> confirmed / pending -> refresh grocery
   to `docs/plans/completed/`
 
 - [ ] document architecture, prerequisites, uv setup, and local test commands
-- [ ] document all environment variables, SSM SecureString parameters, and
+- [ ] document all environment variables, Secrets Manager secret names, and
   safe secret-rotation steps
 - [ ] document SAM validation, build, deployment, and rollback commands
 - [ ] document Telegram webhook registration with `secret_token`
@@ -441,8 +441,8 @@ confirmed edit -> confirmed / pending -> refresh grocery
 
 ### Manual verification
 
-- Create the bot token, LLM key, and webhook secret as SSM SecureStrings in a
-  non-production AWS account.
+- Create the bot token, LLM key, and webhook secret as Secrets Manager secrets
+  in a non-production AWS account.
 - Deploy a dedicated feature branch through a pull request; never push or
   merge directly to `master`.
 - Register the deployed webhook URL and matching `secret_token` with Telegram.
@@ -455,7 +455,7 @@ confirmed edit -> confirmed / pending -> refresh grocery
 
 ### External system updates
 
-- Store SSM parameters using the names supplied to the SAM stack.
+- Store Secrets Manager secrets using the names supplied to the SAM stack.
 - Update the Telegram webhook after deployment.
 - Link the final conventional commit or draft PR from the associated GitHub
   issue and summarize completed remediation there.

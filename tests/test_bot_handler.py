@@ -5,6 +5,8 @@ import json
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from meal_planner.bot_handler import BotHandler, lambda_handler
 from meal_planner.models.schemas import (
     FamilyMember,
@@ -416,7 +418,11 @@ def test_lambda_handler_b64_and_json(mocker: Any, mock_env: None) -> None:
         json.dumps(update_payload).encode("utf-8")
     ).decode("utf-8")
 
-    event = {"isBase64Encoded": True, "body": b64_body}
+    event = {
+        "isBase64Encoded": True,
+        "body": b64_body,
+        "headers": {"X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret"},
+    }
     res = lambda_handler(event, None)
 
     assert res == {"statusCode": 200, "body": "ok"}
@@ -424,9 +430,71 @@ def test_lambda_handler_b64_and_json(mocker: Any, mock_env: None) -> None:
 
 
 def test_lambda_handler_invalid_json(mocker: Any) -> None:
-    event = {"body": "invalid json{"}
+    mocker.patch.dict(
+        "os.environ", {"TELEGRAM_WEBHOOK_SECRET": "test-webhook-secret"}
+    )
+    event = {
+        "body": "invalid json{",
+        "headers": {"X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret"},
+    }
     res = lambda_handler(event, None)
     assert res == {"statusCode": 200, "body": "ok"}
+
+
+def test_lambda_handler_accepts_case_insensitive_secret_header(
+    mocker: Any, mock_env: None
+) -> None:
+    """Header names are accepted regardless of API Gateway casing."""
+    mocker.patch("boto3.resource")
+    mocker.patch("boto3.client")
+    mock_bot_handler = mocker.patch("meal_planner.bot_handler.BotHandler")
+    instance = MagicMock()
+    instance.handle_update.return_value = {"statusCode": 200, "body": "ok"}
+    mock_bot_handler.return_value = instance
+
+    update_payload = {"update_id": 1}
+    event = {
+        "body": json.dumps(update_payload),
+        "headers": {"x-telegram-bot-api-secret-token": "test-webhook-secret"},
+    }
+
+    result = lambda_handler(event, None)
+
+    assert result == {"statusCode": 200, "body": "ok"}
+    instance.handle_update.assert_called_once_with(update_payload)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"X-Telegram-Bot-Api-Secret-Token": ["test-webhook-secret"]},
+        {"X-Telegram-Bot-Api-Secret-Token": "é"},
+        {"X-Telegram-Bot-Api-Secret-Token": "wrong-secret"},
+    ],
+)
+def test_lambda_handler_rejects_invalid_webhook_headers(
+    mocker: Any, mock_env: None, headers: dict[str, Any]
+) -> None:
+    """Invalid secrets are forbidden before body decoding or client setup."""
+    decode = mocker.patch("base64.b64decode")
+    resource = mocker.patch("boto3.resource")
+    client = mocker.patch("boto3.client")
+    webhook_secret = mocker.patch(
+        "meal_planner.bot_handler.get_webhook_secret",
+        return_value="test-webhook-secret",
+    )
+
+    result = lambda_handler(
+        {"isBase64Encoded": True, "body": "not-base64", "headers": headers},
+        None,
+    )
+
+    assert result == {"statusCode": 403, "body": "forbidden"}
+    decode.assert_not_called()
+    resource.assert_not_called()
+    client.assert_not_called()
+    webhook_secret.assert_called()
 
 
 # ---------------------------------------------------------------------------

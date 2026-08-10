@@ -96,7 +96,9 @@ def test_generate_plan_exception_handling(mocker: Any) -> None:
     assert "an error occurred" in mock_api.send_message.call_args[0][1]
 
 
-def test_lambda_handler(mocker: Any, mock_env: None) -> None:
+def test_lambda_handler(mocker: Any, mock_env: None, monkeypatch: Any) -> None:
+    """Planner initialization does not require the bot webhook secret."""
+    monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET", raising=False)
     mocker.patch("boto3.resource")
 
     mock_planner = mocker.patch("meal_planner.planner_handler.PlannerHandler")

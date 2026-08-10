@@ -10,14 +10,15 @@ Parameters:
     AllowedValues:
       - dev
       - prod
-  TelegramBotToken:
+  TelegramBotTokenSecretName:
     Type: String
-    NoEcho: true
-    Description: Telegram Bot Token from BotFather
-  LlmApiKey:
+    Description: Secrets Manager secret name for the Telegram Bot Token
+  TelegramWebhookSecretName:
     Type: String
-    NoEcho: true
-    Description: API Key for LiteLLM provider
+    Description: Secrets Manager secret name for the Telegram webhook secret
+  LlmApiKeySecretName:
+    Type: String
+    Description: Secrets Manager secret name for the LiteLLM API key
   LlmModel:
     Type: String
     Default: gpt-4o-mini
@@ -33,8 +34,12 @@ Globals:
     Environment:
       Variables:
         DYNAMODB_TABLE_NAME: !Ref MealPlannerTable
-        TELEGRAM_BOT_TOKEN: !Ref TelegramBotToken
-        LLM_API_KEY: !Ref LlmApiKey
+        TELEGRAM_BOT_TOKEN: !Sub
+          - '{{resolve:secretsmanager:${SecretName}:SecretString}}'
+          - SecretName: !Ref TelegramBotTokenSecretName
+        LLM_API_KEY: !Sub
+          - '{{resolve:secretsmanager:${SecretName}:SecretString}}'
+          - SecretName: !Ref LlmApiKeySecretName
         LLM_MODEL: !Ref LlmModel
 
 Resources:
@@ -67,6 +72,9 @@ Resources:
       Environment:
         Variables:
           PLANNER_FUNCTION_NAME: !Ref PlannerFunction
+          TELEGRAM_WEBHOOK_SECRET: !Sub
+            - '{{resolve:secretsmanager:${SecretName}:SecretString}}'
+            - SecretName: !Ref TelegramWebhookSecretName
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref MealPlannerTable

@@ -1,6 +1,7 @@
 """AWS Lambda entry point for Telegram bot webhook commands and routing."""
 
 import base64
+import hmac
 import json
 import logging
 import os
@@ -8,8 +9,9 @@ from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 import boto3  # type: ignore[import-untyped]
+from pydantic import ValidationError
 
-from meal_planner.config import get_settings
+from meal_planner.config import get_settings, get_webhook_secret
 from meal_planner.db.dynamo import DynamoRepository
 from meal_planner.llm.client import LLMClient
 from meal_planner.llm.parser import parse_conversational_response
@@ -27,6 +29,37 @@ from meal_planner.router import RouteResult, RouteType, route_update
 from meal_planner.telegram.api import TelegramAPI
 
 logger = logging.getLogger(__name__)
+
+WEBHOOK_SECRET_HEADER = "x-telegram-bot-api-secret-token"
+
+
+def _webhook_secret_is_valid(event: dict[str, Any]) -> bool:
+    """Validate the Telegram webhook secret before processing an event."""
+    try:
+        expected_secret = get_webhook_secret()
+    except ValidationError:
+        return False
+
+    headers = event.get("headers")
+    if not expected_secret or not isinstance(headers, dict):
+        return False
+
+    provided_secret: str | None = None
+    for header_name, header_value in headers.items():
+        if (
+            isinstance(header_name, str)
+            and header_name.lower() == WEBHOOK_SECRET_HEADER
+            and isinstance(header_value, str)
+        ):
+            provided_secret = header_value
+            break
+
+    if not provided_secret:
+        return False
+    try:
+        return hmac.compare_digest(provided_secret, expected_secret)
+    except TypeError:
+        return False
 
 
 class BotHandler:
@@ -402,6 +435,9 @@ class BotHandler:
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Lambda entry point for API Gateway HTTP API events."""
+    if not _webhook_secret_is_valid(event):
+        return {"statusCode": 403, "body": "forbidden"}
+
     body_str = event.get("body", "")
     if event.get("isBase64Encoded"):
         body_str = base64.b64decode(body_str).decode("utf-8")

@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     @classmethod
     def validate_non_empty(cls, v: str, info: ValidationInfo) -> str:
         """Validate that required fields are not empty."""
-        if not v:
+        if not v.strip():
             raise ValueError(f"{info.field_name} must not be empty")
         return v
 
@@ -52,6 +52,35 @@ class Settings(BaseSettings):
         return self.aws_region
 
 
+class WebhookSettings(BaseSettings):
+    """Webhook authentication settings loaded from environment variables."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+        populate_by_name=True,
+    )
+
+    telegram_webhook_secret: str = Field(
+        default="", alias="TELEGRAM_WEBHOOK_SECRET"
+    )
+
+    @field_validator("telegram_webhook_secret")
+    @classmethod
+    def validate_non_empty(cls, v: str) -> str:
+        """Validate that the webhook secret is not empty."""
+        if not v.strip():
+            raise ValueError("telegram_webhook_secret must not be empty")
+        return v
+
+
 def get_settings() -> Settings:
     """Return an instance of Settings."""
     return Settings()
+
+
+def get_webhook_secret() -> str:
+    """Return the configured webhook secret without loading other settings."""
+    return WebhookSettings().telegram_webhook_secret
