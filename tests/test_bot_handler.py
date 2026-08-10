@@ -286,16 +286,15 @@ def test_handle_callback_malformed_day(mocker: Any) -> None:
     handler = BotHandler(repo=mock_repo, telegram_api=mock_api)
 
     malformed_payloads = [
-        "checkin:abc:lunch:cooked",   # non-integer day
-        "checkin::lunch:cooked",      # empty day
-        "checkin:1.5:lunch:cooked",   # float string
+        "checkin:abc:lunch:cooked",  # non-integer day
+        "checkin::lunch:cooked",  # empty day
+        "checkin:1.5:lunch:cooked",  # float string
     ]
     for payload in malformed_payloads:
         handler.handle_update(make_update(callback_data=payload))
 
     mock_repo.update_meal_status.assert_not_called()
     mock_api.send_message.assert_not_called()
-
 
 
 def test_conversational_log_meal_intent(mocker: Any) -> None:

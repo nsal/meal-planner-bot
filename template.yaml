@@ -27,8 +27,9 @@ Globals:
   Function:
     Timeout: 30
     MemorySize: 256
-    Runtime: python3.12
-    Architecture: x86_64
+    Runtime: python3.14
+    Architectures:
+      - arm64
     Environment:
       Variables:
         DYNAMODB_TABLE_NAME: !Ref MealPlannerTable
@@ -55,9 +56,11 @@ Resources:
 
   BotFunction:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: python-uv
     Properties:
       FunctionName: !Sub ${AWS::StackName}-bot
-      CodeUri: src/
+      CodeUri: ./
       Handler: meal_planner.bot_handler.lambda_handler
       Timeout: 30
       MemorySize: 256
@@ -78,9 +81,11 @@ Resources:
 
   PlannerFunction:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: python-uv
     Properties:
       FunctionName: !Sub ${AWS::StackName}-planner
-      CodeUri: src/
+      CodeUri: ./
       Handler: meal_planner.planner_handler.lambda_handler
       Timeout: 120
       MemorySize: 512

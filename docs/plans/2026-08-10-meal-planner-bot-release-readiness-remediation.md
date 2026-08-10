@@ -12,7 +12,7 @@
 
 ## Context (from discovery)
 
-- The project is a Python 3.12 Telegram bot deployed through AWS SAM as a bot
+- The project is a Python 3.14 Telegram bot deployed through AWS SAM as a bot
   Lambda and an asynchronous planner Lambda.
 - Runtime code lives under `src/meal_planner/`; tests use pytest, moto, and
   mocks under `tests/`.
@@ -151,20 +151,23 @@ confirmed edit -> confirmed / pending -> refresh grocery
 **Files:**
 - Modify: `template.yaml`
 - Modify: `pyproject.toml` if SAM uv build metadata requires it
+- Create: `meal_planner/__init__.py` for the repository-root SAM artifact
 - Create: `tests/test_template.py`
 
-- [ ] configure both functions to use a build context containing
+- [x] configure both functions to use a build context containing
   `pyproject.toml`, `uv.lock`, and `src/meal_planner`
-- [ ] configure SAM's Python uv build method without duplicating dependency
+- [x] configure SAM's Python uv build method without duplicating dependency
   manifests
-- [ ] preserve importable `meal_planner.bot_handler` and
+- [x] preserve importable `meal_planner.bot_handler` and
   `meal_planner.planner_handler` handler paths in built artifacts
-- [ ] write static template tests for both functions' build configuration
-- [ ] write build-artifact smoke tests that import both Lambda handlers
-- [ ] run `uv run pytest tests/test_template.py` and make it pass
-- [ ] run `uvx aws-sam-cli validate --template-file template.yaml`
-- [ ] run `uvx aws-sam-cli build` and verify both artifacts include runtime
-  dependencies before Task 2
+- [x] write static template tests for both functions' build configuration
+- [x] write build-artifact smoke tests that import both Lambda handlers
+- [x] run `uv run pytest tests/test_template.py` and make it pass
+- [x] align the functions with the Python 3.14 ARM64 deployment contract
+- [x] run `uvx --from aws-sam-cli sam validate --template-file template.yaml
+  --region us-east-1`
+- [x] run `uvx --from aws-sam-cli sam build --beta-features` and verify both
+  artifacts include runtime dependencies before Task 2
 
 ### Task 2: Authenticate webhooks and secure deployment parameters
 
@@ -399,8 +402,10 @@ confirmed edit -> confirmed / pending -> refresh grocery
 - [ ] run `uv run ruff check .` and confirm it passes
 - [ ] run `uv run ruff format --check .` and confirm it passes
 - [ ] run `uv run mypy` and confirm strict typing passes
-- [ ] run `uvx aws-sam-cli validate --lint` and `uvx aws-sam-cli build`
-- [ ] smoke-import both built Lambda handlers with the Python 3.12 runtime
+- [ ] run `uvx --from aws-sam-cli sam validate --lint --region us-east-1` and
+  `uvx --from aws-sam-cli sam build --beta-features`
+- [x] smoke-import both built Lambda handlers with the Linux ARM64 Python 3.14
+  runtime using `REQUIRE_SAM_ARTIFACTS=1 uv run pytest tests/test_template.py`
 - [ ] mark the corresponding original-plan acceptance items complete only
   after their evidence is verified
 

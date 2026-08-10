@@ -3,7 +3,7 @@ name = "meal-planner-bot"
 version = "0.1.0"
 description = "Telegram-based family meal planning assistant powered by LLM"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14,<3.15"
 dependencies = [
     "aiogram>=3.17.0",
     "litellm>=1.60.0",
@@ -34,13 +34,13 @@ asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 line-length = 80
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.14"
 files = ["src"]
 mypy_path = "src"
 explicit_package_bases = true
@@ -49,4 +49,3 @@ disallow_untyped_defs = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/meal_planner"]
-

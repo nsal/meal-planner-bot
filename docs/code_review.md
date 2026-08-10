@@ -28,11 +28,13 @@ raw_response = asyncio.run(client.chat(system_prompt, route.text))
 ```python
 import asyncio
 
+
 def _run_async(coro):  # type: ignore[type-arg]
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
             import concurrent.futures
+
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 return pool.submit(asyncio.run, coro).result()
         return loop.run_until_complete(coro)
@@ -58,6 +60,7 @@ user runs `/today` on Wednesday, they still see Monday's meals.
 select the matching `PlanDay`:
 ```python
 from datetime import date
+
 week_start = date.fromisoformat(plan.week_start)
 day_offset = (date.today() - week_start).days + 1  # 1-based
 today_plan = next(
@@ -196,7 +199,7 @@ lowercase name. Remove them or pick one convention.
 **File:** [`llm/client.py:26`](file:///Users/nikolaysalionov/code/meal-planner-bot/src/meal_planner/llm/client.py#L26)
 
 ```python
-initial_backoff: float = 0.01,
+initial_backoff: float = (0.01,)
 ```
 
 This is a test-friendly default but not a real production default. For

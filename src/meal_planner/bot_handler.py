@@ -185,9 +185,7 @@ class BotHandler:
             )
         self.telegram_api.send_message(chat_id, "\n".join(lines))
 
-    def _cmd_submit_meals(
-        self, chat_id: int | str, user_id: str
-    ) -> None:
+    def _cmd_submit_meals(self, chat_id: int | str, user_id: str) -> None:
         plan = self.repo.get_current_plan(user_id)
         if not plan or not plan.days:
             self.telegram_api.send_message(
@@ -218,7 +216,7 @@ class BotHandler:
                 )
                 if matched is not None:
                     return matched
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             pass
         return plan.days[0]
 
