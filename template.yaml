@@ -1,0 +1,103 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Meal Planner Bot - Telegram family meal planning assistant powered by LLM.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+  TelegramBotToken:
+    Type: String
+    NoEcho: true
+    Description: Telegram Bot Token from BotFather
+  LlmApiKey:
+    Type: String
+    NoEcho: true
+    Description: API Key for LiteLLM provider
+  LlmModel:
+    Type: String
+    Default: gpt-4o-mini
+    Description: LiteLLM model identifier
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: python3.12
+    Architecture: x86_64
+    Environment:
+      Variables:
+        DYNAMODB_TABLE_NAME: !Ref MealPlannerTable
+        TELEGRAM_BOT_TOKEN: !Ref TelegramBotToken
+        LLM_API_KEY: !Ref LlmApiKey
+        LLM_MODEL: !Ref LlmModel
+
+Resources:
+  MealPlannerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  BotFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-bot
+      CodeUri: src/
+      Handler: meal_planner.bot_handler.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          PLANNER_FUNCTION_NAME: !Ref PlannerFunction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MealPlannerTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PlannerFunction
+      Events:
+        TelegramWebhook:
+          Type: HttpApi
+          Properties:
+            Path: /webhook
+            Method: post
+
+  PlannerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-planner
+      CodeUri: src/
+      Handler: meal_planner.planner_handler.lambda_handler
+      Timeout: 120
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MealPlannerTable
+
+Outputs:
+  WebhookUrl:
+    Description: Telegram Webhook URL to configure in setWebhook
+    Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/webhook
+  MealPlannerTableName:
+    Description: DynamoDB Table Name
+    Value: !Ref MealPlannerTable
+  BotFunctionName:
+    Description: Bot Lambda Function Name
+    Value: !Ref BotFunction
+  PlannerFunctionName:
+    Description: Planner Lambda Function Name
+    Value: !Ref PlannerFunction
