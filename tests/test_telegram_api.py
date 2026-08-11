@@ -7,6 +7,7 @@ from urllib.error import HTTPError, URLError
 import pytest
 from pytest_mock import MockerFixture
 
+from meal_planner.models.schemas import MealOutcome, MealType
 from meal_planner.telegram.api import (
     TelegramAPI,
     TelegramAPIError,
@@ -95,6 +96,33 @@ def test_plan_and_checkin_use_safe_text_and_specific_week(
         f"checkin:{plan.week_start_date}:1:lunch:cooked"
     )
     assert len(callback["callback_data"].encode()) <= 64
+
+
+def test_maximum_valid_plan_fits_one_notification(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+    plan = make_plan()
+    template_meal = plan.days[0].meals[0]
+    for day in plan.days:
+        day.meals = [
+            template_meal.model_copy(
+                update={
+                    "meal_type": MealType.BREAKFAST,
+                    "name": "x" * 100,
+                    "est_calories": 10_000,
+                    "outcome": MealOutcome.SKIPPED,
+                }
+            )
+            for _ in range(4)
+        ]
+
+    TelegramAPI("token").send_plan(1, plan)
+
+    assert urlopen.call_count == 1
 
 
 def test_answer_callback_query(mocker: MockerFixture) -> None:

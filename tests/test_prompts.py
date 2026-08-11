@@ -72,6 +72,7 @@ def test_build_plan_prompt_empty() -> None:
     assert "General profile" in prompt
     assert "2000 kcal/day" in prompt
     assert "Week Start Date: 2026-08-10" in prompt
+    assert "at most four meals per day" in prompt
     assert "OUTPUT JSON SCHEMA" in prompt
 
 

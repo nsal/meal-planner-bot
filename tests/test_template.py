@@ -22,14 +22,17 @@ class CloudFormationLoader(yaml.SafeLoader):
 
 
 def _construct_intrinsic(
-    loader: yaml.SafeLoader, _tag_suffix: str, node: yaml.nodes.Node
+    loader: yaml.SafeLoader, tag_suffix: str, node: yaml.nodes.Node
 ) -> Any:
     """Load an intrinsic value without interpreting its CloudFormation tag."""
     if isinstance(node, yaml.nodes.ScalarNode):
-        return loader.construct_scalar(node)
-    if isinstance(node, yaml.nodes.SequenceNode):
-        return loader.construct_sequence(node)
-    return loader.construct_mapping(node)
+        value: Any = loader.construct_scalar(node)
+    elif isinstance(node, yaml.nodes.SequenceNode):
+        value = loader.construct_sequence(node)
+    else:
+        value = loader.construct_mapping(node)
+    intrinsic_name = "Ref" if tag_suffix == "Ref" else f"Fn::{tag_suffix}"
+    return {intrinsic_name: value}
 
 
 CloudFormationLoader.add_multi_constructor("!", _construct_intrinsic)
@@ -179,6 +182,51 @@ def _contains_text(value: object, needle: str) -> bool:
     return False
 
 
+def _normalize_build_template(value: object) -> object:
+    """Normalize only SAM's generated function CodeUri values."""
+    if isinstance(value, dict):
+        return {
+            key: "<generated CodeUri>"
+            if key == "CodeUri"
+            else _normalize_build_template(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_normalize_build_template(item) for item in value]
+    return value
+
+
+def _first_template_difference(
+    expected: object, actual: object, path: str = "$"
+) -> str | None:
+    """Return a path for the first deep template mismatch."""
+    if type(expected) is not type(actual):
+        return path
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        keys = list(dict.fromkeys([*expected.keys(), *actual.keys()]))
+        for key in keys:
+            child_path = f"{path}.{key}"
+            if key not in expected or key not in actual:
+                return child_path
+            difference = _first_template_difference(
+                expected[key], actual[key], child_path
+            )
+            if difference:
+                return difference
+        return None
+    if isinstance(expected, list) and isinstance(actual, list):
+        if len(expected) != len(actual):
+            return path
+        for index, (left, right) in enumerate(zip(expected, actual)):
+            difference = _first_template_difference(
+                left, right, f"{path}[{index}]"
+            )
+            if difference:
+                return difference
+        return None
+    return None if expected == actual else path
+
+
 def _assert_built_template_is_current() -> None:
     """Verify the generated template reflects the checked-in template."""
     built_template_path = BUILD_ROOT / "template.yaml"
@@ -190,26 +238,12 @@ def _assert_built_template_is_current() -> None:
     assert isinstance(built_template, dict)
 
     source_template = _load_template()
-    source_globals = source_template["Globals"]["Function"]
-    built_globals = built_template["Globals"]["Function"]
-    assert built_globals["Runtime"] == source_globals["Runtime"]
-    assert built_globals["Architectures"] == source_globals["Architectures"]
-    assert (
-        built_template["Parameters"].keys()
-        == source_template["Parameters"].keys()
-    )
+    normalized_source = _normalize_build_template(source_template)
+    normalized_built = _normalize_build_template(built_template)
+    difference = _first_template_difference(normalized_source, normalized_built)
+    assert difference is None, f"SAM template differs at {difference}"
 
-    for logical_id in ("BotFunction", "PlannerFunction"):
-        source_resource = source_template["Resources"][logical_id]
-        built_resource = built_template["Resources"][logical_id]
-        assert (
-            built_resource["Properties"]["Handler"]
-            == source_resource["Properties"]["Handler"]
-        )
-        assert (
-            built_resource["Metadata"]["BuildMethod"]
-            == source_resource["Metadata"]["BuildMethod"]
-        )
+    built_globals = built_template["Globals"]["Function"]
 
     built_global_variables = built_globals["Environment"]["Variables"]
     for variable_name, parameter_name in (
@@ -304,10 +338,76 @@ def test_lambda_build_configuration() -> None:
     assert function_globals["Runtime"] == "python3.14"
     assert function_globals["Architectures"] == ["arm64"]
     variables = function_globals["Environment"]["Variables"]
-    assert variables["TELEGRAM_REQUEST_TIMEOUT_SECONDS"] == "10"
-    assert variables["LLM_REQUEST_TIMEOUT_SECONDS"] == "20"
-    assert variables["LLM_MAX_RETRIES"] == "3"
-    assert variables["LLM_INITIAL_BACKOFF_SECONDS"] == "1"
+    assert "TELEGRAM_REQUEST_TIMEOUT_SECONDS" not in variables
+    assert "LLM_REQUEST_TIMEOUT_SECONDS" not in variables
+    assert "LLM_MAX_RETRIES" not in variables
+    assert "LLM_INITIAL_BACKOFF_SECONDS" not in variables
+    bot_variables = resources["BotFunction"]["Properties"]["Environment"][
+        "Variables"
+    ]
+    assert bot_variables["BOT_FUNCTION_TIMEOUT_SECONDS"] == "30"
+    assert bot_variables["BOT_LLM_MAX_RETRIES"] == "2"
+    planner_variables = resources["PlannerFunction"]["Properties"][
+        "Environment"
+    ]["Variables"]
+    assert planner_variables["PLANNER_FUNCTION_TIMEOUT_SECONDS"] == "120"
+    assert planner_variables["PLANNER_LLM_MAX_RETRIES"] == "3"
+    for function_variables in (bot_variables, planner_variables):
+        assert function_variables["SECRET_REFRESH_TOKEN"] == {
+            "Ref": "SecretRefreshToken"
+        }
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("Properties.Timeout", 31),
+        ("Properties.MemorySize", 257),
+        ("Properties.Environment.Variables.EXTRA", "stale"),
+        ("Properties.Events", {}),
+        ("Properties.Policies", []),
+    ],
+)
+def test_template_difference_helper_reports_deploy_fields(
+    path: str, value: object
+) -> None:
+    source: dict[str, Any] = {
+        "Resources": {
+            "Function": {
+                "Properties": {
+                    "CodeUri": "./",
+                    "Timeout": 30,
+                    "MemorySize": 256,
+                    "Environment": {"Variables": {}},
+                    "Events": {"Webhook": {"Type": "HttpApi"}},
+                    "Policies": [{"Allow": "read"}],
+                }
+            }
+        }
+    }
+    built = yaml.safe_load(yaml.safe_dump(source))
+    target: dict[str, Any] = built["Resources"]["Function"]
+    if path == "Properties.Environment.Variables.EXTRA":
+        target["Properties"]["Environment"]["Variables"]["EXTRA"] = value
+    else:
+        target["Properties"][path.removeprefix("Properties.")] = value
+    assert (
+        _first_template_difference(
+            _normalize_build_template(source), _normalize_build_template(built)
+        )
+        is not None
+    )
+
+
+def test_template_normalization_allows_generated_code_uri_only() -> None:
+    source = {"Resources": {"Function": {"Properties": {"CodeUri": "./"}}}}
+    built = {"Resources": {"Function": {"Properties": {"CodeUri": "Fn"}}}}
+    assert (
+        _first_template_difference(
+            _normalize_build_template(source), _normalize_build_template(built)
+        )
+        is None
+    )
 
 
 def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
@@ -319,6 +419,8 @@ def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
         "TelegramWebhookSecretName",
         "LlmApiKeySecretName",
     }
+    assert parameters["SecretRefreshToken"]["Type"] == "String"
+    assert "Default" not in parameters["SecretRefreshToken"]
 
     assert secret_parameters <= parameters.keys()
     assert (
@@ -335,11 +437,14 @@ def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
         assert "Default" not in parameters[parameter_name]
 
     variables = template["Globals"]["Function"]["Environment"]["Variables"]
+    assert variables["SECRET_REFRESH_TOKEN"] == {"Ref": "SecretRefreshToken"}
     for variable_name in (
         "TELEGRAM_BOT_TOKEN",
         "LLM_API_KEY",
     ):
         dynamic_reference = variables[variable_name]
+        assert isinstance(dynamic_reference, dict)
+        dynamic_reference = dynamic_reference["Fn::Sub"]
         assert isinstance(dynamic_reference, list)
         assert (
             dynamic_reference[0]
@@ -350,6 +455,8 @@ def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
     bot_variables = template["Resources"]["BotFunction"]["Properties"]
     bot_variables = bot_variables["Environment"]["Variables"]
     webhook_reference = bot_variables["TELEGRAM_WEBHOOK_SECRET"]
+    assert isinstance(webhook_reference, dict)
+    webhook_reference = webhook_reference["Fn::Sub"]
     assert isinstance(webhook_reference, list)
     assert (
         webhook_reference[0]

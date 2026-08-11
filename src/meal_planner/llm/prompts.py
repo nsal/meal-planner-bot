@@ -140,6 +140,7 @@ def build_plan_prompt(
         "Generate a 7-day meal plan based on the profile below.\n\n"
         "=== REQUIREMENTS ===\n"
         f"Week Start Date: {week_start}\n"
+        "Include at most four meals per day.\n"
         f"Profile & Constraints:\n{profile_text}\n\n"
         f"Recent Meal History (avoid repeating):\n{history_text}\n\n"
         f"Previous Plan Feedback:\n{prev_plan_text}\n\n"

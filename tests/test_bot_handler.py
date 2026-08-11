@@ -139,6 +139,82 @@ def test_profile_update_rejects_invalid_targets_and_reports_db_failure(
     assert failed.message and "save" in failed.message
 
 
+def test_incomplete_complete_looking_profile_is_saved_as_draft(
+    handler: BotHandler,
+) -> None:
+    handler.repo.get_profile_draft.return_value = ProfileUpdateEntities()
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.UPDATE_PROFILE,
+        {
+            "name": "Alex",
+            "people_count": 2,
+            "family_members": [{"name": "Alex", "calorie_target": 2000}],
+            "allergies": [],
+            "dietary_preferences": [],
+            "restrictions": [],
+            "goals": [],
+        },
+        None,
+    )
+    assert result.success
+    assert result.message and "one name" in result.message
+    handler.repo.save_profile_draft.assert_called_once()
+    handler.repo.save_profile.assert_not_called()
+
+
+def test_existing_profile_size_change_accumulates_replacement_members(
+    handler: BotHandler,
+) -> None:
+    existing = make_profile()
+    handler.repo.get_profile_draft.return_value = None
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.UPDATE_PROFILE,
+        {
+            "people_count": 3,
+            "family_members": [
+                {"name": "Alex", "calorie_target": 2000},
+                {"name": "Sam", "calorie_target": 1800},
+                {"name": "Lee", "calorie_target": 1600},
+            ],
+        },
+        existing,
+    )
+    assert result.success
+    saved = handler.repo.save_profile.call_args.args[1]
+    assert saved.people_count == 3
+    assert [member.name for member in saved.family_members] == [
+        "Alex",
+        "Sam",
+        "Lee",
+    ]
+
+
+def test_existing_profile_same_size_update_preserves_members(
+    handler: BotHandler,
+) -> None:
+    existing = make_profile()
+    handler.repo.get_profile_draft.return_value = None
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.UPDATE_PROFILE,
+        {"people_count": 2, "allergies": ["peanuts"]},
+        existing,
+    )
+
+    assert result.success
+    saved = handler.repo.save_profile.call_args.args[1]
+    assert [member.name for member in saved.family_members] == [
+        "Alex",
+        "Sam",
+    ]
+    assert saved.allergies == ["peanuts"]
+
+
 def test_confirm_and_edit_refresh_exact_week(handler: BotHandler) -> None:
     draft = make_plan()
     handler.repo.get_latest_plan.return_value = draft
@@ -166,6 +242,99 @@ def test_confirm_and_edit_refresh_exact_week(handler: BotHandler) -> None:
     assert draft.grocery_status is GroceryStatus.PENDING
 
 
+def test_confirm_retries_only_failed_grocery_generation(
+    handler: BotHandler,
+) -> None:
+    failed = make_plan(
+        status=PlanStatus.CONFIRMED, grocery_status=GroceryStatus.ERROR
+    )
+    handler.repo.get_latest_plan.return_value = failed
+    handler.repo.get_active_plan.return_value = failed
+    result = handler._apply_intent_metadata(
+        "user", 1, ConversationIntent.CONFIRM_PLAN, {}, None
+    )
+    assert result.success
+    assert result.message and "Retrying" in result.message
+    handler.repo.retry_grocery.assert_called_once_with(
+        "user", failed.week_start_date, failed.revision
+    )
+
+
+def test_confirm_retries_active_error_when_latest_error_is_inactive(
+    handler: BotHandler,
+) -> None:
+    latest = make_plan(
+        week_start=date.today() + timedelta(days=8),
+        status=PlanStatus.CONFIRMED,
+        grocery_status=GroceryStatus.ERROR,
+    )
+    active = make_plan(
+        status=PlanStatus.CONFIRMED, grocery_status=GroceryStatus.ERROR
+    )
+    handler.repo.get_latest_plan.return_value = latest
+    handler.repo.get_active_plan.return_value = active
+    handler.repo.retry_grocery.return_value = True
+
+    result = handler._apply_intent_metadata(
+        "user", 1, ConversationIntent.CONFIRM_PLAN, {}, None
+    )
+
+    assert result.success
+    handler.repo.retry_grocery.assert_called_once_with(
+        "user", active.week_start_date, active.revision
+    )
+
+
+@pytest.mark.parametrize("week_offset", [-14, 8])
+def test_confirm_rejects_inactive_error_without_retry(
+    handler: BotHandler, week_offset: int
+) -> None:
+    inactive = make_plan(
+        week_start=date.today() + timedelta(days=week_offset),
+        status=PlanStatus.CONFIRMED,
+        grocery_status=GroceryStatus.ERROR,
+    )
+    handler.repo.get_latest_plan.return_value = inactive
+    handler.repo.get_active_plan.return_value = None
+
+    result = handler._apply_intent_metadata(
+        "user", 1, ConversationIntent.CONFIRM_PLAN, {}, None
+    )
+
+    assert not result.success
+    handler.repo.retry_grocery.assert_not_called()
+    handler.lambda_client.invoke.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [GroceryStatus.PENDING, GroceryStatus.READY])
+def test_confirm_rejects_active_non_error_grocery_state(
+    handler: BotHandler, status: GroceryStatus
+) -> None:
+    plan = make_plan(status=PlanStatus.CONFIRMED, grocery_status=status)
+    handler.repo.get_latest_plan.return_value = plan
+    handler.repo.get_active_plan.return_value = plan
+    result = handler._apply_intent_metadata(
+        "user", 1, ConversationIntent.CONFIRM_PLAN, {}, None
+    )
+    assert not result.success
+    handler.repo.retry_grocery.assert_not_called()
+
+
+def test_confirmation_invocation_failure_restores_error_state(
+    handler: BotHandler,
+) -> None:
+    plan = make_plan()
+    handler.repo.get_latest_plan.return_value = plan
+    handler.lambda_client.invoke.side_effect = RuntimeError("unavailable")
+    result = handler._apply_intent_metadata(
+        "user", 1, ConversationIntent.CONFIRM_PLAN, {}, None
+    )
+    assert not result.success
+    handler.repo.fail_grocery.assert_called_once_with(
+        "user", plan.week_start_date, plan.revision
+    )
+
+
 def test_edit_never_creates_missing_day_or_meal(handler: BotHandler) -> None:
     handler.repo.get_latest_plan.return_value = make_plan()
     result = handler._apply_intent_metadata(
@@ -177,6 +346,36 @@ def test_edit_never_creates_missing_day_or_meal(handler: BotHandler) -> None:
     )
     assert not result.success
     handler.repo.save_plan.assert_not_called()
+
+
+def test_edit_conflict_does_not_start_grocery_refresh(
+    handler: BotHandler,
+) -> None:
+    plan = make_plan(status=PlanStatus.DRAFT)
+    handler.repo.get_latest_plan.return_value = plan
+    handler.repo.update_meal.return_value = False
+
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.EDIT_PLAN,
+        {"day": 1, "meal_type": "lunch", "name": "Stale edit"},
+        None,
+    )
+
+    assert not result.success
+    assert result.message and "changed" in result.message
+    update_call = handler.repo.update_meal.call_args
+    assert update_call is not None
+    assert update_call.args[:4] == (
+        "user",
+        plan.week_start_date,
+        1,
+        "lunch",
+    )
+    assert update_call.args[5] == plan.revision
+    assert update_call.kwargs["expected_status"] is PlanStatus.DRAFT
+    handler.lambda_client.invoke.assert_not_called()
 
 
 @pytest.mark.parametrize("outcome", list(MealOutcome)[1:])

@@ -53,10 +53,29 @@ Local development reads these variables from the environment or an ignored
 | `LLM_MODEL` | `gpt-4o-mini` | LiteLLM model identifier |
 | `DYNAMODB_TABLE_NAME` | `meal-planner` | DynamoDB table |
 | `AWS_REGION` | `us-east-1` | AWS client region |
-| `TELEGRAM_REQUEST_TIMEOUT_SECONDS` | `10` | Telegram HTTP timeout, maximum 20 |
-| `LLM_REQUEST_TIMEOUT_SECONDS` | `20` | LLM timeout, maximum 25 |
-| `LLM_MAX_RETRIES` | `3` | Total transient LLM attempts, maximum 5 |
-| `LLM_INITIAL_BACKOFF_SECONDS` | `1` | Initial exponential backoff, maximum 5 |
+| `BOT_FUNCTION_TIMEOUT_SECONDS` | `30` | Bot Lambda deadline |
+| `BOT_TELEGRAM_REQUEST_TIMEOUT_SECONDS` | `5` | Bot Telegram HTTP timeout |
+| `BOT_LLM_REQUEST_TIMEOUT_SECONDS` | `6` | Per-attempt Bot LLM timeout |
+| `BOT_LLM_MAX_RETRIES` | `2` | Bot transient LLM attempts |
+| `BOT_LLM_INITIAL_BACKOFF_SECONDS` | `1` | Bot initial retry backoff |
+| `BOT_HANDLER_SAFETY_MARGIN_SECONDS` | `4` | Bot non-provider safety margin |
+| `PLANNER_FUNCTION_TIMEOUT_SECONDS` | `120` | Planner Lambda deadline |
+| `PLANNER_TELEGRAM_REQUEST_TIMEOUT_SECONDS` | `10` | Planner Telegram HTTP timeout |
+| `PLANNER_LLM_REQUEST_TIMEOUT_SECONDS` | `20` | Per-attempt Planner LLM timeout |
+| `PLANNER_LLM_MAX_RETRIES` | `3` | Planner transient LLM attempts |
+| `PLANNER_LLM_INITIAL_BACKOFF_SECONDS` | `1` | Planner initial retry backoff |
+| `PLANNER_HANDLER_SAFETY_MARGIN_SECONDS` | `20` | Planner non-provider safety margin |
+
+The settings validator includes every LLM attempt, the maximum bounded retry
+wait (5 seconds per retry), each sequential Telegram allowance, and a handler
+safety margin. Each function's worst-case budget must fit its configured deadline.
+The Bot budget remains below the 30-second HTTP API integration limit. Lambda
+itself permits up to 900 seconds, but that larger service limit cannot extend
+the synchronous Telegram webhook deadline ([Lambda timeout quota](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html),
+[HTTP API integration quota](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-quotas.html)).
+
+The former global timeout and retry variables are ignored for compatibility;
+use the function-specific settings above.
 
 Never commit `.env` or secret values.
 
@@ -84,7 +103,8 @@ uvx --from aws-sam-cli sam deploy --guided \
   --parameter-overrides \
   TelegramBotTokenSecretName=meal-planner/bot-token \
   TelegramWebhookSecretName=meal-planner/webhook-secret \
-  LlmApiKeySecretName=meal-planner/llm-key
+  LlmApiKeySecretName=meal-planner/llm-key \
+  SecretRefreshToken="$(date +%s)"
 ```
 
 Use the stack's `WebhookUrl` output to register Telegram. The `secret_token`
@@ -97,17 +117,28 @@ curl --fail-with-body \
   --data-urlencode "secret_token=${TELEGRAM_WEBHOOK_SECRET}"
 ```
 
-To rotate a secret, write a new version, update Telegram first when rotating
-the webhook secret, then redeploy so CloudFormation resolves the new value:
+To rotate a secret, update one secret at a time, then deploy with a new unique
+`SecretRefreshToken`. The marker changes both Lambda resources, forcing
+CloudFormation to re-resolve the versionless Secrets Manager references. For
+an LLM key or bot token:
 
 ```bash
 aws secretsmanager put-secret-value --secret-id meal-planner/llm-key \
   --secret-string "$NEW_LLM_API_KEY"
-uvx --from aws-sam-cli sam deploy
+uvx --from aws-sam-cli sam deploy --parameter-overrides \
+  TelegramBotTokenSecretName=meal-planner/bot-token \
+  TelegramWebhookSecretName=meal-planner/webhook-secret \
+  LlmApiKeySecretName=meal-planner/llm-key \
+  SecretRefreshToken="$(date +%s)"
 ```
 
-CloudFormation dynamic references are resolved on resource updates; a secret
-rotation alone does not refresh an existing Lambda environment.
+For webhook-secret rotation, update the secret and deploy the Lambda before
+registering the new Telegram webhook secret, then verify the webhook. A single
+accepted secret necessarily has a brief coordinated transition window; dual
+secret acceptance is outside this remediation. CloudFormation resolves
+dynamic references on resource updates, while a secret-value-only change does
+not refresh an existing Lambda environment ([dynamic reference rotation
+behavior](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/dynamic-references-secretsmanager.html)).
 
 For rollback, identify the last known-good commit, rebuild it, and redeploy the
 same stack parameters. DynamoDB uses on-demand billing and is retained only as
@@ -123,6 +154,8 @@ confirming a rollback.
 - Ask conversationally to edit an existing meal; missing days or meal types
   are rejected rather than silently created.
 - Tell the bot to confirm the draft. Confirmation starts grocery generation.
+- Repeating confirmation on a confirmed plan retries groceries only when the
+  previous grocery attempt is in `error`; `pending` and `ready` are not reset.
 - `/grocery` reports `pending`, `ready`, or `error`, and shows ready sections.
 - `/today` shows the active confirmed plan's meals for today.
 - `/submit_meals` sends plan-specific buttons for `cooked`, `skipped`, and
@@ -146,11 +179,21 @@ non-empty section before it can become ready.
   secret match exactly.
 - No plan generation: complete every per-person calorie target and inspect the
   planner Lambda logs.
-- Grocery state `error`: confirm the exact plan week again and inspect LLM
-  parsing or timeout logs.
+- Grocery state `error`: for the active plan week, confirm again and inspect
+  LLM parsing or timeout logs. If that week has expired, generate and confirm
+  the current week's plan instead.
+- Grocery state `ready` is persisted before its Telegram notification. If the
+  notification fails, retry `/grocery` after Telegram connectivity returns.
+- A slow grocery worker whose plan revision is stale is discarded without
+  changing state or sending a notification. Meal outcomes are targeted writes
+  and do not invalidate grocery content; meal edits advance the revision and
+  trigger a fresh grocery request.
+- Incomplete profile updates are retained as a draft, including household
+  size and partial member targets, so the next turn can finish onboarding.
 - Telegram delivery failure: check the endpoint status in logs; logs omit bot
   tokens and message content.
 - SAM smoke-test failure: rerun a clean SAM build. Tests reject stale source or
   generated templates.
 - Timeout failures: keep configured request timeouts below Lambda deadlines;
-  only transient LLM failures are retried.
+  only transient LLM failures are retried. The bot must also fit API Gateway's
+  non-increasable 30-second HTTP API integration timeout.

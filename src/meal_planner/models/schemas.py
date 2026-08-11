@@ -138,7 +138,7 @@ class PlanDay(BaseModel):
     """Single day in a weekly meal plan."""
 
     day: int = Field(ge=1, le=7)
-    meals: list[PlannedMeal] = Field(default_factory=list)
+    meals: list[PlannedMeal] = Field(default_factory=list, max_length=4)
 
 
 class GrocerySection(BaseModel):
@@ -153,6 +153,7 @@ class WeeklyPlan(BaseModel):
 
     week_start: date = Field(alias="week_start_date")
     status: PlanStatus = PlanStatus.DRAFT
+    revision: int = Field(default=0, ge=0)
     days: list[PlanDay]
     grocery_status: GroceryStatus = GroceryStatus.NOT_REQUESTED
     grocery_list: list[GrocerySection] = Field(default_factory=list)

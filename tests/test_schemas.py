@@ -100,6 +100,15 @@ def test_plan_day_validation() -> None:
     with pytest.raises(ValidationError):
         PlanDay(day=8)
 
+    with pytest.raises(ValidationError):
+        PlanDay(
+            day=3,
+            meals=[
+                PlannedMeal(meal_type="lunch", name=f"Lunch {number}")
+                for number in range(5)
+            ],
+        )
+
 
 def test_weekly_plan_and_grocery_section() -> None:
     """Test WeeklyPlan and GrocerySection instantiation."""
@@ -117,6 +126,20 @@ def test_weekly_plan_and_grocery_section() -> None:
     assert plan.status is PlanStatus.CONFIRMED
     assert len(plan.days) == 7
     assert len(plan.grocery_list) == 1
+
+
+def test_weekly_plan_revision_defaults_and_round_trips() -> None:
+    days = [PlanDay(day=day) for day in range(1, 8)]
+    plan = WeeklyPlan(week_start="2026-08-10", days=days)
+    assert plan.revision == 0
+    restored = WeeklyPlan.model_validate_json(plan.model_dump_json())
+    assert restored.revision == 0
+
+
+def test_weekly_plan_rejects_negative_revision() -> None:
+    days = [PlanDay(day=day) for day in range(1, 8)]
+    with pytest.raises(ValidationError):
+        WeeklyPlan(week_start="2026-08-10", days=days, revision=-1)
 
 
 def test_meal_log_entry() -> None:

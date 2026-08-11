@@ -62,6 +62,20 @@ async def test_transient_recovery_uses_provider_retry_guidance(
 
 
 @pytest.mark.asyncio
+async def test_provider_retry_guidance_is_capped(
+    client: LLMClient, mocker: MockerFixture
+) -> None:
+    completion = mocker.patch(
+        "litellm.acompletion",
+        side_effect=[ProviderError(429, retry_after=99), _response("ok")],
+    )
+    sleep = mocker.patch("asyncio.sleep")
+    assert await client.chat("system", "user") == "ok"
+    assert completion.call_count == 2
+    sleep.assert_awaited_once_with(5.0)
+
+
+@pytest.mark.asyncio
 async def test_timeout_exhaustion_is_bounded(
     client: LLMClient, mocker: MockerFixture
 ) -> None:

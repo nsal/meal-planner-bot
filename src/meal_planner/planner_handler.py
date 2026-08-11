@@ -69,7 +69,13 @@ class PlannerHandler:
             plan.status = PlanStatus.DRAFT
             plan.grocery_status = GroceryStatus.NOT_REQUESTED
             plan.grocery_list = []
-            self.repo.save_plan(user_id, plan)
+            if not self.repo.save_generated_draft(user_id, plan):
+                self.telegram_api.send_message(
+                    chat_id,
+                    "That week's plan was already confirmed, so I kept it "
+                    "unchanged.",
+                )
+                return
             self.telegram_api.send_plan(chat_id, plan)
             self.telegram_api.send_message(
                 chat_id,
@@ -95,13 +101,19 @@ class PlannerHandler:
         if plan.status is not PlanStatus.CONFIRMED:
             self._notify_failure(chat_id, "Confirm the plan before groceries.")
             return
+        if plan.grocery_status is not GroceryStatus.PENDING:
+            logger.info(
+                "Ignoring stale grocery event for user %s week %s in state %s",
+                user_id,
+                week_start,
+                plan.grocery_status.value,
+            )
+            return
+        revision = plan.revision
         try:
             profile = self.repo.get_profile(user_id)
             if not profile:
                 raise ValueError("profile missing")
-            plan.grocery_status = GroceryStatus.PENDING
-            plan.grocery_list = []
-            self.repo.save_plan(user_id, plan)
             client = self.llm_client or LLMClient()
             sections = parse_grocery_response(
                 client.chat_json_sync(
@@ -111,12 +123,15 @@ class PlannerHandler:
             )
             if not sections:
                 raise ValueError("grocery response contained no valid sections")
-            plan.grocery_list = sections
-            plan.grocery_status = GroceryStatus.READY
-            self.repo.save_plan(user_id, plan)
-            self.telegram_api.send_message(
-                chat_id, "Your grocery list is ready. Use /grocery to view it."
-            )
+            if not self.repo.complete_grocery(
+                user_id, week_start, revision, sections
+            ):
+                logger.info(
+                    "Discarded stale grocery result for user %s week %s",
+                    user_id,
+                    week_start,
+                )
+                return
         except Exception as exc:
             logger.error(
                 "Grocery finalization failed for user %s week %s: %s",
@@ -124,12 +139,29 @@ class PlannerHandler:
                 week_start,
                 exc,
             )
-            plan.grocery_list = []
-            plan.grocery_status = GroceryStatus.ERROR
-            self.repo.save_plan(user_id, plan)
-            self._notify_failure(
-                chat_id,
-                "I couldn't generate groceries for that plan. Please retry.",
+            if self.repo.fail_grocery(user_id, week_start, revision):
+                self._notify_failure(
+                    chat_id,
+                    "I couldn't generate groceries for that plan. Please "
+                    "retry.",
+                )
+            else:
+                logger.info(
+                    "Suppressed stale grocery failure for user %s week %s",
+                    user_id,
+                    week_start,
+                )
+            return
+        try:
+            self.telegram_api.send_message(
+                chat_id, "Your grocery list is ready. Use /grocery to view it."
+            )
+        except Exception as exc:
+            logger.error(
+                "Grocery-ready notification failed for user %s week %s: %s",
+                user_id,
+                week_start,
+                exc,
             )
 
     def _notify_failure(self, chat_id: int | str, message: str) -> None:
@@ -177,14 +209,14 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     repo = DynamoRepository(dynamodb.Table(settings.dynamodb_table_name))
     telegram_api = TelegramAPI(
         settings.telegram_bot_token,
-        request_timeout=settings.telegram_request_timeout_seconds,
+        request_timeout=settings.planner_telegram_request_timeout_seconds,
     )
     llm_client = LLMClient(
         model=settings.llm_model,
         api_key=settings.llm_api_key,
-        max_retries=settings.llm_max_retries,
-        initial_backoff=settings.llm_initial_backoff_seconds,
-        request_timeout=settings.llm_request_timeout_seconds,
+        max_retries=settings.planner_llm_max_retries,
+        initial_backoff=settings.planner_llm_initial_backoff_seconds,
+        request_timeout=settings.planner_llm_request_timeout_seconds,
     )
     planner = PlannerHandler(repo, telegram_api, llm_client)
     if not planner.handle_event(event):

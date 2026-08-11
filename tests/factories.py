@@ -36,6 +36,7 @@ def make_plan(
     *,
     week_start: date | None = None,
     status: PlanStatus = PlanStatus.DRAFT,
+    revision: int = 0,
     grocery_status: GroceryStatus = GroceryStatus.NOT_REQUESTED,
     outcome: MealOutcome = MealOutcome.UNREPORTED,
 ) -> WeeklyPlan:
@@ -48,6 +49,7 @@ def make_plan(
     return WeeklyPlan(
         week_start=week_start or date.today(),
         status=status,
+        revision=revision,
         grocery_status=grocery_status,
         grocery_list=groceries,
         days=[

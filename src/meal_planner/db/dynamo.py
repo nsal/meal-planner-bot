@@ -48,14 +48,16 @@ class DynamoRepository:
             }
         )
 
-    def get_profile_draft(self, user_id: str) -> ProfileUpdateEntities:
-        """Return accumulated onboarding fields for an incomplete profile."""
+    def get_profile_draft(
+        self, user_id: str
+    ) -> Optional[ProfileUpdateEntities]:
+        """Return accumulated onboarding fields, if a draft exists."""
         response = self.table.get_item(
             Key={"PK": f"USER#{user_id}", "SK": "PROFILE_DRAFT"}
         )
         item = response.get("Item")
         if not item:
-            return ProfileUpdateEntities()
+            return None
         return ProfileUpdateEntities.model_validate(self._data(item))
 
     def save_profile_draft(
@@ -133,6 +135,257 @@ class DynamoRepository:
                 **plan.model_dump(by_alias=True, mode="json"),
             }
         )
+
+    @staticmethod
+    def _is_conditional_failure(exc: ClientError) -> bool:
+        error = exc.response.get("Error", {})
+        code = error.get("Code") if isinstance(error, dict) else None
+        return code == "ConditionalCheckFailedException"
+
+    def save_generated_draft(self, user_id: str, plan: WeeklyPlan) -> bool:
+        """Save a generated draft unless the week is already confirmed."""
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": f"USER#{user_id}",
+                    "SK": f"PLAN#{plan.week_start_date}",
+                    **plan.model_dump(by_alias=True, mode="json"),
+                },
+                ConditionExpression=(
+                    "attribute_not_exists(#status) OR #status = :draft"
+                ),
+                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeValues={
+                    ":draft": PlanStatus.DRAFT.value,
+                },
+            )
+        except ClientError as exc:
+            if self._is_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def confirm_plan(
+        self, user_id: str, week_start: str, expected_revision: int
+    ) -> bool:
+        """Atomically confirm a draft and start grocery generation."""
+        try:
+            self.table.update_item(
+                Key={
+                    "PK": f"USER#{user_id}",
+                    "SK": f"PLAN#{week_start}",
+                },
+                UpdateExpression=(
+                    "SET #status = :confirmed, "
+                    "#grocery_status = :pending, "
+                    "#grocery_list = :empty"
+                ),
+                ConditionExpression=(
+                    "#status = :draft AND #revision = :revision"
+                ),
+                ExpressionAttributeNames={
+                    "#status": "status",
+                    "#revision": "revision",
+                    "#grocery_status": "grocery_status",
+                    "#grocery_list": "grocery_list",
+                },
+                ExpressionAttributeValues={
+                    ":confirmed": PlanStatus.CONFIRMED.value,
+                    ":draft": PlanStatus.DRAFT.value,
+                    ":pending": "pending",
+                    ":empty": [],
+                    ":revision": expected_revision,
+                },
+            )
+        except ClientError as exc:
+            if self._is_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def retry_grocery(
+        self, user_id: str, week_start: str, expected_revision: int
+    ) -> bool:
+        """Atomically retry grocery generation for an errored plan."""
+        try:
+            self.table.update_item(
+                Key={
+                    "PK": f"USER#{user_id}",
+                    "SK": f"PLAN#{week_start}",
+                },
+                UpdateExpression=(
+                    "SET #grocery_status = :pending, #grocery_list = :empty"
+                ),
+                ConditionExpression=(
+                    "#status = :confirmed AND #grocery_status = :error "
+                    "AND #revision = :revision"
+                ),
+                ExpressionAttributeNames={
+                    "#status": "status",
+                    "#grocery_status": "grocery_status",
+                    "#revision": "revision",
+                    "#grocery_list": "grocery_list",
+                },
+                ExpressionAttributeValues={
+                    ":confirmed": PlanStatus.CONFIRMED.value,
+                    ":error": "error",
+                    ":pending": "pending",
+                    ":empty": [],
+                    ":revision": expected_revision,
+                },
+            )
+        except ClientError as exc:
+            if self._is_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def update_meal(
+        self,
+        user_id: str,
+        week_start: str,
+        day: int,
+        meal_type: str,
+        meal: Any,
+        expected_revision: int,
+        *,
+        expected_status: PlanStatus,
+    ) -> bool:
+        """Replace one meal with revision and status checks atomically."""
+        plan = self.get_plan(user_id, week_start)
+        if not plan:
+            return False
+        day_index: int | None = None
+        meal_index: int | None = None
+        for candidate_day_index, plan_day in enumerate(plan.days):
+            if plan_day.day != day:
+                continue
+            for candidate_meal_index, candidate_meal in enumerate(
+                plan_day.meals
+            ):
+                if candidate_meal.meal_type.value == meal_type.lower():
+                    day_index = candidate_day_index
+                    meal_index = candidate_meal_index
+                    break
+        if day_index is None or meal_index is None:
+            return False
+        update_expression = (
+            f"SET #days[{day_index}].#meals[{meal_index}] = :meal, "
+            "#revision = #revision + :one"
+        )
+        names = {
+            "#days": "days",
+            "#meals": "meals",
+            "#revision": "revision",
+        }
+        values: dict[str, Any] = {
+            ":meal": meal.model_dump(mode="json"),
+            ":one": 1,
+            ":revision": expected_revision,
+        }
+        condition = "#revision = :revision AND #status = :status"
+        names["#status"] = "status"
+        values[":status"] = expected_status.value
+        if expected_status is PlanStatus.CONFIRMED:
+            update_expression += (
+                ", #grocery_status = :pending, #grocery_list = :empty"
+            )
+            names.update(
+                {
+                    "#grocery_status": "grocery_status",
+                    "#grocery_list": "grocery_list",
+                }
+            )
+            values.update({":pending": "pending", ":empty": []})
+        try:
+            self.table.update_item(
+                Key={
+                    "PK": f"USER#{user_id}",
+                    "SK": f"PLAN#{week_start}",
+                },
+                UpdateExpression=update_expression,
+                ConditionExpression=condition,
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+            )
+        except ClientError as exc:
+            if self._is_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def complete_grocery(
+        self,
+        user_id: str,
+        week_start: str,
+        revision: int,
+        grocery_list: list[Any],
+    ) -> bool:
+        """Publish groceries only for the worker's pending revision."""
+        return self._update_grocery_state(
+            user_id,
+            week_start,
+            revision,
+            status="ready",
+            grocery_list=grocery_list,
+        )
+
+    def fail_grocery(
+        self, user_id: str, week_start: str, revision: int
+    ) -> bool:
+        """Mark a pending grocery job as failed if it is still current."""
+        return self._update_grocery_state(
+            user_id,
+            week_start,
+            revision,
+            status="error",
+            grocery_list=[],
+        )
+
+    def _update_grocery_state(
+        self,
+        user_id: str,
+        week_start: str,
+        revision: int,
+        *,
+        status: str,
+        grocery_list: list[Any],
+    ) -> bool:
+        try:
+            self.table.update_item(
+                Key={
+                    "PK": f"USER#{user_id}",
+                    "SK": f"PLAN#{week_start}",
+                },
+                UpdateExpression=(
+                    "SET #grocery_status = :status, #grocery_list = :list"
+                ),
+                ConditionExpression=(
+                    "#status = :confirmed AND #grocery_status = :pending "
+                    "AND #revision = :revision"
+                ),
+                ExpressionAttributeNames={
+                    "#status": "status",
+                    "#grocery_status": "grocery_status",
+                    "#grocery_list": "grocery_list",
+                    "#revision": "revision",
+                },
+                ExpressionAttributeValues={
+                    ":confirmed": PlanStatus.CONFIRMED.value,
+                    ":pending": "pending",
+                    ":status": status,
+                    ":list": [
+                        section.model_dump(mode="json")
+                        for section in grocery_list
+                    ],
+                    ":revision": revision,
+                },
+            )
+        except ClientError as exc:
+            if self._is_conditional_failure(exc):
+                return False
+            raise
+        return True
 
     def get_plan(
         self, user_id: str, week_start: str | date

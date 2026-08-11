@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from meal_planner.config import (
     Settings,
     WebhookSettings,
+    external_call_budget_seconds,
     get_settings,
     get_webhook_secret,
 )
@@ -42,10 +43,6 @@ def test_config_default_values(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LLM_MODEL", raising=False)
     monkeypatch.delenv("DYNAMODB_TABLE_NAME", raising=False)
     monkeypatch.delenv("AWS_REGION", raising=False)
-    monkeypatch.delenv("TELEGRAM_REQUEST_TIMEOUT_SECONDS", raising=False)
-    monkeypatch.delenv("LLM_REQUEST_TIMEOUT_SECONDS", raising=False)
-    monkeypatch.delenv("LLM_MAX_RETRIES", raising=False)
-    monkeypatch.delenv("LLM_INITIAL_BACKOFF_SECONDS", raising=False)
 
     settings = Settings()
     assert settings.telegram_bot_token == "token123"
@@ -53,10 +50,8 @@ def test_config_default_values(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.llm_model == "gpt-4o-mini"
     assert settings.dynamodb_table_name == "meal-planner"
     assert settings.aws_region == "us-east-1"
-    assert settings.telegram_request_timeout_seconds == 10
-    assert settings.llm_request_timeout_seconds == 20
-    assert settings.llm_max_retries == 3
-    assert settings.llm_initial_backoff_seconds == 1
+    assert settings.bot_llm_request_timeout_seconds == 6
+    assert settings.planner_llm_request_timeout_seconds == 20
 
 
 def test_config_missing_required_token(
@@ -114,13 +109,13 @@ def test_config_rejects_whitespace_webhook_secret(
 @pytest.mark.parametrize(
     ("name", "value"),
     [
-        ("TELEGRAM_REQUEST_TIMEOUT_SECONDS", "0"),
-        ("LLM_REQUEST_TIMEOUT_SECONDS", "30"),
-        ("LLM_MAX_RETRIES", "0"),
-        ("LLM_INITIAL_BACKOFF_SECONDS", "10"),
+        ("BOT_TELEGRAM_REQUEST_TIMEOUT_SECONDS", "0"),
+        ("BOT_LLM_REQUEST_TIMEOUT_SECONDS", "30"),
+        ("BOT_LLM_MAX_RETRIES", "0"),
+        ("BOT_LLM_INITIAL_BACKOFF_SECONDS", "10"),
     ],
 )
-def test_config_rejects_unbounded_external_call_settings(
+def test_config_rejects_unbounded_function_call_settings(
     mock_env: None,
     monkeypatch: pytest.MonkeyPatch,
     name: str,
@@ -129,3 +124,56 @@ def test_config_rejects_unbounded_external_call_settings(
     monkeypatch.setenv(name, value)
     with pytest.raises(ValidationError):
         Settings()
+
+
+def test_external_call_budget_includes_maximum_provider_waits() -> None:
+    assert (
+        external_call_budget_seconds(
+            llm_attempts=3,
+            llm_request_timeout_seconds=7,
+            llm_initial_backoff_seconds=0.1,
+            telegram_allowance_seconds=5,
+            handler_safety_margin_seconds=2,
+        )
+        == 38
+    )
+
+
+def test_external_call_budget_counts_sequential_telegram_requests() -> None:
+    assert (
+        external_call_budget_seconds(
+            llm_attempts=3,
+            llm_request_timeout_seconds=7,
+            llm_initial_backoff_seconds=0.1,
+            telegram_allowance_seconds=5,
+            handler_safety_margin_seconds=2,
+            telegram_request_count=2,
+        )
+        == 43
+    )
+
+
+def test_legacy_external_call_settings_are_tolerated(
+    mock_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TELEGRAM_REQUEST_TIMEOUT_SECONDS", "10")
+    monkeypatch.setenv("LLM_REQUEST_TIMEOUT_SECONDS", "20")
+    monkeypatch.setenv("LLM_MAX_RETRIES", "3")
+    monkeypatch.setenv("LLM_INITIAL_BACKOFF_SECONDS", "1")
+
+    settings = Settings()
+
+    assert settings.bot_telegram_request_timeout_seconds == 5
+    assert settings.bot_llm_request_timeout_seconds == 6
+    assert settings.bot_llm_max_retries == 2
+
+
+def test_function_budgets_are_safe_by_default(mock_env: None) -> None:
+    settings = Settings()
+    assert settings.bot_function_timeout_seconds == 30
+    assert settings.planner_function_timeout_seconds == 120
+
+
+def test_function_budget_rejects_timeout_overrun(mock_env: None) -> None:
+    with pytest.raises(ValidationError, match="Bot external-call budget"):
+        Settings(bot_function_timeout_seconds=20)

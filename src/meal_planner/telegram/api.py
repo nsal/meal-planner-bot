@@ -141,14 +141,6 @@ class TelegramAPI:
                     f"• {meal.meal_type.value.capitalize()}: {meal.name} "
                     f"({meal.est_calories} kcal){outcome}"
                 )
-                if meal.ingredients:
-                    ingredients = ", ".join(
-                        f"{item.item} ({item.amount})"
-                        if item.amount
-                        else item.item
-                        for item in meal.ingredients
-                    )
-                    lines.append(f"  Ingredients: {ingredients}")
             lines.append("")
         return self.send_message(chat_id, "\n".join(lines).strip())
 

@@ -362,10 +362,19 @@ class BotHandler:
         existing: UserProfile | None,
     ) -> MutationResult:
         update = ProfileUpdateEntities.model_validate(entities)
-        if existing:
+        persisted_draft = self.repo.get_profile_draft(user_id)
+        if isinstance(persisted_draft, ProfileUpdateEntities):
+            data = persisted_draft.model_dump(mode="json")
+        elif existing:
             data = existing.model_dump(mode="json")
         else:
-            data = self.repo.get_profile_draft(user_id).model_dump(mode="json")
+            data = {}
+        if (
+            "people_count" in update.model_fields_set
+            and "family_members" not in update.model_fields_set
+            and update.people_count != data.get("people_count")
+        ):
+            data["family_members"] = None
         for field in update.model_fields_set:
             data[field] = getattr(update, field)
         draft = ProfileUpdateEntities.model_validate(data)
@@ -384,38 +393,67 @@ class BotHandler:
             return MutationResult(
                 True, "I still need: " + ", ".join(missing) + "."
             )
-        profile = UserProfile.model_validate(draft.model_dump())
-        if not profile.is_complete:
+        if (
+            draft.family_members is None
+            or len(draft.family_members) != draft.people_count
+        ):
+            self.repo.save_profile_draft(user_id, draft)
             return MutationResult(
-                False,
+                True,
                 "Please provide one name and calorie target for each person.",
             )
+        profile = UserProfile.model_validate(draft.model_dump())
         self.repo.save_profile(user_id, profile)
         self.repo.delete_profile_draft(user_id)
         return MutationResult(True, "Your profile has been saved.")
 
     def _confirm_plan(self, user_id: str, chat_id: int | str) -> MutationResult:
-        plan = self.repo.get_latest_plan(user_id)
-        if not plan or plan.status is not PlanStatus.DRAFT:
-            return MutationResult(False, "There is no draft plan to confirm.")
+        latest_plan = self.repo.get_latest_plan(user_id)
+        plan: WeeklyPlan | None = latest_plan
+        if not latest_plan or latest_plan.status is not PlanStatus.DRAFT:
+            plan = self.repo.get_active_plan(user_id)
+        if not plan:
+            return MutationResult(False, "There is no plan to confirm.")
+        if plan.status is PlanStatus.DRAFT:
+            transitioned = self.repo.confirm_plan(
+                user_id, plan.week_start_date, plan.revision
+            )
+            response = "Plan confirmed. Groceries are being prepared."
+        elif (
+            plan.status is PlanStatus.CONFIRMED
+            and plan.grocery_status is GroceryStatus.ERROR
+        ):
+            transitioned = self.repo.retry_grocery(
+                user_id, plan.week_start_date, plan.revision
+            )
+            response = "Retrying grocery generation for your confirmed plan."
+        else:
+            return MutationResult(
+                False,
+                "Only a draft or a failed grocery request can be confirmed "
+                "again.",
+            )
+        if not transitioned:
+            return MutationResult(
+                False,
+                "That plan changed while I was saving it. Please try again.",
+            )
         plan.status = PlanStatus.CONFIRMED
         plan.grocery_status = GroceryStatus.PENDING
         plan.grocery_list = []
-        self.repo.save_plan(user_id, plan)
         if not self._invoke_planner(
             user_id,
             chat_id,
             FINALIZE_GROCERY,
             week_start=plan.week_start_date,
         ):
-            plan.grocery_status = GroceryStatus.ERROR
-            self.repo.save_plan(user_id, plan)
+            self.repo.fail_grocery(user_id, plan.week_start_date, plan.revision)
             return MutationResult(
-                False, "The plan was confirmed, but groceries failed."
+                False,
+                "The plan is saved, but grocery generation failed to "
+                "start. Please confirm again to retry.",
             )
-        return MutationResult(
-            True, "Plan confirmed. Groceries are being prepared."
-        )
+        return MutationResult(True, response)
 
     def _edit_plan(
         self, user_id: str, chat_id: int | str, entities: dict[str, Any]
@@ -458,20 +496,31 @@ class BotHandler:
                 "outcome": MealOutcome.UNREPORTED,
             }
         )
-        plan_day.meals[plan_day.meals.index(meal)] = updated
         refresh = plan.status is PlanStatus.CONFIRMED
+        if not self.repo.update_meal(
+            user_id,
+            plan.week_start_date,
+            day_number,
+            meal_type.value,
+            updated,
+            plan.revision,
+            expected_status=plan.status,
+        ):
+            return MutationResult(
+                False, "That plan changed while I was saving it. Please retry."
+            )
+        plan_day.meals[plan_day.meals.index(meal)] = updated
+        plan.revision += 1
         if refresh:
             plan.grocery_status = GroceryStatus.PENDING
             plan.grocery_list = []
-        self.repo.save_plan(user_id, plan)
         if refresh and not self._invoke_planner(
             user_id,
             chat_id,
             FINALIZE_GROCERY,
             week_start=plan.week_start_date,
         ):
-            plan.grocery_status = GroceryStatus.ERROR
-            self.repo.save_plan(user_id, plan)
+            self.repo.fail_grocery(user_id, plan.week_start_date, plan.revision)
             return MutationResult(
                 False, "The meal changed, but grocery refresh failed."
             )
@@ -525,14 +574,14 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     repo = DynamoRepository(dynamodb.Table(settings.dynamodb_table_name))
     telegram_api = TelegramAPI(
         settings.telegram_bot_token,
-        request_timeout=settings.telegram_request_timeout_seconds,
+        request_timeout=settings.bot_telegram_request_timeout_seconds,
     )
     llm_client = LLMClient(
         model=settings.llm_model,
         api_key=settings.llm_api_key,
-        max_retries=settings.llm_max_retries,
-        initial_backoff=settings.llm_initial_backoff_seconds,
-        request_timeout=settings.llm_request_timeout_seconds,
+        max_retries=settings.bot_llm_max_retries,
+        initial_backoff=settings.bot_llm_initial_backoff_seconds,
+        request_timeout=settings.bot_llm_request_timeout_seconds,
     )
     handler = BotHandler(
         repo,
