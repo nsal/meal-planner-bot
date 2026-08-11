@@ -79,10 +79,26 @@ use the function-specific settings above.
 
 Never commit `.env` or secret values.
 
-## AWS secrets and deployment
+## AWS deployment
+
+Deploy from the repository root. The deployment creates two ARM64 Lambda
+functions, an HTTP API, and an on-demand DynamoDB table. The deploying
+principal needs permission to use CloudFormation, Lambda, API Gateway,
+DynamoDB, IAM, S3, and Secrets Manager.
+
+Select the account and region explicitly before creating resources. The
+commands below use `us-east-1`; replace it with your target region when
+needed:
+
+```bash
+export AWS_REGION=us-east-1
+export STACK_NAME=meal-planner-dev
+aws sts get-caller-identity
+```
 
 Create three Secrets Manager secrets whose `SecretString` is the raw value,
-not a JSON object:
+not a JSON object. Secret names are deployment parameters, so you may use
+different names if required by your account:
 
 ```bash
 aws secretsmanager create-secret --name meal-planner/bot-token \
@@ -93,13 +109,23 @@ aws secretsmanager create-secret --name meal-planner/llm-key \
   --secret-string "$LLM_API_KEY"
 ```
 
-Validate, build, and deploy:
+Validate the template, build the locked `uv` dependencies, and run the
+template tests against the fresh SAM artifact:
 
 ```bash
-uvx --from aws-sam-cli sam validate --lint --region us-east-1
+uvx --from aws-sam-cli sam validate --lint --region "$AWS_REGION"
 uvx --from aws-sam-cli sam build --beta-features
 REQUIRE_SAM_ARTIFACTS=1 uv run pytest tests/test_template.py
+```
+
+For the first deployment, use guided mode. Accept the generated S3 bucket,
+save the answers to `samconfig.toml`, and confirm the IAM capability prompt:
+
+```bash
 uvx --from aws-sam-cli sam deploy --guided \
+  --stack-name "$STACK_NAME" \
+  --region "$AWS_REGION" \
+  --capabilities CAPABILITY_IAM \
   --parameter-overrides \
   TelegramBotTokenSecretName=meal-planner/bot-token \
   TelegramWebhookSecretName=meal-planner/webhook-secret \
@@ -107,14 +133,48 @@ uvx --from aws-sam-cli sam deploy --guided \
   SecretRefreshToken="$(date +%s)"
 ```
 
-Use the stack's `WebhookUrl` output to register Telegram. The `secret_token`
-must exactly match the webhook secret in Secrets Manager:
+For later deployments, rerun validation and build, then deploy the same stack
+without prompts. Keep the secret names unchanged unless you are deliberately
+switching credentials:
 
 ```bash
+uvx --from aws-sam-cli sam validate --lint --region "$AWS_REGION"
+uvx --from aws-sam-cli sam build --beta-features
+uvx --from aws-sam-cli sam deploy \
+  --stack-name "$STACK_NAME" \
+  --region "$AWS_REGION" \
+  --capabilities CAPABILITY_IAM \
+  --no-confirm-changeset \
+  --no-fail-on-empty-changeset \
+  --parameter-overrides \
+  TelegramBotTokenSecretName=meal-planner/bot-token \
+  TelegramWebhookSecretName=meal-planner/webhook-secret \
+  LlmApiKeySecretName=meal-planner/llm-key \
+  SecretRefreshToken="$(date +%s)"
+```
+
+After deployment, read the generated URL and register it with Telegram. The
+`secret_token` must exactly match the webhook secret in Secrets Manager:
+
+```bash
+export WEBHOOK_URL="$(aws cloudformation describe-stacks \
+  --stack-name "$STACK_NAME" \
+  --region "$AWS_REGION" \
+  --query 'Stacks[0].Outputs[?OutputKey==`WebhookUrl`].OutputValue' \
+  --output text)"
 curl --fail-with-body \
   "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
   --data-urlencode "url=${WEBHOOK_URL}" \
   --data-urlencode "secret_token=${TELEGRAM_WEBHOOK_SECRET}"
+curl --fail-with-body \
+  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+```
+
+The stack also outputs the DynamoDB table and both Lambda function names:
+
+```bash
+aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+  --region "$AWS_REGION" --query 'Stacks[0].Outputs' --output table
 ```
 
 To rotate a secret, update one secret at a time, then deploy with a new unique
@@ -144,6 +204,17 @@ For rollback, identify the last known-good commit, rebuild it, and redeploy the
 same stack parameters. DynamoDB uses on-demand billing and is retained only as
 configured by the deployed stack, so inspect CloudFormation changes before
 confirming a rollback.
+
+To remove a non-production deployment, first remove the Telegram webhook and
+then delete the CloudFormation stack. This deletes the stack-managed table;
+export or back up any data you need first:
+
+```bash
+curl --fail-with-body \
+  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook"
+aws cloudformation delete-stack --stack-name "$STACK_NAME" \
+  --region "$AWS_REGION"
+```
 
 ## User workflow
 
