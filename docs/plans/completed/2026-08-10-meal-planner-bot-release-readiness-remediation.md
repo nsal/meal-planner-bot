@@ -203,17 +203,17 @@ confirmed edit -> confirmed / pending -> refresh grocery
 - Modify: `tests/test_parser.py`
 - Modify: `tests/test_prompts.py`
 
-- [ ] add `PlanStatus`, `MealOutcome`, and `GroceryStatus` enums
-- [ ] replace `was_cooked` with the clean `outcome` field throughout schemas
-- [ ] use typed date and datetime fields for plans and meal logs
-- [ ] validate exactly seven unique plan days numbered 1 through 7
-- [ ] constrain meal types and callback-bound text to safe non-empty lengths
-- [ ] update plan and conversational prompt schemas to emit the new fields and
+- [x] add `PlanStatus`, `MealOutcome`, and `GroceryStatus` enums
+- [x] replace `was_cooked` with the clean `outcome` field throughout schemas
+- [x] use typed date and datetime fields for plans and meal logs
+- [x] validate exactly seven unique plan days numbered 1 through 7
+- [x] constrain meal types and callback-bound text to safe non-empty lengths
+- [x] update plan and conversational prompt schemas to emit the new fields and
   ISO dates
-- [ ] reject partial, duplicate-day, invalid-date, invalid-status, and invalid
+- [x] reject partial, duplicate-day, invalid-date, invalid-status, and invalid
   outcome LLM responses in parser tests
-- [ ] update success tests for complete seven-day responses
-- [ ] run schema, parser, and prompt tests before Task 4
+- [x] update success tests for complete seven-day responses
+- [x] run schema, parser, and prompt tests before Task 4
 
 ### Task 4: Complete and truthfully persist profile onboarding
 
@@ -225,18 +225,18 @@ confirmed edit -> confirmed / pending -> refresh grocery
 - Modify: `tests/test_prompts.py`
 - Modify: `tests/test_bot_handler.py`
 
-- [ ] define explicit profile-update entities including `family_members` and
+- [x] define explicit profile-update entities including `family_members` and
   per-person calorie targets
-- [ ] make onboarding collect name, people count, member targets, allergies,
+- [x] make onboarding collect name, people count, member targets, allergies,
   preferences, restrictions, and goals across conversational turns
-- [ ] validate the complete candidate profile before saving any update
-- [ ] persist `family_members` instead of silently dropping them
-- [ ] return a mutation result so validation and DynamoDB failures replace the
+- [x] validate the complete candidate profile before saving any update
+- [x] persist `family_members` instead of silently dropping them
+- [x] return a mutation result so validation and DynamoDB failures replace the
   LLM success reply with a truthful error message
-- [ ] write onboarding tests for new, partial, and completed profiles
-- [ ] write update tests for family members, invalid targets, inconsistent
+- [x] write onboarding tests for new, partial, and completed profiles
+- [x] write update tests for family members, invalid targets, inconsistent
   people counts, and repository failures
-- [ ] run focused profile and handler tests before Task 5
+- [x] run focused profile and handler tests before Task 5
 
 ### Task 5: Implement confirmed and non-expired plan lifecycle
 
@@ -249,19 +249,19 @@ confirmed edit -> confirmed / pending -> refresh grocery
 - Modify: `tests/test_bot_handler.py`
 - Modify: `tests/test_prompts.py`
 
-- [ ] replace ambiguous current-plan lookup with `get_latest_plan`, exact
+- [x] replace ambiguous current-plan lookup with `get_latest_plan`, exact
   `get_plan`, and date-aware `get_active_plan` methods
-- [ ] make `/today`, `/grocery`, and `/submit_meals` reject drafts and expired
+- [x] make `/today`, `/grocery`, and `/submit_meals` reject drafts and expired
   plans with accurate messages
-- [ ] add a `confirm_plan` conversational intent and transition the selected
+- [x] add a `confirm_plan` conversational intent and transition the selected
   draft to `confirmed`
-- [ ] ensure edits address an explicit latest draft or active plan and never
+- [x] ensure edits address an explicit latest draft or active plan and never
   silently save when the requested day or meal does not exist
-- [ ] remove the expired-plan fallback to Day 1
-- [ ] write repository tests for draft, confirmed, future, active, and expired
+- [x] remove the expired-plan fallback to Day 1
+- [x] write repository tests for draft, confirmed, future, active, and expired
   plan selection
-- [ ] write command and conversational tests for confirmation and failed edits
-- [ ] run lifecycle tests before Task 6
+- [x] write command and conversational tests for confirmation and failed edits
+- [x] run lifecycle tests before Task 6
 
 ### Task 6: Preserve correct meal history and outcome feedback
 
@@ -273,17 +273,17 @@ confirmed edit -> confirmed / pending -> refresh grocery
 - Modify: `tests/test_bot_handler.py`
 - Modify: `tests/test_prompts.py`
 
-- [ ] query all meals in the requested inclusive ISO-date window instead of
+- [x] query all meals in the requested inclusive ISO-date window instead of
   truncating to an item count
-- [ ] handle DynamoDB pagination while preserving reverse chronological order
-- [ ] normalize conversational meal-log dates before constructing DynamoDB
+- [x] handle DynamoDB pagination while preserving reverse chronological order
+- [x] normalize conversational meal-log dates before constructing DynamoDB
   sort keys
-- [ ] persist cooked, skipped, and swapped as distinct outcomes
-- [ ] omit `unreported` meals from positive or negative previous-plan feedback
-- [ ] write history tests with multiple meals per day, old records, boundaries,
+- [x] persist cooked, skipped, and swapped as distinct outcomes
+- [x] omit `unreported` meals from positive or negative previous-plan feedback
+- [x] write history tests with multiple meals per day, old records, boundaries,
   pagination, and malformed dates
-- [ ] write feedback tests covering every meal outcome
-- [ ] run history, prompt, and handler tests before Task 7
+- [x] write feedback tests covering every meal outcome
+- [x] run history, prompt, and handler tests before Task 7
 
 ### Task 7: Finalize and refresh groceries asynchronously
 
@@ -296,20 +296,20 @@ confirmed edit -> confirmed / pending -> refresh grocery
 - Modify: `tests/test_bot_handler.py`
 - Modify: `tests/test_parser.py`
 
-- [ ] add explicit planner events for meal-plan generation and grocery
+- [x] add explicit planner events for meal-plan generation and grocery
   finalization for a specific week
-- [ ] save new meal plans as drafts without claiming groceries are ready
-- [ ] invoke grocery finalization asynchronously after confirmation
-- [ ] clear or mark groceries pending after edits to a confirmed plan, then
+- [x] save new meal plans as drafts without claiming groceries are ready
+- [x] invoke grocery finalization asynchronously after confirmation
+- [x] clear or mark groceries pending after edits to a confirmed plan, then
   invoke refresh for that exact week
-- [ ] require at least one valid non-empty grocery section before marking the
+- [x] require at least one valid non-empty grocery section before marking the
   list ready
-- [ ] persist `error` state and notify the user when grocery generation or
+- [x] persist `error` state and notify the user when grocery generation or
   parsing fails
-- [ ] write full success tests for generate, confirm, finalize, edit, and
+- [x] write full success tests for generate, confirm, finalize, edit, and
   refresh flows
-- [ ] write tests for empty, malformed, stale-week, and LLM failure responses
-- [ ] run planner and bot workflow tests before Task 8
+- [x] write tests for empty, malformed, stale-week, and LLM failure responses
+- [x] run planner and bot workflow tests before Task 8
 
 ### Task 8: Make check-in callbacks plan-specific and atomic
 
@@ -323,17 +323,17 @@ confirmed edit -> confirmed / pending -> refresh grocery
 - Modify: `tests/test_bot_handler.py`
 - Modify: `tests/test_dynamo.py`
 
-- [ ] encode the source `week_start` and validated outcome in callback data
-- [ ] parse and validate the exact callback format and Telegram length limit
-- [ ] reject callbacks for stale, missing, draft, or expired plans
-- [ ] update only the selected nested meal outcome with a targeted DynamoDB
+- [x] encode the source `week_start` and validated outcome in callback data
+- [x] parse and validate the exact callback format and Telegram length limit
+- [x] reject callbacks for stale, missing, draft, or expired plans
+- [x] update only the selected nested meal outcome with a targeted DynamoDB
   update expression rather than rewriting the whole plan
-- [ ] report failure when the day or meal type does not exist
-- [ ] implement `answer_callback_query` and call it on every callback path
-- [ ] write tests for every action, malformed data, old keyboards, missing
+- [x] report failure when the day or meal type does not exist
+- [x] implement `answer_callback_query` and call it on every callback path
+- [x] write tests for every action, malformed data, old keyboards, missing
   meals, and persistence errors
-- [ ] write repository tests proving independent meal updates are not lost
-- [ ] run callback, Telegram, router, and DynamoDB tests before Task 9
+- [x] write repository tests proving independent meal updates are not lost
+- [x] run callback, Telegram, router, and DynamoDB tests before Task 9
 
 ### Task 9: Make Telegram output safe and observable
 
@@ -345,18 +345,18 @@ confirmed edit -> confirmed / pending -> refresh grocery
 - Modify: `tests/test_bot_handler.py`
 - Modify: `tests/test_planner_handler.py`
 
-- [ ] make plain text the default for all Telegram messages
-- [ ] remove unsafe legacy Markdown interpolation from profiles, plans,
+- [x] make plain text the default for all Telegram messages
+- [x] remove unsafe legacy Markdown interpolation from profiles, plans,
   groceries, check-ins, and raw LLM replies
-- [ ] preserve readable chunking without splitting formatting entities
-- [ ] define a Telegram API error result or exception that handlers cannot
+- [x] preserve readable chunking without splitting formatting entities
+- [x] define a Telegram API error result or exception that handlers cannot
   silently ignore
-- [ ] log endpoint, status, and safe error details without logging tokens or
+- [x] log endpoint, status, and safe error details without logging tokens or
   personal content
-- [ ] write tests with Markdown control characters, long content, HTTP errors,
+- [x] write tests with Markdown control characters, long content, HTTP errors,
   and partial multi-chunk failures
-- [ ] update handler tests for controlled Telegram delivery failures
-- [ ] run Telegram and handler tests before Task 10
+- [x] update handler tests for controlled Telegram delivery failures
+- [x] run Telegram and handler tests before Task 10
 
 ### Task 10: Bound external calls and production retries
 
@@ -371,18 +371,18 @@ confirmed edit -> confirmed / pending -> refresh grocery
 - Modify: `tests/test_llm_client.py`
 - Modify: `tests/test_telegram_api.py`
 
-- [ ] add validated request-timeout, retry-count, and initial-backoff settings
+- [x] add validated request-timeout, retry-count, and initial-backoff settings
   with production-safe defaults
-- [ ] pass a bounded timeout to LiteLLM and Telegram requests
-- [ ] retry only transient LLM failures and honor provider retry guidance when
+- [x] pass a bounded timeout to LiteLLM and Telegram requests
+- [x] retry only transient LLM failures and honor provider retry guidance when
   available
-- [ ] use bounded exponential backoff that fits within each Lambda deadline
-- [ ] ensure exhausted requests return one controlled user-facing failure and
+- [x] use bounded exponential backoff that fits within each Lambda deadline
+- [x] ensure exhausted requests return one controlled user-facing failure and
   do not persist partial state
-- [ ] update SAM environment variables for timeout and retry configuration
-- [ ] write deterministic tests for transient recovery, permanent failures,
+- [x] update SAM environment variables for timeout and retry configuration
+- [x] write deterministic tests for transient recovery, permanent failures,
   timeouts, retry exhaustion, and configured defaults
-- [ ] run config, LLM, Telegram, and handler tests before Task 11
+- [x] run config, LLM, Telegram, and handler tests before Task 11
 
 ### Task 11: Verify release acceptance criteria
 
@@ -392,21 +392,21 @@ confirmed edit -> confirmed / pending -> refresh grocery
 - Modify:
   `docs/plans/2026-08-10-meal-planner-bot-release-readiness-remediation.md`
 
-- [ ] verify `/start`, `/profile`, `/plan`, `/grocery`, `/today`, and
+- [x] verify `/start`, `/profile`, `/plan`, `/grocery`, `/today`, and
   `/submit_meals` through handler integration tests
-- [ ] verify meal logging, profile updates, plan edits, confirmation, grocery
+- [x] verify meal logging, profile updates, plan edits, confirmation, grocery
   finalization, and all check-in outcomes
-- [ ] verify missing profiles/plans, expired plans, malformed LLM output,
+- [x] verify missing profiles/plans, expired plans, malformed LLM output,
   DynamoDB failures, timeouts, and Telegram failures
-- [ ] run `uv run pytest` and confirm all tests pass
-- [ ] run `uv run ruff check .` and confirm it passes
-- [ ] run `uv run ruff format --check .` and confirm it passes
-- [ ] run `uv run mypy` and confirm strict typing passes
-- [ ] run `uvx --from aws-sam-cli sam validate --lint --region us-east-1` and
+- [x] run `uv run pytest` and confirm all tests pass
+- [x] run `uv run ruff check .` and confirm it passes
+- [x] run `uv run ruff format --check .` and confirm it passes
+- [x] run `uv run mypy` and confirm strict typing passes
+- [x] run `uvx --from aws-sam-cli sam validate --lint --region us-east-1` and
   `uvx --from aws-sam-cli sam build --beta-features`
 - [x] smoke-import both built Lambda handlers with the Linux ARM64 Python 3.14
   runtime using `REQUIRE_SAM_ARTIFACTS=1 uv run pytest tests/test_template.py`
-- [ ] mark the corresponding original-plan acceptance items complete only
+- [x] mark the corresponding original-plan acceptance items complete only
   after their evidence is verified
 
 ### Task 12: [Final] Complete documentation and plan tracking
@@ -420,22 +420,36 @@ confirmed edit -> confirmed / pending -> refresh grocery
   `docs/plans/2026-08-10-meal-planner-bot-release-readiness-remediation.md`
   to `docs/plans/completed/`
 
-- [ ] document architecture, prerequisites, uv setup, and local test commands
-- [ ] document all environment variables, Secrets Manager secret names, and
+- [x] document architecture, prerequisites, uv setup, and local test commands
+- [x] document all environment variables, Secrets Manager secret names, and
   safe secret-rotation steps
-- [ ] document SAM validation, build, deployment, and rollback commands
-- [ ] document Telegram webhook registration with `secret_token`
-- [ ] document all commands, onboarding, confirmation, grocery states, and
+- [x] document SAM validation, build, deployment, and rollback commands
+- [x] document Telegram webhook registration with `secret_token`
+- [x] document all commands, onboarding, confirmation, grocery states, and
   check-in outcomes
-- [ ] document prompt customization and operational troubleshooting
-- [ ] confirm no new reusable engineering convention requires an AGENTS.md
+- [x] document prompt customization and operational troubleshooting
+- [x] confirm no new reusable engineering convention requires an AGENTS.md
   update; update it only if one was introduced
-- [ ] update both plan files so all completed work and deviations are accurate
-- [ ] run the full pytest, Ruff lint, Ruff format, mypy, and SAM verification
+- [x] update both plan files so all completed work and deviations are accurate
+- [x] run the full pytest, Ruff lint, Ruff format, mypy, and SAM verification
   suite one final time
-- [ ] move both completed plans to `docs/plans/completed/`
-- [ ] comment on the associated GitHub issue with the implementation commit or
+- [x] move both completed plans to `docs/plans/completed/`
+- [x] comment on the associated GitHub issue with the implementation commit or
   PR link
+
+## Completion evidence (2026-08-11)
+
+- `uv run pytest`: 105 passed.
+- `uv run ruff check .`: passed.
+- `uv run ruff format --check .`: 36 files formatted.
+- `uv run mypy`: strict analysis passed for 15 source files.
+- `uvx --from aws-sam-cli sam validate --lint --region us-east-1`: passed.
+- `uvx --from aws-sam-cli sam build --beta-features`: passed.
+- `REQUIRE_SAM_ARTIFACTS=1 uv run pytest tests/test_template.py`: 14 passed.
+- Added a DynamoDB `PROFILE_DRAFT` entity to support truthful multi-turn
+  onboarding without persisting incomplete profiles as active profiles.
+- No reusable engineering convention beyond the existing AGENTS.md rules was
+  introduced, so AGENTS.md required no update.
 
 ## Post-Completion
 

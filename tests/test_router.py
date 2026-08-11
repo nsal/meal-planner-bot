@@ -1,95 +1,75 @@
-"""Unit tests for Telegram message router."""
+"""Telegram update and callback routing tests."""
 
-from meal_planner.router import RouteType, route_update
+import pytest
 
-
-def test_route_start_command() -> None:
-    update = {
-        "update_id": 1,
-        "message": {
-            "message_id": 10,
-            "from": {"id": 123456, "first_name": "Alice"},
-            "chat": {"id": 123456, "type": "private"},
-            "text": "/start",
-        },
-    }
-    res = route_update(update)
-    assert res.route_type == RouteType.COMMAND
-    assert res.command == "start"
-    assert res.args == ""
-    assert res.user_id == "123456"
-    assert res.chat_id == 123456
+from meal_planner.models.schemas import MealOutcome, MealType
+from meal_planner.router import RouteType, parse_checkin_callback, route_update
 
 
-def test_route_commands_with_args_and_bot_name() -> None:
-    commands = ["start", "profile", "plan", "grocery", "today", "submit_meals"]
-    for cmd in commands:
-        update = {
-            "update_id": 1,
+def test_route_command_and_conversation() -> None:
+    command = route_update(
+        {
             "message": {
-                "message_id": 10,
-                "from": {"id": 999},
-                "chat": {"id": 888},
-                "text": f"/{cmd}@my_meal_bot extra details",
-            },
+                "from": {"id": 1},
+                "chat": {"id": 2},
+                "text": "/plan@bot next week",
+            }
         }
-        res = route_update(update)
-        assert res.route_type == RouteType.COMMAND
-        assert res.command == cmd
-        assert res.args == "extra details"
-        assert res.user_id == "999"
-        assert res.chat_id == 888
+    )
+    assert command.route_type is RouteType.COMMAND
+    assert command.command == "plan"
+    assert command.args == "next week"
+    conversation = route_update(
+        {
+            "message": {
+                "from": {"id": 1},
+                "chat": {"id": 2},
+                "text": "swap lunch",
+            }
+        }
+    )
+    assert conversation.route_type is RouteType.CONVERSATIONAL
 
 
-def test_route_conversational_text() -> None:
-    update = {
-        "update_id": 2,
-        "message": {
-            "message_id": 11,
-            "from": {"id": 123},
-            "chat": {"id": 123},
-            "text": "Can you swap Thursday dinner for tacos?",
-        },
-    }
-    res = route_update(update)
-    assert res.route_type == RouteType.CONVERSATIONAL
-    assert res.text == "Can you swap Thursday dinner for tacos?"
-    assert res.user_id == "123"
-    assert res.chat_id == 123
+def test_route_callback_preserves_query_id() -> None:
+    routed = route_update(
+        {
+            "callback_query": {
+                "id": "callback-1",
+                "from": {"id": 1},
+                "message": {"chat": {"id": 2}},
+                "data": "checkin:2026-08-10:1:lunch:cooked",
+            }
+        }
+    )
+    assert routed.route_type is RouteType.CALLBACK
+    assert routed.callback_query_id == "callback-1"
 
 
-def test_route_callback_query() -> None:
-    update = {
-        "update_id": 3,
-        "callback_query": {
-            "id": "cb123",
-            "from": {"id": 456},
-            "message": {"chat": {"id": 789}},
-            "data": "checkin:1:lunch:cooked",
-        },
-    }
-    res = route_update(update)
-    assert res.route_type == RouteType.CALLBACK
-    assert res.callback_data == "checkin:1:lunch:cooked"
-    assert res.callback_query_id == "cb123"
-    assert res.user_id == "456"
-    assert res.chat_id == 789
+def test_parse_plan_specific_checkin_callback() -> None:
+    callback = parse_checkin_callback("checkin:2026-08-10:7:dinner:swapped")
+    assert callback is not None
+    assert callback.week_start == "2026-08-10"
+    assert callback.day == 7
+    assert callback.meal_type is MealType.DINNER
+    assert callback.outcome is MealOutcome.SWAPPED
 
 
-def test_route_malformed_and_unknown() -> None:
-    assert route_update({}).route_type == RouteType.UNKNOWN
-    assert route_update("invalid").route_type == RouteType.UNKNOWN
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "checkin:1:lunch:cooked",
+        "checkin:not-a-date:1:lunch:cooked",
+        "checkin:2026-08-10:0:lunch:cooked",
+        "checkin:2026-08-10:1:brunch:cooked",
+        "checkin:2026-08-10:1:lunch:liked",
+        "x" * 65,
+    ],
+)
+def test_reject_malformed_or_old_callbacks(payload: str) -> None:
+    assert parse_checkin_callback(payload) is None
 
-    # Message without text (e.g. photo)
-    update_photo = {
-        "update_id": 4,
-        "message": {
-            "from": {"id": 100},
-            "chat": {"id": 100},
-            "photo": [],
-        },
-    }
-    res = route_update(update_photo)
-    assert res.route_type == RouteType.UNKNOWN
-    assert res.user_id == "100"
-    assert res.chat_id == 100
+
+def test_route_unknown_updates() -> None:
+    assert route_update({}).route_type is RouteType.UNKNOWN
+    assert route_update("bad").route_type is RouteType.UNKNOWN

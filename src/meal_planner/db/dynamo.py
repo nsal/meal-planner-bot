@@ -1,75 +1,154 @@
-"""DynamoDB repository implementation for meal planner bot."""
+"""DynamoDB repository for profiles, meal history, and weekly plans."""
 
+import logging
+from datetime import date, timedelta
 from typing import Any, Optional
 
 from boto3.dynamodb.conditions import Key  # type: ignore[import-untyped]
+from botocore.exceptions import ClientError  # type: ignore[import-untyped]
+from pydantic import ValidationError
 
-from meal_planner.models.schemas import MealLogEntry, UserProfile, WeeklyPlan
+from meal_planner.models.schemas import (
+    MealLogEntry,
+    MealOutcome,
+    PlanStatus,
+    ProfileUpdateEntities,
+    UserProfile,
+    WeeklyPlan,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class DynamoRepository:
-    """Repository handling CRUD operations on single-table DynamoDB."""
+    """Repository handling CRUD operations on a single DynamoDB table."""
 
     def __init__(self, table: Any) -> None:
-        """Initialize repository with a boto3 DynamoDB Table resource."""
         self.table = table
 
+    @staticmethod
+    def _data(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value for key, value in item.items() if key not in {"PK", "SK"}
+        }
+
     def get_profile(self, user_id: str) -> Optional[UserProfile]:
-        """Fetch user profile by user_id."""
         response = self.table.get_item(
             Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}
         )
         item = response.get("Item")
-        if not item:
-            return None
-        data = {k: v for k, v in item.items() if k not in ("PK", "SK")}
-        return UserProfile.model_validate(data)
+        return UserProfile.model_validate(self._data(item)) if item else None
 
     def save_profile(self, user_id: str, profile: UserProfile) -> None:
-        """Upsert user profile entity."""
-        data = profile.model_dump()
-        item = {"PK": f"USER#{user_id}", "SK": "PROFILE", **data}
-        self.table.put_item(Item=item)
+        self.table.put_item(
+            Item={
+                "PK": f"USER#{user_id}",
+                "SK": "PROFILE",
+                **profile.model_dump(mode="json"),
+            }
+        )
+
+    def get_profile_draft(self, user_id: str) -> ProfileUpdateEntities:
+        """Return accumulated onboarding fields for an incomplete profile."""
+        response = self.table.get_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE_DRAFT"}
+        )
+        item = response.get("Item")
+        if not item:
+            return ProfileUpdateEntities()
+        return ProfileUpdateEntities.model_validate(self._data(item))
+
+    def save_profile_draft(
+        self, user_id: str, draft: ProfileUpdateEntities
+    ) -> None:
+        self.table.put_item(
+            Item={
+                "PK": f"USER#{user_id}",
+                "SK": "PROFILE_DRAFT",
+                **draft.model_dump(mode="json"),
+            }
+        )
+
+    def delete_profile_draft(self, user_id: str) -> None:
+        self.table.delete_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE_DRAFT"}
+        )
 
     def log_meal(self, user_id: str, entry: MealLogEntry) -> None:
-        """Log a meal entry for a user."""
-        data = entry.model_dump()
-        item = {
-            "PK": f"USER#{user_id}",
-            "SK": f"MEAL#{entry.date}#{entry.meal_type}",
-            **data,
-        }
-        self.table.put_item(Item=item)
+        """Store a meal without overwriting another meal of the same type."""
+        created_key = entry.created_at.isoformat()
+        self.table.put_item(
+            Item={
+                "PK": f"USER#{user_id}",
+                "SK": (
+                    f"MEAL#{entry.date_key}#{created_key}#"
+                    f"{entry.meal_type.value}"
+                ),
+                **entry.model_dump(mode="json"),
+            }
+        )
 
     def get_meal_history(
-        self, user_id: str, days: int = 14
+        self,
+        user_id: str,
+        days: int = 14,
+        *,
+        on_date: date | None = None,
     ) -> list[MealLogEntry]:
-        """Query meal history for a user, returned sorted by date."""
-        response = self.table.query(
-            KeyConditionExpression=Key("PK").eq(f"USER#{user_id}")
-            & Key("SK").begins_with("MEAL#"),
-            ScanIndexForward=False,
+        """Return every valid meal in the inclusive requested date window."""
+        end_date = on_date or date.today()
+        start_date = end_date - timedelta(days=max(days, 1) - 1)
+        key_condition = Key("PK").eq(f"USER#{user_id}") & Key("SK").between(
+            f"MEAL#{start_date.isoformat()}",
+            f"MEAL#{end_date.isoformat()}~",
         )
-        items = response.get("Items", [])
+        query_kwargs: dict[str, Any] = {
+            "KeyConditionExpression": key_condition,
+            "ScanIndexForward": False,
+        }
         entries: list[MealLogEntry] = []
-        for item in items:
-            data = {k: v for k, v in item.items() if k not in ("PK", "SK")}
-            entries.append(MealLogEntry.model_validate(data))
-        entries.sort(key=lambda x: x.date, reverse=True)
-        return entries[:days]
+        while True:
+            response = self.table.query(**query_kwargs)
+            for item in response.get("Items", []):
+                try:
+                    entries.append(
+                        MealLogEntry.model_validate(self._data(item))
+                    )
+                except ValidationError as exc:
+                    logger.warning(
+                        "Skipping malformed meal history item: %s", exc
+                    )
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            query_kwargs["ExclusiveStartKey"] = last_key
+        entries.sort(key=lambda entry: entry.created_at, reverse=True)
+        return entries
 
     def save_plan(self, user_id: str, plan: WeeklyPlan) -> None:
-        """Save weekly plan entity."""
-        data = plan.model_dump(by_alias=True)
-        item = {
-            "PK": f"USER#{user_id}",
-            "SK": f"PLAN#{plan.week_start_date}",
-            **data,
-        }
-        self.table.put_item(Item=item)
+        self.table.put_item(
+            Item={
+                "PK": f"USER#{user_id}",
+                "SK": f"PLAN#{plan.week_start_date}",
+                **plan.model_dump(by_alias=True, mode="json"),
+            }
+        )
 
-    def get_current_plan(self, user_id: str) -> Optional[WeeklyPlan]:
-        """Fetch the most recent weekly plan for a user."""
+    def get_plan(
+        self, user_id: str, week_start: str | date
+    ) -> Optional[WeeklyPlan]:
+        week_key = (
+            week_start.isoformat()
+            if isinstance(week_start, date)
+            else week_start
+        )
+        response = self.table.get_item(
+            Key={"PK": f"USER#{user_id}", "SK": f"PLAN#{week_key}"}
+        )
+        item = response.get("Item")
+        return WeeklyPlan.model_validate(self._data(item)) if item else None
+
+    def get_latest_plan(self, user_id: str) -> Optional[WeeklyPlan]:
         response = self.table.query(
             KeyConditionExpression=Key("PK").eq(f"USER#{user_id}")
             & Key("SK").begins_with("PLAN#"),
@@ -77,40 +156,80 @@ class DynamoRepository:
             Limit=1,
         )
         items = response.get("Items", [])
-        if not items:
-            return None
-        item = items[0]
-        data = {k: v for k, v in item.items() if k not in ("PK", "SK")}
-        return WeeklyPlan.model_validate(data)
+        return (
+            WeeklyPlan.model_validate(self._data(items[0])) if items else None
+        )
 
-    def update_meal_status(
+    def get_active_plan(
+        self, user_id: str, on_date: date | None = None
+    ) -> Optional[WeeklyPlan]:
+        """Return the confirmed plan covering a given date."""
+        target = on_date or date.today()
+        response = self.table.query(
+            KeyConditionExpression=Key("PK").eq(f"USER#{user_id}")
+            & Key("SK").begins_with("PLAN#"),
+            ScanIndexForward=False,
+        )
+        for item in response.get("Items", []):
+            plan = WeeklyPlan.model_validate(self._data(item))
+            if (
+                plan.status is PlanStatus.CONFIRMED
+                and plan.week_start <= target <= plan.week_end
+            ):
+                return plan
+        return None
+
+    def update_meal_outcome(
         self,
         user_id: str,
         week_start: str,
         day: int,
         meal_type: str,
-        was_cooked: bool,
+        outcome: MealOutcome,
     ) -> bool:
-        """Update was_cooked status for a specific meal in a weekly plan."""
-        response = self.table.get_item(
-            Key={"PK": f"USER#{user_id}", "SK": f"PLAN#{week_start}"}
-        )
-        item = response.get("Item")
-        if not item:
+        """Atomically update one nested outcome without rewriting the plan."""
+        plan = self.get_plan(user_id, week_start)
+        if not plan or plan.status is not PlanStatus.CONFIRMED:
             return False
-
-        data = {k: v for k, v in item.items() if k not in ("PK", "SK")}
-        plan = WeeklyPlan.model_validate(data)
-
-        updated = False
-        for plan_day in plan.days:
-            if plan_day.day == day:
-                for meal in plan_day.meals:
-                    if meal.meal_type.lower() == meal_type.lower():
-                        meal.was_cooked = was_cooked
-                        updated = True
-
-        if updated:
-            self.save_plan(user_id, plan)
-
-        return updated
+        day_index: int | None = None
+        meal_index: int | None = None
+        for candidate_day_index, plan_day in enumerate(plan.days):
+            if plan_day.day != day:
+                continue
+            for candidate_meal_index, meal in enumerate(plan_day.meals):
+                if meal.meal_type.value == meal_type.lower():
+                    day_index = candidate_day_index
+                    meal_index = candidate_meal_index
+                    break
+        if day_index is None or meal_index is None:
+            return False
+        try:
+            self.table.update_item(
+                Key={
+                    "PK": f"USER#{user_id}",
+                    "SK": f"PLAN#{week_start}",
+                },
+                UpdateExpression=(
+                    f"SET #days[{day_index}].#meals[{meal_index}].#outcome "
+                    "= :outcome"
+                ),
+                ConditionExpression="#status = :confirmed",
+                ExpressionAttributeNames={
+                    "#days": "days",
+                    "#meals": "meals",
+                    "#outcome": "outcome",
+                    "#status": "status",
+                },
+                ExpressionAttributeValues={
+                    ":outcome": outcome.value,
+                    ":confirmed": PlanStatus.CONFIRMED.value,
+                },
+            )
+        except ClientError as exc:
+            if (
+                exc.response.get("Error", {}).get("Code")
+                == "ConditionalCheckFailedException"
+            ):
+                return False
+            raise
+        return True

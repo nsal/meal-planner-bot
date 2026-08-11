@@ -5,6 +5,10 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from meal_planner.models.schemas import MealOutcome, MealType
+
+MAX_CALLBACK_DATA_BYTES = 64
+
 
 class RouteType(str, Enum):
     """Types of update routes."""
@@ -37,6 +41,36 @@ SUPPORTED_COMMANDS = {
     "today",
     "submit_meals",
 }
+
+
+class CheckinCallback(BaseModel):
+    """Validated, plan-specific check-in callback payload."""
+
+    week_start: str
+    day: int = Field(ge=1, le=7)
+    meal_type: MealType
+    outcome: MealOutcome
+
+
+def parse_checkin_callback(data: str) -> CheckinCallback | None:
+    """Parse the exact callback format accepted by check-in handlers."""
+    if len(data.encode("utf-8")) > MAX_CALLBACK_DATA_BYTES:
+        return None
+    parts = data.split(":")
+    if len(parts) != 5 or parts[0] != "checkin":
+        return None
+    try:
+        from datetime import date
+
+        date.fromisoformat(parts[1])
+        return CheckinCallback(
+            week_start=parts[1],
+            day=int(parts[2]),
+            meal_type=MealType(parts[3]),
+            outcome=MealOutcome(parts[4]),
+        )
+    except TypeError, ValueError:
+        return None
 
 
 def route_update(update: dict[str, Any]) -> RouteResult:

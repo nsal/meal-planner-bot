@@ -22,6 +22,25 @@ class Settings(BaseSettings):
         default="meal-planner", alias="DYNAMODB_TABLE_NAME"
     )
     aws_region: str = Field(default="us-east-1", alias="AWS_REGION")
+    telegram_request_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        le=20,
+        alias="TELEGRAM_REQUEST_TIMEOUT_SECONDS",
+    )
+    llm_request_timeout_seconds: float = Field(
+        default=20.0,
+        gt=0,
+        le=25,
+        alias="LLM_REQUEST_TIMEOUT_SECONDS",
+    )
+    llm_max_retries: int = Field(default=3, ge=1, le=5, alias="LLM_MAX_RETRIES")
+    llm_initial_backoff_seconds: float = Field(
+        default=1.0,
+        ge=0,
+        le=5,
+        alias="LLM_INITIAL_BACKOFF_SECONDS",
+    )
 
     @field_validator("telegram_bot_token", "llm_api_key")
     @classmethod

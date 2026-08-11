@@ -1,6 +1,14 @@
 # Meal Planner Bot
 
 ## Overview
+
+> Completion note (2026-08-11): the release-readiness remediation superseded
+> several original implementation details. The final system targets Python
+> 3.14 ARM64, uses `pyproject.toml` plus `uv.lock` instead of requirements
+> files, stores secrets in Secrets Manager, uses typed meal outcomes instead
+> of `was_cooked`, and generates groceries only after plan confirmation. The
+> project is pre-release, so these are intentional clean schema changes.
+
 - A Telegram-based family meal planning assistant powered by LLM
 - Solves the daily "what to cook" problem by generating weekly meal plans tailored to user preferences, allergies, restrictions, and per-person calorie targets
 - Generates consolidated grocery lists from confirmed plans
@@ -397,29 +405,31 @@ meal-planner-bot/
 
 ### Task 13: Verify acceptance criteria
 
-- [ ] Verify all commands work: `/start`, `/profile`, `/plan`, `/grocery`, `/today`, `/submit_meals`
-- [ ] Verify conversational flows: meal logging, plan editing, profile updates, general questions
-- [ ] Verify plan generation produces valid structured output with correct calorie targets
-- [ ] Verify grocery list consolidates ingredients and multiplies by family size
-- [ ] Verify `/submit_meals` inline keyboard and callback handling
-- [ ] Verify error handling: missing profile, no plan, LLM failures
-- [ ] Run full test suite: `pytest tests/ -v`
-- [ ] Verify test coverage meets reasonable standard
+- [x] Verify all commands work: `/start`, `/profile`, `/plan`, `/grocery`, `/today`, `/submit_meals`
+- [x] Verify conversational flows: meal logging, plan editing, profile updates, general questions
+- [x] Verify plan generation produces valid structured output with correct calorie targets
+- [x] Verify grocery list consolidates ingredients and multiplies by family size
+- [x] Verify `/submit_meals` inline keyboard and callback handling
+- [x] Verify error handling: missing profile, no plan, LLM failures
+- [x] Run full test suite: `uv run pytest`
+- [x] Verify test coverage is risk-focused across domain, persistence, handlers,
+  external calls, and deployment artifacts
 
 ### Task 14: Update documentation
 
-- [ ] Create README.md with: project description, architecture diagram, setup instructions (BotFather, AWS credentials, env vars), deployment steps (`sam build && sam deploy`), usage guide for all commands
-- [ ] Document environment variables and secrets required
-- [ ] Document prompt templates and how to customize rules
-- [ ] Move this plan to `docs/plans/completed/`
+- [x] Create README.md with architecture, setup, deployment, and command usage
+- [x] Document environment variables and Secrets Manager inputs
+- [x] Document prompt templates and customization rules
+- [x] Move this plan to `docs/plans/completed/`
 
 ---
 
 ## Post-Completion
 - Register Telegram bot with BotFather, obtain bot token
-- Store bot token and LLM API key in AWS SSM Parameter Store
+- Store bot token, webhook secret, and LLM API key in Secrets Manager
 - Deploy with `sam build && sam deploy --guided`
-- Set Telegram webhook URL to API GW endpoint: `https://api.telegram.org/bot<token>/setWebhook?url=<api-gw-url>`
+- Set the Telegram webhook URL and matching `secret_token` as documented in
+  README.md
 - Send `/start` to the bot and complete onboarding
 - Test full flow: onboarding → `/plan` → review plan → `/grocery` → `/submit_meals`
 - Iterate on prompt rules based on actual plan quality

@@ -1,11 +1,38 @@
 """Tests for LLM response parser functions."""
 
+import json
+from typing import Any
+
 from meal_planner.llm.parser import (
     parse_conversational_response,
     parse_grocery_response,
     parse_plan_response,
 )
 from meal_planner.models.schemas import ConversationIntent
+
+
+def make_plan_data() -> dict[str, Any]:
+    """Return a complete valid seven-day LLM plan payload."""
+    return {
+        "week_start_date": "2026-08-10",
+        "status": "draft",
+        "days": [
+            {
+                "day": day,
+                "meals": [
+                    {
+                        "meal_type": "breakfast",
+                        "name": f"Oatmeal {day}",
+                        "ingredients": [{"item": "Oats", "amount": "100g"}],
+                        "est_calories": 300,
+                        "outcome": "unreported",
+                    }
+                ],
+            }
+            for day in range(1, 8)
+        ],
+        "grocery_list": [],
+    }
 
 
 def test_parse_conversational_response_valid() -> None:
@@ -51,49 +78,21 @@ def test_parse_conversational_response_empty() -> None:
 
 def test_parse_plan_response_dict() -> None:
     """Test parse_plan_response with valid dict input."""
-    data = {
-        "week_start_date": "2026-08-10",
-        "status": "draft",
-        "days": [
-            {
-                "day": 1,
-                "meals": [
-                    {
-                        "meal_type": "breakfast",
-                        "name": "Oatmeal",
-                        "ingredients": [{"item": "Oats", "amount": "100g"}],
-                        "est_calories": 300,
-                        "was_cooked": False,
-                    }
-                ],
-            }
-        ],
-        "grocery_list": [],
-    }
+    data = make_plan_data()
     plan = parse_plan_response(data)
     assert plan is not None
     assert plan.week_start_date == "2026-08-10"
-    assert plan.days[0].meals[0].name == "Oatmeal"
+    assert plan.days[0].meals[0].name == "Oatmeal 1"
 
 
 def test_parse_plan_response_json_string() -> None:
     """Test parse_plan_response with raw markdown JSON string."""
-    raw_text = (
-        "Here is your 7-day meal plan:\n"
-        "```json\n"
-        "{\n"
-        '  "week_start_date": "2026-08-10",\n'
-        '  "status": "draft",\n'
-        '  "days": [\n'
-        '    {"day": 1, "meals": [{"meal_type": "dinner", "name": "Tacos"}]}\n'
-        "  ]\n"
-        "}\n"
-        "```"
-    )
+    data = make_plan_data()
+    raw_text = f"Here is your plan:\n```json\n{json.dumps(data)}\n```"
     plan = parse_plan_response(raw_text)
     assert plan is not None
     assert plan.week_start_date == "2026-08-10"
-    assert plan.days[0].meals[0].name == "Tacos"
+    assert plan.days[0].meals[0].name == "Oatmeal 1"
 
 
 def test_parse_plan_response_invalid() -> None:
@@ -101,6 +100,17 @@ def test_parse_plan_response_invalid() -> None:
     assert parse_plan_response("") is None
     assert parse_plan_response("No plan here") is None
     assert parse_plan_response({"invalid": "schema"}) is None
+
+
+def test_parse_plan_response_rejects_incomplete_and_duplicate_days() -> None:
+    """Plan parser enforces the complete-week domain invariant."""
+    partial = make_plan_data()
+    partial["days"] = partial["days"][:-1]
+    assert parse_plan_response(partial) is None
+
+    duplicate = make_plan_data()
+    duplicate["days"] = [{"day": 1, "meals": []} for _ in range(7)]
+    assert parse_plan_response(duplicate) is None
 
 
 def test_parse_grocery_response_dict() -> None:

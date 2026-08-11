@@ -23,13 +23,34 @@ class LLMClient:
         model: str = "gpt-4o-mini",
         api_key: str = "",
         max_retries: int = 3,
-        initial_backoff: float = 0.01,
+        initial_backoff: float = 1.0,
+        request_timeout: float = 20.0,
     ) -> None:
         """Initialize LLM client with model settings and retry parameters."""
         self.model = model
         self.api_key = api_key
         self.max_retries = max_retries
-        self.initial_backoff = initial_backoff
+        self.initial_backoff: float = initial_backoff
+        self.request_timeout: float = request_timeout
+
+    @staticmethod
+    def _is_transient(exc: Exception) -> bool:
+        """Return whether an error is safe to retry."""
+        if isinstance(
+            exc, (TimeoutError, ConnectionError, asyncio.TimeoutError)
+        ):
+            return True
+        status = getattr(exc, "status_code", None)
+        return status in {408, 409, 429, 500, 502, 503, 504}
+
+    def _retry_delay(self, exc: Exception, attempt: int) -> float:
+        """Use provider retry guidance or bounded exponential backoff."""
+        retry_after = getattr(exc, "retry_after", None)
+        if isinstance(retry_after, (int, float)) and retry_after >= 0:
+            guided_delay: float = float(retry_after)
+            return min(guided_delay, 5.0)
+        delay: float = self.initial_backoff * float(2**attempt)
+        return delay if delay < 5.0 else 5.0
 
     async def _execute_with_retry(
         self,
@@ -40,6 +61,7 @@ class LLMClient:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
+            "timeout": self.request_timeout,
         }
         if self.api_key:
             kwargs["api_key"] = self.api_key
@@ -67,12 +89,13 @@ class LLMClient:
                 logger.warning(
                     "LLM request attempt %d failed: %s", attempt + 1, exc
                 )
-                if attempt < self.max_retries - 1:
-                    sleep_time = self.initial_backoff * (2**attempt)
-                    await asyncio.sleep(sleep_time)
-                else:
-                    logger.error("LLM request failed after max retries.")
+                if not self._is_transient(exc):
+                    logger.error("LLM request failed permanently")
                     return None
+                if attempt >= self.max_retries - 1:
+                    logger.error("LLM request failed after max retries")
+                    return None
+                await asyncio.sleep(self._retry_delay(exc, attempt))
         return None
 
     async def chat(self, system_prompt: str, user_message: str) -> str:

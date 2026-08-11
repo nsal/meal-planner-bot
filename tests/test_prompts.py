@@ -9,6 +9,7 @@ from meal_planner.models.schemas import (
     FamilyMember,
     Ingredient,
     MealLogEntry,
+    MealOutcome,
     PlanDay,
     PlannedMeal,
     UserProfile,
@@ -30,7 +31,10 @@ def test_build_conversational_prompt_with_context() -> None:
     member = FamilyMember(name="Alice", calorie_target=1800)
     profile = UserProfile(
         name="John",
-        family_members=[member],
+        family_members=[
+            member,
+            FamilyMember(name="John", calorie_target=2100),
+        ],
         allergies=["peanuts"],
         dietary_preferences=["low-carb"],
         restrictions=["dairy-free"],
@@ -39,7 +43,8 @@ def test_build_conversational_prompt_with_context() -> None:
     )
     meal = PlannedMeal(meal_type="lunch", name="Salad")
     day = PlanDay(day=1, meals=[meal])
-    plan = WeeklyPlan(week_start="2026-08-10", status="confirmed", days=[day])
+    days = [day, *(PlanDay(day=value) for value in range(2, 8))]
+    plan = WeeklyPlan(week_start="2026-08-10", status="confirmed", days=days)
     history = [
         MealLogEntry(
             date="2026-08-04",
@@ -75,7 +80,11 @@ def test_build_plan_prompt_with_context() -> None:
     member = FamilyMember(name="Bob", calorie_target=2200)
     profile = UserProfile(
         name="Alice",
-        family_members=[member],
+        family_members=[
+            member,
+            FamilyMember(name="Alice", calorie_target=1800),
+            FamilyMember(name="Charlie", calorie_target=2000),
+        ],
         allergies=["shellfish"],
         dietary_preferences=["keto"],
         people_count=3,
@@ -89,10 +98,16 @@ def test_build_plan_prompt_with_context() -> None:
         )
     ]
     prev_meal_cooked = PlannedMeal(
-        meal_type="dinner", name="Steak", was_cooked=True
+        meal_type="dinner", name="Steak", outcome=MealOutcome.COOKED
     )
     prev_meal_skipped = PlannedMeal(
-        meal_type="lunch", name="Soup", was_cooked=False
+        meal_type="lunch", name="Soup", outcome=MealOutcome.SKIPPED
+    )
+    prev_meal_swapped = PlannedMeal(
+        meal_type="dinner", name="Pasta", outcome=MealOutcome.SWAPPED
+    )
+    prev_meal_unreported = PlannedMeal(
+        meal_type="snack", name="Fruit", outcome=MealOutcome.UNREPORTED
     )
     prev_plan = WeeklyPlan(
         week_start="2026-08-03",
@@ -100,6 +115,8 @@ def test_build_plan_prompt_with_context() -> None:
         days=[
             PlanDay(day=1, meals=[prev_meal_cooked]),
             PlanDay(day=2, meals=[prev_meal_skipped]),
+            PlanDay(day=3, meals=[prev_meal_swapped, prev_meal_unreported]),
+            *(PlanDay(day=value) for value in range(4, 8)),
         ],
     )
 
@@ -115,6 +132,8 @@ def test_build_plan_prompt_with_context() -> None:
     assert "Salmon" in prompt
     assert "Cooked: Steak" in prompt
     assert "Skipped: Soup" in prompt
+    assert "Swapped: Pasta" in prompt
+    assert "Fruit" not in prompt
 
 
 def test_build_grocery_prompt() -> None:
@@ -125,7 +144,10 @@ def test_build_grocery_prompt() -> None:
         meal_type="dinner", name="Chicken Rice", ingredients=[ing1, ing2]
     )
     day = PlanDay(day=1, meals=[meal])
-    plan = WeeklyPlan(week_start="2026-08-10", days=[day])
+    plan = WeeklyPlan(
+        week_start="2026-08-10",
+        days=[day, *(PlanDay(day=value) for value in range(2, 8))],
+    )
 
     prompt = build_grocery_prompt(plan=plan, people_count=4)
     assert "Scale quantities for 4 people." in prompt

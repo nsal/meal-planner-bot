@@ -7,11 +7,14 @@ from meal_planner.models.schemas import (
     ConversationIntent,
     FamilyMember,
     GrocerySection,
+    GroceryStatus,
     Ingredient,
     LLMResponseMetadata,
     MealLogEntry,
+    MealOutcome,
     PlanDay,
     PlannedMeal,
+    PlanStatus,
     UserProfile,
     WeeklyPlan,
 )
@@ -47,14 +50,17 @@ def test_user_profile_full() -> None:
     member = FamilyMember(name="Bob", calorie_target=2200)
     profile = UserProfile(
         name="John Doe",
-        family_members=[member],
+        family_members=[
+            member,
+            FamilyMember(name="Jane Doe", calorie_target=1800),
+        ],
         allergies=["peanuts"],
         dietary_preferences=["keto"],
         restrictions=["gluten-free"],
         goals=["weight-loss"],
         people_count=2,
     )
-    assert len(profile.family_members) == 1
+    assert len(profile.family_members) == 2
     assert profile.allergies == ["peanuts"]
     assert profile.people_count == 2
 
@@ -73,13 +79,13 @@ def test_ingredient_and_planned_meal() -> None:
         name="Grilled Chicken",
         ingredients=[ing],
         est_calories=650,
-        was_cooked=True,
+        outcome=MealOutcome.COOKED,
     )
     assert meal.meal_type == "dinner"
     assert meal.name == "Grilled Chicken"
     assert len(meal.ingredients) == 1
     assert meal.ingredients[0].item == "Chicken breast"
-    assert meal.was_cooked is True
+    assert meal.outcome is MealOutcome.COOKED
 
 
 def test_plan_day_validation() -> None:
@@ -98,17 +104,18 @@ def test_plan_day_validation() -> None:
 def test_weekly_plan_and_grocery_section() -> None:
     """Test WeeklyPlan and GrocerySection instantiation."""
     sec = GrocerySection(name="Produce", items=["Apples", "Bananas"])
-    day1 = PlanDay(day=1)
+    days = [PlanDay(day=day) for day in range(1, 8)]
     plan = WeeklyPlan(
         week_start="2026-08-10",
-        status="confirmed",
-        days=[day1],
+        status=PlanStatus.CONFIRMED,
+        days=days,
+        grocery_status=GroceryStatus.READY,
         grocery_list=[sec],
     )
-    assert plan.week_start == "2026-08-10"
+    assert plan.week_start.isoformat() == "2026-08-10"
     assert plan.week_start_date == "2026-08-10"
-    assert plan.status == "confirmed"
-    assert len(plan.days) == 1
+    assert plan.status is PlanStatus.CONFIRMED
+    assert len(plan.days) == 7
     assert len(plan.grocery_list) == 1
 
 
@@ -120,8 +127,34 @@ def test_meal_log_entry() -> None:
         description="Salad with olive oil",
         created_at="2026-08-05T12:30:00Z",
     )
-    assert entry.date == "2026-08-05"
-    assert entry.meal_type == "lunch"
+    assert entry.date.isoformat() == "2026-08-05"
+    assert entry.meal_type.value == "lunch"
+
+
+@pytest.mark.parametrize(
+    "days",
+    [
+        [PlanDay(day=day) for day in range(1, 7)],
+        [PlanDay(day=1) for _ in range(7)],
+    ],
+)
+def test_weekly_plan_requires_complete_unique_week(
+    days: list[PlanDay],
+) -> None:
+    """Plans must contain exactly one entry for every day of the week."""
+    with pytest.raises(ValidationError):
+        WeeklyPlan(week_start="2026-08-10", days=days)
+
+
+def test_weekly_plan_rejects_invalid_date_status_and_outcome() -> None:
+    """Typed plan fields reject malformed LLM values."""
+    days = [PlanDay(day=day) for day in range(1, 8)]
+    with pytest.raises(ValidationError):
+        WeeklyPlan(week_start="not-a-date", days=days)
+    with pytest.raises(ValidationError):
+        WeeklyPlan(week_start="2026-08-10", status="active", days=days)
+    with pytest.raises(ValidationError):
+        PlannedMeal(meal_type="lunch", name="Soup", outcome="maybe")
 
 
 def test_llm_response_metadata_and_intent() -> None:

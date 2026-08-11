@@ -199,7 +199,10 @@ lowercase name. Remove them or pick one convention.
 **File:** [`llm/client.py:26`](file:///Users/nikolaysalionov/code/meal-planner-bot/src/meal_planner/llm/client.py#L26)
 
 ```python
-initial_backoff: float = (0.01,)
+def __init__(
+    ...,
+    initial_backoff: float = 0.01,
+) -> None:
 ```
 
 This is a test-friendly default but not a real production default. For

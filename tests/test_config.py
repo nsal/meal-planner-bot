@@ -42,6 +42,10 @@ def test_config_default_values(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LLM_MODEL", raising=False)
     monkeypatch.delenv("DYNAMODB_TABLE_NAME", raising=False)
     monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("TELEGRAM_REQUEST_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("LLM_REQUEST_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("LLM_MAX_RETRIES", raising=False)
+    monkeypatch.delenv("LLM_INITIAL_BACKOFF_SECONDS", raising=False)
 
     settings = Settings()
     assert settings.telegram_bot_token == "token123"
@@ -49,6 +53,10 @@ def test_config_default_values(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.llm_model == "gpt-4o-mini"
     assert settings.dynamodb_table_name == "meal-planner"
     assert settings.aws_region == "us-east-1"
+    assert settings.telegram_request_timeout_seconds == 10
+    assert settings.llm_request_timeout_seconds == 20
+    assert settings.llm_max_retries == 3
+    assert settings.llm_initial_backoff_seconds == 1
 
 
 def test_config_missing_required_token(
@@ -101,3 +109,23 @@ def test_config_rejects_whitespace_webhook_secret(
     with pytest.raises(ValidationError) as exc_info:
         WebhookSettings()
     assert "telegram_webhook_secret" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("TELEGRAM_REQUEST_TIMEOUT_SECONDS", "0"),
+        ("LLM_REQUEST_TIMEOUT_SECONDS", "30"),
+        ("LLM_MAX_RETRIES", "0"),
+        ("LLM_INITIAL_BACKOFF_SECONDS", "10"),
+    ],
+)
+def test_config_rejects_unbounded_external_call_settings(
+    mock_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValidationError):
+        Settings()

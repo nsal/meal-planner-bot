@@ -165,6 +165,94 @@ def _require_artifact(artifact: Path) -> None:
     pytest.skip(message)
 
 
+def _contains_text(value: object, needle: str) -> bool:
+    """Return whether a nested CloudFormation value contains text."""
+    if isinstance(value, str):
+        return needle in value
+    if isinstance(value, dict):
+        return any(
+            _contains_text(key, needle) or _contains_text(item, needle)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_contains_text(item, needle) for item in value)
+    return False
+
+
+def _assert_built_template_is_current() -> None:
+    """Verify the generated template reflects the checked-in template."""
+    built_template_path = BUILD_ROOT / "template.yaml"
+    assert built_template_path.is_file(), (
+        f"SAM build template missing at {built_template_path}"
+    )
+    with built_template_path.open(encoding="utf-8") as template_file:
+        built_template = yaml.load(template_file, Loader=CloudFormationLoader)
+    assert isinstance(built_template, dict)
+
+    source_template = _load_template()
+    source_globals = source_template["Globals"]["Function"]
+    built_globals = built_template["Globals"]["Function"]
+    assert built_globals["Runtime"] == source_globals["Runtime"]
+    assert built_globals["Architectures"] == source_globals["Architectures"]
+    assert (
+        built_template["Parameters"].keys()
+        == source_template["Parameters"].keys()
+    )
+
+    for logical_id in ("BotFunction", "PlannerFunction"):
+        source_resource = source_template["Resources"][logical_id]
+        built_resource = built_template["Resources"][logical_id]
+        assert (
+            built_resource["Properties"]["Handler"]
+            == source_resource["Properties"]["Handler"]
+        )
+        assert (
+            built_resource["Metadata"]["BuildMethod"]
+            == source_resource["Metadata"]["BuildMethod"]
+        )
+
+    built_global_variables = built_globals["Environment"]["Variables"]
+    for variable_name, parameter_name in (
+        ("TELEGRAM_BOT_TOKEN", "TelegramBotTokenSecretName"),
+        ("LLM_API_KEY", "LlmApiKeySecretName"),
+    ):
+        dynamic_reference = built_global_variables[variable_name]
+        assert _contains_text(dynamic_reference, "secretsmanager")
+        assert _contains_text(dynamic_reference, parameter_name)
+
+    built_bot_variables = built_template["Resources"]["BotFunction"][
+        "Properties"
+    ]["Environment"]["Variables"]
+    webhook_reference = built_bot_variables["TELEGRAM_WEBHOOK_SECRET"]
+    assert _contains_text(webhook_reference, "secretsmanager")
+    assert _contains_text(webhook_reference, "TelegramWebhookSecretName")
+
+
+def _assert_source_files_match_artifact(artifact: Path) -> None:
+    """Verify the artifact contains the current application source files."""
+    source_files = [
+        (
+            PROJECT_ROOT / "meal_planner" / "__init__.py",
+            Path("meal_planner") / "__init__.py",
+        )
+    ]
+    source_files.extend(
+        (
+            source_path,
+            Path("src") / source_path.relative_to(PROJECT_ROOT / "src"),
+        )
+        for source_path in sorted(
+            (PROJECT_ROOT / "src" / "meal_planner").rglob("*.py")
+        )
+    )
+    for source_path, artifact_relative_path in source_files:
+        artifact_path = artifact / artifact_relative_path
+        assert artifact_path.is_file(), artifact_relative_path
+        assert artifact_path.read_bytes() == source_path.read_bytes(), (
+            f"SAM artifact is stale for {artifact_relative_path}"
+        )
+
+
 def _import_lambda_handler(artifact: Path, module_name: str) -> None:
     """Import a Lambda handler in an isolated subprocess."""
     import_script = (
@@ -215,6 +303,11 @@ def test_lambda_build_configuration() -> None:
     function_globals = template["Globals"]["Function"]
     assert function_globals["Runtime"] == "python3.14"
     assert function_globals["Architectures"] == ["arm64"]
+    variables = function_globals["Environment"]["Variables"]
+    assert variables["TELEGRAM_REQUEST_TIMEOUT_SECONDS"] == "10"
+    assert variables["LLM_REQUEST_TIMEOUT_SECONDS"] == "20"
+    assert variables["LLM_MAX_RETRIES"] == "3"
+    assert variables["LLM_INITIAL_BACKOFF_SECONDS"] == "1"
 
 
 def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
@@ -384,6 +477,8 @@ def test_built_artifact_imports_lambda_handler(
 
     artifact = _built_artifact(logical_id)
     _require_artifact(artifact)
+    _assert_built_template_is_current()
+    _assert_source_files_match_artifact(artifact)
 
     for dependency in (
         "aiogram",
