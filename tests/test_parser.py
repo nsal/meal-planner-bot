@@ -113,6 +113,21 @@ def test_parse_plan_response_rejects_incomplete_and_duplicate_days() -> None:
     assert parse_plan_response(duplicate) is None
 
 
+def test_parse_plan_response_rejects_duplicate_meal_types_in_a_day() -> None:
+    data = make_plan_data()
+    data["days"][0]["meals"].append(
+        {
+            "meal_type": "breakfast",
+            "name": "Second breakfast",
+            "ingredients": [],
+            "est_calories": 200,
+            "outcome": "unreported",
+        }
+    )
+
+    assert parse_plan_response(data) is None
+
+
 def test_parse_grocery_response_dict() -> None:
     """Test parse_grocery_response with valid dict input."""
     data = {

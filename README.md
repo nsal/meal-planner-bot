@@ -219,12 +219,18 @@ aws cloudformation delete-stack --stack-name "$STACK_NAME" \
 ## User workflow
 
 - `/start` begins onboarding. Supply the household size, every person's name
-  and calorie target, allergies, preferences, restrictions, and goals.
+  and calorie target, allergies, preferences, restrictions, and goals. Known
+  onboarding fields carry across conversational turns, so provide only the
+  fields the bot still requests.
 - `/profile` shows the persisted profile.
 - `/plan` asynchronously generates a complete seven-day draft.
 - Ask conversationally to edit an existing meal; missing days or meal types
   are rejected rather than silently created.
 - Tell the bot to confirm the draft. Confirmation starts grocery generation.
+- Expired drafts cannot be confirmed or edited. Confirmed plans can be edited
+  only while they are the active plan covering today.
+- Each plan day contains at most one breakfast, lunch, dinner, and snack, so a
+  day-and-meal-type selection always addresses one meal.
 - Repeating confirmation on a confirmed plan retries groceries only when the
   previous grocery attempt is in `error`; `pending` and `ready` are not reset.
 - `/grocery` reports `pending`, `ready`, or `error`, and shows ready sections.
@@ -260,7 +266,8 @@ non-empty section before it can become ready.
   and do not invalidate grocery content; meal edits advance the revision and
   trigger a fresh grocery request.
 - Incomplete profile updates are retained as a draft, including household
-  size and partial member targets, so the next turn can finish onboarding.
+  size and partial member targets, so the next turn can finish onboarding
+  without resubmitting known fields.
 - Telegram delivery failure: check the endpoint status in logs; logs omit bot
   tokens and message content.
 - SAM smoke-test failure: rerun a clean SAM build. Tests reject stale source or

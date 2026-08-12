@@ -45,6 +45,28 @@ def test_generate_plan_rejects_missing_profile_and_malformed_plan(
     repo.save_generated_draft.assert_not_called()
 
 
+def test_generate_plan_rejects_ambiguous_daily_meals(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = make_plan_payload(date(2026, 8, 10))
+    payload["days"][0]["meals"].append(payload["days"][0]["meals"][0])
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user", 1, week_start=date(2026, 8, 10)
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    api.send_plan.assert_not_called()
+    assert "valid meal plan" in api.send_message.call_args.args[1]
+
+
 def test_late_generation_result_does_not_replace_confirmed_week(
     mocker: Any,
 ) -> None:

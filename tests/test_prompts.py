@@ -12,6 +12,7 @@ from meal_planner.models.schemas import (
     MealOutcome,
     PlanDay,
     PlannedMeal,
+    ProfileUpdateEntities,
     UserProfile,
     WeeklyPlan,
 )
@@ -64,6 +65,45 @@ def test_build_conversational_prompt_with_context() -> None:
     assert "Status: confirmed" in prompt
     assert "Day 1: lunch: Salad" in prompt
     assert "Tacos" in prompt
+
+
+def test_build_conversational_prompt_with_partial_profile_draft() -> None:
+    prompt = build_conversational_prompt(
+        profile_draft=ProfileUpdateEntities(name="Alex", people_count=2)
+    )
+
+    assert "--- Saved Profile ---" in prompt
+    assert "--- Pending Profile Updates ---" in prompt
+    assert "Name: Alex" in prompt
+    assert "People Count: 2" in prompt
+    assert "Family Members: Missing" in prompt
+    assert "Allergies: Missing" in prompt
+    assert "Family Members: None specified" not in prompt
+
+
+def test_prompt_separates_saved_and_pending_values() -> None:
+    profile = UserProfile(name="Alex", allergies=["shellfish"])
+    draft = ProfileUpdateEntities(allergies=["peanuts"])
+
+    prompt = build_conversational_prompt(
+        profile=profile,
+        profile_draft=draft,
+    )
+
+    saved_start = prompt.index("--- Saved Profile ---")
+    pending_start = prompt.index("--- Pending Profile Updates ---")
+    assert "Allergies: shellfish" in prompt[saved_start:pending_start]
+    assert "Allergies: peanuts" in prompt[pending_start:]
+
+
+def test_build_conversational_prompt_renders_pending_family_members() -> None:
+    prompt = build_conversational_prompt(
+        profile_draft=ProfileUpdateEntities(
+            family_members=[{"name": "Sam", "calorie_target": 1800}]
+        )
+    )
+
+    assert "Family Members: Sam (1800 kcal)" in prompt
 
 
 def test_build_plan_prompt_empty() -> None:

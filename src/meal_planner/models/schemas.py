@@ -140,6 +140,16 @@ class PlanDay(BaseModel):
     day: int = Field(ge=1, le=7)
     meals: list[PlannedMeal] = Field(default_factory=list, max_length=4)
 
+    @model_validator(mode="after")
+    def validate_unique_meal_types(self) -> "PlanDay":
+        """Keep each meal type uniquely addressable within the day."""
+        meal_types = [meal.meal_type.value for meal in self.meals]
+        if len(meal_types) != len(set(meal_types)):
+            raise ValueError(
+                "meals must contain at most one meal of each meal type"
+            )
+        return self
+
 
 class GrocerySection(BaseModel):
     """A non-empty supermarket section in a grocery list."""

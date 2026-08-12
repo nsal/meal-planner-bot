@@ -109,6 +109,27 @@ def test_plan_day_validation() -> None:
             ],
         )
 
+    distinct_meals = PlanDay(
+        day=3,
+        meals=[
+            PlannedMeal(meal_type=meal_type, name=meal_type)
+            for meal_type in ("breakfast", "lunch", "dinner", "snack")
+        ],
+    )
+    assert len(distinct_meals.meals) == 4
+
+    with pytest.raises(
+        ValidationError,
+        match="at most one meal of each meal type",
+    ):
+        PlanDay(
+            day=3,
+            meals=[
+                PlannedMeal(meal_type="lunch", name="Soup"),
+                PlannedMeal(meal_type="lunch", name="Salad"),
+            ],
+        )
+
 
 def test_weekly_plan_and_grocery_section() -> None:
     """Test WeeklyPlan and GrocerySection instantiation."""

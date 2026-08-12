@@ -290,8 +290,14 @@ class BotHandler:
             return
         try:
             profile = self.repo.get_profile(route.user_id)
+            profile_draft = self.repo.get_profile_draft(route.user_id)
             prompt = build_conversational_prompt(
                 profile=profile,
+                profile_draft=(
+                    profile_draft
+                    if isinstance(profile_draft, ProfileUpdateEntities)
+                    else None
+                ),
                 current_plan=self.repo.get_latest_plan(route.user_id),
                 recent_meals=self.repo.get_meal_history(route.user_id, days=14),
             )
@@ -407,13 +413,37 @@ class BotHandler:
         self.repo.delete_profile_draft(user_id)
         return MutationResult(True, "Your profile has been saved.")
 
+    @staticmethod
+    def _is_eligible_draft(plan: WeeklyPlan | None) -> bool:
+        return bool(
+            plan
+            and plan.status is PlanStatus.DRAFT
+            and plan.week_end >= date.today()
+        )
+
+    @staticmethod
+    def _is_active_confirmed_plan(plan: WeeklyPlan | None) -> bool:
+        today = date.today()
+        return bool(
+            plan
+            and plan.status is PlanStatus.CONFIRMED
+            and plan.week_start <= today <= plan.week_end
+        )
+
     def _confirm_plan(self, user_id: str, chat_id: int | str) -> MutationResult:
         latest_plan = self.repo.get_latest_plan(user_id)
-        plan: WeeklyPlan | None = latest_plan
-        if not latest_plan or latest_plan.status is not PlanStatus.DRAFT:
-            plan = self.repo.get_active_plan(user_id)
+        plan = latest_plan if self._is_eligible_draft(latest_plan) else None
+        if plan is None:
+            active_plan = self.repo.get_active_plan(user_id)
+            if self._is_active_confirmed_plan(active_plan):
+                plan = active_plan
         if not plan:
-            return MutationResult(False, "There is no plan to confirm.")
+            if latest_plan and latest_plan.status is PlanStatus.DRAFT:
+                return MutationResult(
+                    False,
+                    "That draft has expired and cannot be confirmed.",
+                )
+            return MutationResult(False, "There is no current plan to confirm.")
         if plan.status is PlanStatus.DRAFT:
             transitioned = self.repo.confirm_plan(
                 user_id, plan.week_start_date, plan.revision
@@ -458,7 +488,25 @@ class BotHandler:
     def _edit_plan(
         self, user_id: str, chat_id: int | str, entities: dict[str, Any]
     ) -> MutationResult:
-        plan = self.repo.get_latest_plan(user_id)
+        latest_plan = self.repo.get_latest_plan(user_id)
+        plan = (
+            latest_plan
+            if self._is_eligible_draft(latest_plan)
+            else self.repo.get_active_plan(user_id)
+        )
+        if not self._is_eligible_draft(
+            plan
+        ) and not self._is_active_confirmed_plan(plan):
+            if latest_plan and latest_plan.status is PlanStatus.DRAFT:
+                return MutationResult(
+                    False, "That draft has expired and cannot be edited."
+                )
+            if latest_plan and latest_plan.status is PlanStatus.CONFIRMED:
+                return MutationResult(
+                    False,
+                    "That confirmed plan is inactive and cannot be edited.",
+                )
+            return MutationResult(False, "There is no plan to edit.")
         if not plan:
             return MutationResult(False, "There is no plan to edit.")
         day_number = int(entities["day"])

@@ -230,6 +230,7 @@ def test_confirm_and_edit_refresh_exact_week(handler: BotHandler) -> None:
     assert payload["action"] == "finalize_grocery"
     assert payload["week_start"] == draft.week_start_date
 
+    handler.repo.get_active_plan.return_value = draft
     edited = handler._apply_intent_metadata(
         "user",
         1,
@@ -285,6 +286,25 @@ def test_confirm_retries_active_error_when_latest_error_is_inactive(
     )
 
 
+def test_confirm_rejects_expired_draft_without_mutation(
+    handler: BotHandler,
+) -> None:
+    expired = make_plan(week_start=date.today() - timedelta(days=8))
+    handler.repo.get_latest_plan.return_value = expired
+    handler.repo.get_active_plan.return_value = None
+
+    result = handler._apply_intent_metadata(
+        "user", 1, ConversationIntent.CONFIRM_PLAN, {}, None
+    )
+
+    assert not result.success
+    assert result.message and "expired" in result.message
+    handler.repo.confirm_plan.assert_not_called()
+    handler.repo.retry_grocery.assert_not_called()
+    handler.repo.fail_grocery.assert_not_called()
+    handler.lambda_client.invoke.assert_not_called()
+
+
 @pytest.mark.parametrize("week_offset", [-14, 8])
 def test_confirm_rejects_inactive_error_without_retry(
     handler: BotHandler, week_offset: int
@@ -303,6 +323,54 @@ def test_confirm_rejects_inactive_error_without_retry(
 
     assert not result.success
     handler.repo.retry_grocery.assert_not_called()
+    handler.lambda_client.invoke.assert_not_called()
+
+
+@pytest.mark.parametrize("week_offset", [-14, 8])
+def test_edit_rejects_inactive_confirmed_plan_without_mutation(
+    handler: BotHandler, week_offset: int
+) -> None:
+    inactive = make_plan(
+        week_start=date.today() + timedelta(days=week_offset),
+        status=PlanStatus.CONFIRMED,
+    )
+    handler.repo.get_latest_plan.return_value = inactive
+    handler.repo.get_active_plan.return_value = None
+
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.EDIT_PLAN,
+        {"day": 1, "meal_type": "lunch", "name": "New"},
+        None,
+    )
+
+    assert not result.success
+    assert result.message and "inactive" in result.message
+    handler.repo.update_meal.assert_not_called()
+    handler.repo.fail_grocery.assert_not_called()
+    handler.lambda_client.invoke.assert_not_called()
+
+
+@pytest.mark.parametrize("week_offset", [0, 8])
+def test_edit_accepts_current_and_future_drafts(
+    handler: BotHandler, week_offset: int
+) -> None:
+    draft = make_plan(week_start=date.today() + timedelta(days=week_offset))
+    handler.repo.get_latest_plan.return_value = draft
+    handler.repo.update_meal.return_value = True
+
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.EDIT_PLAN,
+        {"day": 1, "meal_type": "lunch", "name": "New"},
+        None,
+    )
+
+    assert result.success
+    handler.repo.update_meal.assert_called_once()
+    handler.repo.get_active_plan.assert_not_called()
     handler.lambda_client.invoke.assert_not_called()
 
 
@@ -444,6 +512,33 @@ def test_conversation_replaces_false_success_reply(handler: BotHandler) -> None:
     )
     sent = handler.telegram_api.send_message.call_args.args[1]
     assert sent != "Saved!"
+
+
+def test_conversation_passes_persisted_profile_draft_to_llm(
+    handler: BotHandler,
+) -> None:
+    handler.repo.get_profile.return_value = None
+    handler.repo.get_profile_draft.return_value = ProfileUpdateEntities(
+        name="Alex", people_count=2
+    )
+    handler.repo.get_latest_plan.return_value = None
+    handler.repo.get_meal_history.return_value = []
+    handler.llm_client.chat_sync.return_value = "I still need member details."
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="continue onboarding",
+        )
+    )
+
+    prompt = handler.llm_client.chat_sync.call_args.args[0]
+    assert "Name: Alex" in prompt
+    assert "People Count: 2" in prompt
+    assert "Family Members: Missing" in prompt
+    handler.repo.get_profile_draft.assert_called_once_with("user")
 
 
 def test_telegram_failure_is_controlled_at_update_boundary(

@@ -5,6 +5,7 @@ from typing import Optional
 from meal_planner.models.schemas import (
     MealLogEntry,
     MealOutcome,
+    ProfileUpdateEntities,
     UserProfile,
     WeeklyPlan,
 )
@@ -12,6 +13,7 @@ from meal_planner.models.schemas import (
 
 def build_conversational_prompt(
     profile: Optional[UserProfile] = None,
+    profile_draft: Optional[ProfileUpdateEntities] = None,
     current_plan: Optional[WeeklyPlan] = None,
     recent_meals: Optional[list[MealLogEntry]] = None,
 ) -> str:
@@ -39,6 +41,38 @@ def build_conversational_prompt(
             f"Goals: {goals_str}"
         )
 
+    pending_profile_text = "No pending profile updates."
+    if profile_draft:
+        pending_lines = []
+        pending_fields = (
+            "name",
+            "people_count",
+            "family_members",
+            "allergies",
+            "dietary_preferences",
+            "restrictions",
+            "goals",
+        )
+        for field in pending_fields:
+            value = getattr(profile_draft, field)
+            label = field.replace("_", " ").title()
+            if value is None:
+                rendered = "Missing"
+            elif field == "family_members":
+                rendered = (
+                    ", ".join(
+                        f"{member.name} ({member.calorie_target} kcal)"
+                        for member in value
+                    )
+                    or "None specified"
+                )
+            elif isinstance(value, list):
+                rendered = ", ".join(value) or "None specified"
+            else:
+                rendered = str(value)
+            pending_lines.append(f"{label}: {rendered}")
+        pending_profile_text = "\n".join(sorted(pending_lines))
+
     plan_text = "No active meal plan."
     if current_plan:
         days_summary = []
@@ -62,7 +96,8 @@ def build_conversational_prompt(
     return (
         "You are an intelligent family meal planning assistant.\n\n"
         "=== USER CONTEXT ===\n"
-        f"--- Profile ---\n{profile_text}\n\n"
+        f"--- Saved Profile ---\n{profile_text}\n\n"
+        f"--- Pending Profile Updates ---\n{pending_profile_text}\n\n"
         f"--- Current Plan ---\n{plan_text}\n\n"
         f"--- Recent Meal History ---\n{history_text}\n\n"
         "=== INSTRUCTIONS ===\n"
