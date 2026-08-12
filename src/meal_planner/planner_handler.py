@@ -11,7 +11,11 @@ from meal_planner.db.dynamo import DynamoRepository
 from meal_planner.llm.client import LLMClient
 from meal_planner.llm.parser import parse_grocery_response, parse_plan_response
 from meal_planner.llm.prompts import build_grocery_prompt, build_plan_prompt
-from meal_planner.models.schemas import GroceryStatus, PlanStatus
+from meal_planner.models.schemas import (
+    GroceryStatus,
+    MealOutcome,
+    PlanStatus,
+)
 from meal_planner.telegram.api import TelegramAPI, TelegramAPIError
 
 logger = logging.getLogger(__name__)
@@ -67,8 +71,12 @@ class PlannerHandler:
                 )
                 return
             plan.status = PlanStatus.DRAFT
+            plan.revision = 0
             plan.grocery_status = GroceryStatus.NOT_REQUESTED
             plan.grocery_list = []
+            for plan_day in plan.days:
+                for meal in plan_day.meals:
+                    meal.outcome = MealOutcome.UNREPORTED
             if not self.repo.save_generated_draft(user_id, plan):
                 self.telegram_api.send_message(
                     chat_id,

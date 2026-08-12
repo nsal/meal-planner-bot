@@ -247,12 +247,13 @@ class BotHandler:
                     "That check-in button is invalid or outdated.",
                 )
                 return
-            plan = self.repo.get_plan(route.user_id, callback.week_start)
+            plan = self.repo.get_active_plan(route.user_id)
             today = date.today()
             if (
                 not plan
                 or plan.status is not PlanStatus.CONFIRMED
                 or not plan.week_start <= today <= plan.week_end
+                or plan.week_start_date != callback.week_start
             ):
                 self.telegram_api.send_message(
                     route.chat_id, "That check-in belongs to an inactive plan."

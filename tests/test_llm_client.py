@@ -45,6 +45,7 @@ async def test_success_passes_bounded_timeout(
     )
     assert await client.chat("system", "user") == "hello"
     assert completion.call_args.kwargs["timeout"] == 7.0
+    assert completion.call_args.kwargs["max_retries"] == 0
 
 
 @pytest.mark.asyncio
@@ -103,8 +104,12 @@ async def test_permanent_failure_is_not_retried(
 async def test_chat_json_rejects_malformed_json(
     client: LLMClient, mocker: MockerFixture
 ) -> None:
-    mocker.patch("litellm.acompletion", return_value=_response("not json"))
+    completion = mocker.patch(
+        "litellm.acompletion", return_value=_response("not json")
+    )
     assert await client.chat_json("system", "user") == {}
+    assert completion.call_args.kwargs["timeout"] == 7.0
+    assert completion.call_args.kwargs["max_retries"] == 0
 
 
 def test_sync_wrappers_return_text_and_json(

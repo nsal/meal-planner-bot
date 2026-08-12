@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from meal_planner.models.schemas import GroceryStatus, PlanStatus
+from meal_planner.models.schemas import GroceryStatus, MealOutcome, PlanStatus
 from meal_planner.planner_handler import PlannerHandler, lambda_handler
 from tests.factories import make_plan, make_plan_payload, make_profile
 
@@ -26,6 +26,43 @@ def test_generate_plan_saves_draft_without_groceries(mocker: Any) -> None:
     assert saved.grocery_status is GroceryStatus.NOT_REQUESTED
     assert saved.grocery_list == []
     api.send_plan.assert_called_once()
+
+
+def test_generate_plan_normalizes_provider_lifecycle_fields(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    payload = make_plan_payload(week)
+    payload["status"] = PlanStatus.CONFIRMED.value
+    payload["revision"] = 9
+    payload["grocery_status"] = GroceryStatus.READY.value
+    payload["grocery_list"] = [{"name": "Produce", "items": ["Apples"]}]
+    payload["days"][0]["meals"][0]["outcome"] = MealOutcome.COOKED.value
+    payload["days"][1]["meals"][0]["outcome"] = MealOutcome.SKIPPED.value
+    payload["days"][2]["meals"][0]["outcome"] = MealOutcome.SWAPPED.value
+    llm.chat_json_sync.return_value = payload
+    repo.save_generated_draft.return_value = True
+
+    PlannerHandler(repo, api, llm).generate_plan("user", 1, week_start=week)
+
+    saved = repo.save_generated_draft.call_args.args[1]
+    sent = api.send_plan.call_args.args[1]
+    assert saved.status is PlanStatus.DRAFT
+    assert saved.revision == 0
+    assert saved.grocery_status is GroceryStatus.NOT_REQUESTED
+    assert saved.grocery_list == []
+    assert all(
+        meal.outcome is MealOutcome.UNREPORTED
+        for plan_day in saved.days
+        for meal in plan_day.meals
+    )
+    assert sent is saved
 
 
 def test_generate_plan_rejects_missing_profile_and_malformed_plan(

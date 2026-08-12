@@ -69,6 +69,8 @@ Local development reads these variables from the environment or an ignored
 The settings validator includes every LLM attempt, the maximum bounded retry
 wait (5 seconds per retry), each sequential Telegram allowance, and a handler
 safety margin. Each function's worst-case budget must fit its configured deadline.
+The application retry loop is the sole LLM retry layer; provider adapter retries
+are disabled so the configured attempts and backoff remain within that deadline.
 The Bot budget remains below the 30-second HTTP API integration limit. Lambda
 itself permits up to 900 seconds, but that larger service limit cannot extend
 the synchronous Telegram webhook deadline ([Lambda timeout quota](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html),
@@ -236,7 +238,8 @@ aws cloudformation delete-stack --stack-name "$STACK_NAME" \
 - `/grocery` reports `pending`, `ready`, or `error`, and shows ready sections.
 - `/today` shows the active confirmed plan's meals for today.
 - `/submit_meals` sends plan-specific buttons for `cooked`, `skipped`, and
-  `swapped`. Old, draft, expired, or malformed callbacks are rejected.
+  `swapped`. Old, draft, expired, malformed, and superseded overlapping-plan
+  callbacks are rejected, even if the older plan still covers today.
 
 Conversational metadata supports `log_meal`, `update_profile`, `edit_plan`,
 `confirm_plan`, `suggestion`, and `chitchat`. Mutations are validated before

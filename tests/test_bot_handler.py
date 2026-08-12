@@ -451,7 +451,7 @@ def test_callback_updates_every_outcome_and_acknowledges(
     handler: BotHandler, outcome: MealOutcome
 ) -> None:
     plan = make_plan(status=PlanStatus.CONFIRMED)
-    handler.repo.get_plan.return_value = plan
+    handler.repo.get_active_plan.return_value = plan
     handler.repo.update_meal_outcome.return_value = True
     route = RouteResult(
         route_type=RouteType.CALLBACK,
@@ -465,6 +465,37 @@ def test_callback_updates_every_outcome_and_acknowledges(
     handler.handle_callback(route)
     assert handler.repo.update_meal_outcome.call_args.args[-1] is outcome
     handler.telegram_api.answer_callback_query.assert_called_once()
+
+
+def test_callback_rejects_superseded_overlapping_plan(
+    handler: BotHandler,
+) -> None:
+    older = make_plan(
+        week_start=date.today() - timedelta(days=2),
+        status=PlanStatus.CONFIRMED,
+    )
+    active = make_plan(
+        week_start=date.today() - timedelta(days=1),
+        status=PlanStatus.CONFIRMED,
+    )
+    handler.repo.get_active_plan.return_value = active
+    route = RouteResult(
+        route_type=RouteType.CALLBACK,
+        chat_id=1,
+        user_id="user",
+        callback_query_id="query",
+        callback_data=f"checkin:{older.week_start_date}:1:lunch:cooked",
+    )
+
+    handler.handle_callback(route)
+
+    handler.repo.update_meal_outcome.assert_not_called()
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "query", "Unable to update meal"
+    )
+    assert (
+        "inactive plan" in handler.telegram_api.send_message.call_args.args[1]
+    )
 
 
 def test_callback_rejects_old_missing_and_persistence_failure(

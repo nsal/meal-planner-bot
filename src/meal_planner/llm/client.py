@@ -62,6 +62,7 @@ class LLMClient:
             "model": self.model,
             "messages": messages,
             "timeout": self.request_timeout,
+            "max_retries": 0,
         }
         if self.api_key:
             kwargs["api_key"] = self.api_key
