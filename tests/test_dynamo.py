@@ -1,5 +1,6 @@
-"""Tests for DynamoDB repository using moto mock."""
+"""DynamoDB repository integration tests."""
 
+from datetime import date, datetime, timezone
 from typing import Any, Generator
 
 import boto3
@@ -8,23 +9,22 @@ from moto import mock_aws
 
 from meal_planner.db.dynamo import DynamoRepository
 from meal_planner.models.schemas import (
-    FamilyMember,
     GrocerySection,
-    Ingredient,
+    GroceryStatus,
     MealLogEntry,
-    PlanDay,
-    PlannedMeal,
-    UserProfile,
-    WeeklyPlan,
+    MealOutcome,
+    PlanStatus,
+    ProfileUpdateEntities,
 )
+from tests.factories import make_plan, make_profile
 
 
 @pytest.fixture
 def dynamodb_table() -> Generator[Any, None, None]:
-    """Create a mock DynamoDB table for testing."""
     with mock_aws():
-        dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
-        table = dynamodb.create_table(
+        table = boto3.resource(
+            "dynamodb", region_name="us-east-1"
+        ).create_table(
             TableName="test-meal-planner",
             KeySchema=[
                 {"AttributeName": "PK", "KeyType": "HASH"},
@@ -41,145 +41,249 @@ def dynamodb_table() -> Generator[Any, None, None]:
 
 @pytest.fixture
 def repo(dynamodb_table: Any) -> DynamoRepository:
-    """Return DynamoRepository instance connected to mock table."""
     return DynamoRepository(dynamodb_table)
 
 
-def test_get_profile_not_found(repo: DynamoRepository) -> None:
-    """Test get_profile when no profile exists."""
-    profile = repo.get_profile("user123")
-    assert profile is None
+def test_profile_and_onboarding_draft_round_trip(
+    repo: DynamoRepository,
+) -> None:
+    assert repo.get_profile("user") is None
+    draft = ProfileUpdateEntities(name="Alex", people_count=2)
+    repo.save_profile_draft("user", draft)
+    assert repo.get_profile_draft("user").name == "Alex"
+    profile = make_profile()
+    repo.save_profile("user", profile)
+    assert repo.get_profile("user") == profile
+    repo.delete_profile_draft("user")
+    assert repo.get_profile_draft("user") is None
 
 
-def test_save_and_get_profile(repo: DynamoRepository) -> None:
-    """Test saving and retrieving user profile."""
-    member = FamilyMember(name="Alice", calorie_target=2000)
-    profile = UserProfile(
-        name="User One",
-        family_members=[member],
-        allergies=["nuts"],
-        dietary_preferences=["vegetarian"],
-        restrictions=["low-sodium"],
-        goals=["maintain-weight"],
-        people_count=2,
-    )
-    repo.save_profile("user123", profile)
-
-    retrieved = repo.get_profile("user123")
-    assert retrieved is not None
-    assert retrieved.name == "User One"
-    assert len(retrieved.family_members) == 1
-    assert retrieved.family_members[0].name == "Alice"
-    assert retrieved.allergies == ["nuts"]
-    assert retrieved.people_count == 2
-
-
-def test_log_meal_and_get_history(repo: DynamoRepository) -> None:
-    """Test logging meals and querying history sorted by date."""
-    entry1 = MealLogEntry(
-        date="2026-08-01",
+def _meal(day: int, hour: int, description: str) -> MealLogEntry:
+    return MealLogEntry(
+        date=date(2026, 8, day),
         meal_type="lunch",
-        description="Salad",
-        created_at="2026-08-01T12:00:00Z",
-    )
-    entry2 = MealLogEntry(
-        date="2026-08-03",
-        meal_type="dinner",
-        description="Pasta",
-        created_at="2026-08-03T18:00:00Z",
-    )
-    repo.log_meal("user123", entry1)
-    repo.log_meal("user123", entry2)
-
-    history = repo.get_meal_history("user123", days=14)
-    assert len(history) == 2
-    # Ensure sorted by date descending
-    assert history[0].date == "2026-08-03"
-    assert history[1].date == "2026-08-01"
-
-
-def test_get_meal_history_empty(repo: DynamoRepository) -> None:
-    """Test meal history when no meals logged."""
-    history = repo.get_meal_history("user123")
-    assert history == []
-
-
-def test_save_and_get_current_plan(repo: DynamoRepository) -> None:
-    """Test saving plan and fetching current plan."""
-    ing = Ingredient(item="Rice", amount="200g")
-    meal = PlannedMeal(
-        meal_type="lunch",
-        name="Fried Rice",
-        ingredients=[ing],
-        est_calories=450,
-        was_cooked=False,
-    )
-    day1 = PlanDay(day=1, meals=[meal])
-    section = GrocerySection(name="Pantry", items=["Rice"])
-    plan = WeeklyPlan(
-        week_start="2026-08-10",
-        status="draft",
-        days=[day1],
-        grocery_list=[section],
+        description=description,
+        created_at=datetime(2026, 8, day, hour, tzinfo=timezone.utc),
     )
 
-    repo.save_plan("user123", plan)
 
-    current = repo.get_current_plan("user123")
-    assert current is not None
-    assert current.week_start_date == "2026-08-10"
-    assert current.status == "draft"
-    assert len(current.days) == 1
-    assert current.days[0].meals[0].name == "Fried Rice"
+def test_meal_history_includes_multiple_meals_and_date_boundaries(
+    repo: DynamoRepository,
+) -> None:
+    for entry in (
+        _meal(1, 8, "too old"),
+        _meal(2, 8, "start boundary"),
+        _meal(2, 12, "same day second meal"),
+        _meal(8, 8, "end boundary"),
+    ):
+        repo.log_meal("user", entry)
+    history = repo.get_meal_history("user", days=7, on_date=date(2026, 8, 8))
+    assert [entry.description for entry in history] == [
+        "end boundary",
+        "same day second meal",
+        "start boundary",
+    ]
 
 
-def test_get_current_plan_empty(repo: DynamoRepository) -> None:
-    """Test get_current_plan when no plan exists."""
-    plan = repo.get_current_plan("user123")
-    assert plan is None
-
-
-def test_update_meal_status(repo: DynamoRepository) -> None:
-    """Test updating was_cooked meal status within a weekly plan."""
-    meal = PlannedMeal(
-        meal_type="dinner",
-        name="Steak",
-        ingredients=[],
-        est_calories=700,
-        was_cooked=False,
+def test_meal_history_paginates_and_skips_malformed_items(mocker: Any) -> None:
+    table = mocker.MagicMock()
+    valid = {
+        "PK": "USER#user",
+        "SK": "MEAL#2026-08-08#x",
+        **_meal(8, 8, "valid").model_dump(mode="json"),
+    }
+    table.query.side_effect = [
+        {
+            "Items": [{"PK": "USER#user", "SK": "bad"}],
+            "LastEvaluatedKey": {"PK": "x"},
+        },
+        {"Items": [valid]},
+    ]
+    history = DynamoRepository(table).get_meal_history(
+        "user", days=1, on_date=date(2026, 8, 8)
     )
-    day1 = PlanDay(day=1, meals=[meal])
-    plan = WeeklyPlan(
-        week_start="2026-08-10",
-        status="confirmed",
-        days=[day1],
-        grocery_list=[],
+    assert [entry.description for entry in history] == ["valid"]
+    assert table.query.call_count == 2
+
+
+def test_plan_selection_distinguishes_latest_exact_and_active(
+    repo: DynamoRepository,
+) -> None:
+    active = make_plan(week_start=date(2026, 8, 4), status=PlanStatus.CONFIRMED)
+    future = make_plan(week_start=date(2026, 8, 18))
+    repo.save_plan("user", active)
+    repo.save_plan("user", future)
+    assert repo.get_latest_plan("user") == future
+    assert repo.get_plan("user", "2026-08-04") == active
+    assert repo.get_active_plan("user", date(2026, 8, 10)) == active
+    assert repo.get_active_plan("user", date(2026, 8, 11)) is None
+
+
+def test_atomic_outcome_updates_preserve_independent_meals(
+    repo: DynamoRepository,
+) -> None:
+    plan = make_plan(status=PlanStatus.CONFIRMED)
+    repo.save_plan("user", plan)
+    assert repo.update_meal_outcome(
+        "user", plan.week_start_date, 1, "lunch", MealOutcome.COOKED
     )
-    repo.save_plan("user123", plan)
-
-    # Update status to True
-    updated = repo.update_meal_status(
-        user_id="user123",
-        week_start="2026-08-10",
-        day=1,
-        meal_type="dinner",
-        was_cooked=True,
+    assert repo.update_meal_outcome(
+        "user", plan.week_start_date, 2, "lunch", MealOutcome.SWAPPED
     )
-    assert updated is True
-
-    # Verify updated in DB
-    current = repo.get_current_plan("user123")
-    assert current is not None
-    assert current.days[0].meals[0].was_cooked is True
-
-
-def test_update_meal_status_not_found(repo: DynamoRepository) -> None:
-    """Test update_meal_status returns False when plan does not exist."""
-    updated = repo.update_meal_status(
-        user_id="user123",
-        week_start="2026-08-10",
-        day=1,
-        meal_type="dinner",
-        was_cooked=True,
+    saved = repo.get_plan("user", plan.week_start_date)
+    assert saved is not None
+    assert saved.days[0].meals[0].outcome is MealOutcome.COOKED
+    assert saved.days[1].meals[0].outcome is MealOutcome.SWAPPED
+    assert not repo.update_meal_outcome(
+        "user", plan.week_start_date, 1, "dinner", MealOutcome.SKIPPED
     )
-    assert updated is False
+
+
+def test_atomic_outcome_rejects_draft(repo: DynamoRepository) -> None:
+    plan = make_plan()
+    repo.save_plan("user", plan)
+    assert not repo.update_meal_outcome(
+        "user", plan.week_start_date, 1, "lunch", MealOutcome.COOKED
+    )
+
+
+def test_generated_draft_cannot_replace_confirmed_plan(
+    repo: DynamoRepository,
+) -> None:
+    week = date(2026, 8, 10)
+    draft = make_plan(week_start=week)
+    assert repo.save_generated_draft("user", draft)
+    replacement = make_plan(week_start=week)
+    replacement.days[0].meals[0].name = "Replacement"
+    assert repo.save_generated_draft("user", replacement)
+    assert repo.confirm_plan("user", draft.week_start_date, 0)
+    assert not repo.save_generated_draft("user", replacement)
+    saved = repo.get_plan("user", week)
+    assert saved is not None
+    assert saved.status is PlanStatus.CONFIRMED
+
+
+def test_plan_lifecycle_writes_are_revision_checked(
+    repo: DynamoRepository,
+) -> None:
+    plan = make_plan(
+        status=PlanStatus.CONFIRMED, grocery_status=GroceryStatus.PENDING
+    )
+    repo.save_plan("user", plan)
+    edited_meal = (
+        plan.days[0].meals[0].model_copy(update={"name": "Edited lunch"})
+    )
+    assert repo.update_meal(
+        "user",
+        plan.week_start_date,
+        1,
+        "lunch",
+        edited_meal,
+        expected_revision=0,
+        expected_status=PlanStatus.CONFIRMED,
+    )
+    assert not repo.update_meal(
+        "user",
+        plan.week_start_date,
+        1,
+        "lunch",
+        edited_meal,
+        expected_revision=0,
+        expected_status=PlanStatus.CONFIRMED,
+    )
+    saved = repo.get_plan("user", plan.week_start_date)
+    assert saved is not None
+    assert saved.revision == 1
+    assert saved.grocery_status.value == "pending"
+    assert repo.complete_grocery(
+        "user",
+        plan.week_start_date,
+        1,
+        [GrocerySection(name="Produce", items=["Apples"])],
+    )
+    assert not repo.fail_grocery("user", plan.week_start_date, 1)
+
+
+def test_stale_draft_edit_is_rejected_after_confirmation(
+    repo: DynamoRepository,
+) -> None:
+    plan = make_plan()
+    repo.save_plan("user", plan)
+    edited_meal = (
+        plan.days[0].meals[0].model_copy(update={"name": "Stale edit"})
+    )
+    assert repo.confirm_plan("user", plan.week_start_date, 0)
+
+    assert not repo.update_meal(
+        "user",
+        plan.week_start_date,
+        1,
+        "lunch",
+        edited_meal,
+        expected_revision=0,
+        expected_status=PlanStatus.DRAFT,
+    )
+    saved = repo.get_plan("user", plan.week_start_date)
+    assert saved is not None
+    assert saved.status is PlanStatus.CONFIRMED
+    assert saved.revision == 0
+    assert saved.grocery_status is GroceryStatus.PENDING
+    assert saved.days[0].meals[0].name != "Stale edit"
+
+
+def test_confirm_and_grocery_retry_are_conditional(
+    repo: DynamoRepository,
+) -> None:
+    plan = make_plan()
+    repo.save_plan("user", plan)
+    assert repo.confirm_plan("user", plan.week_start_date, 0)
+    assert not repo.confirm_plan("user", plan.week_start_date, 0)
+    assert repo.fail_grocery("user", plan.week_start_date, 0)
+    assert repo.retry_grocery("user", plan.week_start_date, 0)
+    assert not repo.retry_grocery("user", plan.week_start_date, 0)
+
+
+def test_grocery_worker_races_preserve_outcomes_and_reject_stale_edits(
+    repo: DynamoRepository,
+) -> None:
+    plan = make_plan(
+        status=PlanStatus.CONFIRMED, grocery_status=GroceryStatus.PENDING
+    )
+    repo.save_plan("user", plan)
+    worker_revision = plan.revision
+    assert repo.update_meal_outcome(
+        "user", plan.week_start_date, 1, "lunch", MealOutcome.COOKED
+    )
+    assert repo.complete_grocery(
+        "user",
+        plan.week_start_date,
+        worker_revision,
+        [GrocerySection(name="Produce", items=["Apples"])],
+    )
+    ready = repo.get_plan("user", plan.week_start_date)
+    assert ready is not None
+    assert ready.days[0].meals[0].outcome is MealOutcome.COOKED
+    assert ready.grocery_status is GroceryStatus.READY
+
+    updated_meal = (
+        ready.days[0].meals[0].model_copy(update={"name": "New lunch"})
+    )
+    assert repo.update_meal(
+        "user",
+        plan.week_start_date,
+        1,
+        "lunch",
+        updated_meal,
+        expected_revision=worker_revision,
+        expected_status=PlanStatus.CONFIRMED,
+    )
+    assert not repo.complete_grocery(
+        "user",
+        plan.week_start_date,
+        worker_revision,
+        [GrocerySection(name="Stale", items=["Old item"])],
+    )
+    edited = repo.get_plan("user", plan.week_start_date)
+    assert edited is not None
+    assert edited.days[0].meals[0].name == "New lunch"
+    assert edited.grocery_status is GroceryStatus.PENDING

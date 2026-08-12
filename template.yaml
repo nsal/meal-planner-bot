@@ -10,31 +10,41 @@ Parameters:
     AllowedValues:
       - dev
       - prod
-  TelegramBotToken:
+  TelegramBotTokenSecretName:
     Type: String
-    NoEcho: true
-    Description: Telegram Bot Token from BotFather
-  LlmApiKey:
+    Description: Secrets Manager secret name for the Telegram Bot Token
+  TelegramWebhookSecretName:
     Type: String
-    NoEcho: true
-    Description: API Key for LiteLLM provider
+    Description: Secrets Manager secret name for the Telegram webhook secret
+  LlmApiKeySecretName:
+    Type: String
+    Description: Secrets Manager secret name for the LiteLLM API key
   LlmModel:
     Type: String
     Default: gpt-4o-mini
     Description: LiteLLM model identifier
+  SecretRefreshToken:
+    Type: String
+    Description: Change this non-secret token whenever a referenced secret rotates
 
 Globals:
   Function:
     Timeout: 30
     MemorySize: 256
-    Runtime: python3.12
-    Architecture: x86_64
+    Runtime: python3.14
+    Architectures:
+      - arm64
     Environment:
       Variables:
         DYNAMODB_TABLE_NAME: !Ref MealPlannerTable
-        TELEGRAM_BOT_TOKEN: !Ref TelegramBotToken
-        LLM_API_KEY: !Ref LlmApiKey
+        TELEGRAM_BOT_TOKEN: !Sub
+          - '{{resolve:secretsmanager:${SecretName}:SecretString}}'
+          - SecretName: !Ref TelegramBotTokenSecretName
+        LLM_API_KEY: !Sub
+          - '{{resolve:secretsmanager:${SecretName}:SecretString}}'
+          - SecretName: !Ref LlmApiKeySecretName
         LLM_MODEL: !Ref LlmModel
+        SECRET_REFRESH_TOKEN: !Ref SecretRefreshToken
 
 Resources:
   MealPlannerTable:
@@ -55,15 +65,28 @@ Resources:
 
   BotFunction:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: python-uv
+      SamResourceId: BotFunction
     Properties:
       FunctionName: !Sub ${AWS::StackName}-bot
-      CodeUri: src/
+      CodeUri: ./
       Handler: meal_planner.bot_handler.lambda_handler
       Timeout: 30
       MemorySize: 256
       Environment:
         Variables:
           PLANNER_FUNCTION_NAME: !Ref PlannerFunction
+          TELEGRAM_WEBHOOK_SECRET: !Sub
+            - '{{resolve:secretsmanager:${SecretName}:SecretString}}'
+            - SecretName: !Ref TelegramWebhookSecretName
+          BOT_FUNCTION_TIMEOUT_SECONDS: '30'
+          BOT_TELEGRAM_REQUEST_TIMEOUT_SECONDS: '5'
+          BOT_LLM_REQUEST_TIMEOUT_SECONDS: '6'
+          BOT_LLM_MAX_RETRIES: '2'
+          BOT_LLM_INITIAL_BACKOFF_SECONDS: '1'
+          BOT_HANDLER_SAFETY_MARGIN_SECONDS: '4'
+          SECRET_REFRESH_TOKEN: !Ref SecretRefreshToken
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref MealPlannerTable
@@ -78,12 +101,24 @@ Resources:
 
   PlannerFunction:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: python-uv
+      SamResourceId: PlannerFunction
     Properties:
       FunctionName: !Sub ${AWS::StackName}-planner
-      CodeUri: src/
+      CodeUri: ./
       Handler: meal_planner.planner_handler.lambda_handler
       Timeout: 120
       MemorySize: 512
+      Environment:
+        Variables:
+          PLANNER_FUNCTION_TIMEOUT_SECONDS: '120'
+          PLANNER_TELEGRAM_REQUEST_TIMEOUT_SECONDS: '10'
+          PLANNER_LLM_REQUEST_TIMEOUT_SECONDS: '20'
+          PLANNER_LLM_MAX_RETRIES: '3'
+          PLANNER_LLM_INITIAL_BACKOFF_SECONDS: '1'
+          PLANNER_HANDLER_SAFETY_MARGIN_SECONDS: '20'
+          SECRET_REFRESH_TOKEN: !Ref SecretRefreshToken
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref MealPlannerTable

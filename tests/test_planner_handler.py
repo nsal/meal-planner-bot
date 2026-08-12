@@ -1,115 +1,251 @@
-"""Unit tests for Planner Lambda handler."""
+"""Planner generation and grocery-finalization workflow tests."""
 
+from datetime import date
 from typing import Any
-from unittest.mock import MagicMock
 
-from meal_planner.models.schemas import UserProfile
+import pytest
+
+from meal_planner.models.schemas import GroceryStatus, MealOutcome, PlanStatus
 from meal_planner.planner_handler import PlannerHandler, lambda_handler
+from tests.factories import make_plan, make_plan_payload, make_profile
 
 
-def test_generate_plan_success(mocker: Any) -> None:
-    mock_repo = mocker.MagicMock()
-    mock_repo.get_profile.return_value = UserProfile(
-        name="Alice", people_count=2
+def test_generate_plan_saves_draft_without_groceries(mocker: Any) -> None:
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    llm.chat_json_sync.return_value = make_plan_payload(week)
+    repo.save_generated_draft.return_value = True
+    PlannerHandler(repo, api, llm).generate_plan("user", 1, week_start=week)
+    saved = repo.save_generated_draft.call_args.args[1]
+    assert saved.status is PlanStatus.DRAFT
+    assert saved.grocery_status is GroceryStatus.NOT_REQUESTED
+    assert saved.grocery_list == []
+    api.send_plan.assert_called_once()
+
+
+def test_generate_plan_normalizes_provider_lifecycle_fields(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    payload = make_plan_payload(week)
+    payload["status"] = PlanStatus.CONFIRMED.value
+    payload["revision"] = 9
+    payload["grocery_status"] = GroceryStatus.READY.value
+    payload["grocery_list"] = [{"name": "Produce", "items": ["Apples"]}]
+    payload["days"][0]["meals"][0]["outcome"] = MealOutcome.COOKED.value
+    payload["days"][1]["meals"][0]["outcome"] = MealOutcome.SKIPPED.value
+    payload["days"][2]["meals"][0]["outcome"] = MealOutcome.SWAPPED.value
+    llm.chat_json_sync.return_value = payload
+    repo.save_generated_draft.return_value = True
+
+    PlannerHandler(repo, api, llm).generate_plan("user", 1, week_start=week)
+
+    saved = repo.save_generated_draft.call_args.args[1]
+    sent = api.send_plan.call_args.args[1]
+    assert saved.status is PlanStatus.DRAFT
+    assert saved.revision == 0
+    assert saved.grocery_status is GroceryStatus.NOT_REQUESTED
+    assert saved.grocery_list == []
+    assert all(
+        meal.outcome is MealOutcome.UNREPORTED
+        for plan_day in saved.days
+        for meal in plan_day.meals
     )
-    mock_repo.get_meal_history.return_value = []
-    mock_repo.get_current_plan.return_value = None
-    mock_api = mocker.MagicMock()
-    mock_llm = mocker.MagicMock()
+    assert sent is saved
 
-    plan_json = {
-        "week_start_date": "2026-08-10",
-        "status": "draft",
-        "days": [
-            {
-                "day": 1,
-                "meals": [
-                    {
-                        "meal_type": "lunch",
-                        "name": "Chicken Salad",
-                        "ingredients": [{"item": "Chicken", "amount": "200g"}],
-                        "est_calories": 450,
-                        "was_cooked": False,
-                    }
-                ],
-            }
-        ],
+
+def test_generate_plan_rejects_missing_profile_and_malformed_plan(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    api = mocker.MagicMock()
+    repo.get_profile.return_value = None
+    PlannerHandler(repo, api).generate_plan("user", 1)
+    repo.save_plan.assert_not_called()
+    repo.get_profile.return_value = make_profile()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = {}
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user", 1, week_start=date(2026, 8, 10)
+    )
+    repo.save_generated_draft.assert_not_called()
+
+
+def test_generate_plan_rejects_ambiguous_daily_meals(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = make_plan_payload(date(2026, 8, 10))
+    payload["days"][0]["meals"].append(payload["days"][0]["meals"][0])
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user", 1, week_start=date(2026, 8, 10)
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    api.send_plan.assert_not_called()
+    assert "valid meal plan" in api.send_message.call_args.args[1]
+
+
+def test_late_generation_result_does_not_replace_confirmed_week(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.save_generated_draft.return_value = False
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = make_plan_payload(date(2026, 8, 10))
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user", 1, week_start=date(2026, 8, 10)
+    )
+    repo.save_generated_draft.assert_called_once()
+    api.send_plan.assert_not_called()
+    assert "already confirmed" in api.send_message.call_args.args[1]
+
+
+def test_finalize_grocery_success(mocker: Any) -> None:
+    repo = mocker.MagicMock()
+    plan = make_plan(
+        status=PlanStatus.CONFIRMED, grocery_status=GroceryStatus.PENDING
+    )
+    repo.get_plan.return_value = plan
+    repo.get_profile.return_value = make_profile()
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = {
+        "sections": [{"name": "Produce", "items": ["Apples"]}]
     }
+    repo.complete_grocery.return_value = True
+    PlannerHandler(repo, api, llm).finalize_grocery(
+        "user", 1, plan.week_start_date
+    )
+    repo.complete_grocery.assert_called_once()
+    assert repo.complete_grocery.call_args.args[2] == plan.revision
+    assert repo.complete_grocery.call_args.args[3][0].name == "Produce"
 
-    grocery_json = {
-        "sections": [
-            {"name": "Meat & Poultry", "items": ["400g Chicken breast"]}
-        ]
+
+@pytest.mark.parametrize(
+    "grocery_status", [GroceryStatus.READY, GroceryStatus.ERROR]
+)
+def test_duplicate_non_pending_grocery_event_is_silent(
+    mocker: Any, grocery_status: GroceryStatus
+) -> None:
+    repo = mocker.MagicMock()
+    plan = make_plan(status=PlanStatus.CONFIRMED, grocery_status=grocery_status)
+    repo.get_plan.return_value = plan
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+
+    PlannerHandler(repo, api, llm).finalize_grocery(
+        "user", 1, plan.week_start_date
+    )
+
+    repo.get_profile.assert_not_called()
+    llm.chat_json_sync.assert_not_called()
+    repo.complete_grocery.assert_not_called()
+    repo.fail_grocery.assert_not_called()
+    api.send_message.assert_not_called()
+
+
+def test_finalize_grocery_marks_errors_and_rejects_stale_week(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    api = mocker.MagicMock()
+    repo.get_plan.return_value = None
+    PlannerHandler(repo, api).finalize_grocery("user", 1, "2026-08-10")
+    repo.save_plan.assert_not_called()
+    plan = make_plan(
+        status=PlanStatus.CONFIRMED, grocery_status=GroceryStatus.PENDING
+    )
+    repo.get_plan.return_value = plan
+    repo.get_profile.return_value = make_profile()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = {"sections": []}
+    repo.fail_grocery.return_value = True
+    PlannerHandler(repo, api, llm).finalize_grocery(
+        "user", 1, plan.week_start_date
+    )
+    repo.fail_grocery.assert_called_once_with(
+        "user", plan.week_start_date, plan.revision
+    )
+
+
+def test_ready_groceries_survive_notification_failure(mocker: Any) -> None:
+    repo = mocker.MagicMock()
+    plan = make_plan(
+        status=PlanStatus.CONFIRMED, grocery_status=GroceryStatus.PENDING
+    )
+    repo.get_plan.return_value = plan
+    repo.get_profile.return_value = make_profile()
+    repo.complete_grocery.return_value = True
+    api = mocker.MagicMock()
+    api.send_message.side_effect = RuntimeError("offline")
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = {
+        "sections": [{"name": "Produce", "items": ["Apples"]}]
     }
-
-    mock_llm.chat_json_sync = MagicMock(side_effect=[plan_json, grocery_json])
-
-    planner = PlannerHandler(
-        repo=mock_repo, telegram_api=mock_api, llm_client=mock_llm
+    PlannerHandler(repo, api, llm).finalize_grocery(
+        "user", 1, plan.week_start_date
     )
-    planner.generate_plan("12345", 12345)
-
-    mock_repo.save_plan.assert_called_once()
-    saved_plan = mock_repo.save_plan.call_args[0][1]
-    assert saved_plan.days[0].meals[0].name == "Chicken Salad"
-    assert saved_plan.grocery_list[0].name == "Meat & Poultry"
-    mock_api.send_plan.assert_called_once()
+    repo.complete_grocery.assert_called_once()
+    repo.fail_grocery.assert_not_called()
 
 
-def test_generate_plan_no_profile(mocker: Any) -> None:
-    mock_repo = mocker.MagicMock()
-    mock_repo.get_profile.return_value = None
-    mock_api = mocker.MagicMock()
-
-    planner = PlannerHandler(repo=mock_repo, telegram_api=mock_api)
-    planner.generate_plan("12345", 12345)
-
-    mock_api.send_message.assert_called_once()
-    assert "No profile found" in mock_api.send_message.call_args[0][1]
-
-
-def test_generate_plan_invalid_llm_plan(mocker: Any) -> None:
-    mock_repo = mocker.MagicMock()
-    mock_repo.get_profile.return_value = UserProfile(name="Alice")
-    mock_api = mocker.MagicMock()
-    mock_llm = mocker.MagicMock()
-    mock_llm.chat_json_sync = MagicMock(return_value={})
-
-    planner = PlannerHandler(
-        repo=mock_repo, telegram_api=mock_api, llm_client=mock_llm
+def test_handle_event_validates_actions(mocker: Any) -> None:
+    planner = PlannerHandler(mocker.MagicMock(), mocker.MagicMock())
+    generate = mocker.patch.object(planner, "generate_plan")
+    finalize = mocker.patch.object(planner, "finalize_grocery")
+    assert planner.handle_event(
+        {
+            "action": "generate_plan",
+            "user_id": "user",
+            "chat_id": 1,
+            "week_start": "2026-08-10",
+        }
     )
-    planner.generate_plan("12345", 12345)
-
-    mock_api.send_message.assert_called_once()
-    assert "couldn't generate" in mock_api.send_message.call_args[0][1]
-
-
-def test_generate_plan_exception_handling(mocker: Any) -> None:
-    mock_repo = mocker.MagicMock()
-    mock_repo.get_profile.side_effect = RuntimeError("DB error")
-    mock_api = mocker.MagicMock()
-
-    planner = PlannerHandler(repo=mock_repo, telegram_api=mock_api)
-    planner.generate_plan("12345", 12345)
-
-    mock_api.send_message.assert_called_once()
-    assert "an error occurred" in mock_api.send_message.call_args[0][1]
+    generate.assert_called_once()
+    assert planner.handle_event(
+        {
+            "action": "finalize_grocery",
+            "user_id": "user",
+            "chat_id": 1,
+            "week_start": "2026-08-10",
+        }
+    )
+    finalize.assert_called_once()
+    assert not planner.handle_event({"action": "unknown"})
 
 
-def test_lambda_handler(mocker: Any, mock_env: None) -> None:
+def test_lambda_handler_dispatches_and_rejects_invalid_event(
+    mocker: Any, mock_env: None
+) -> None:
     mocker.patch("boto3.resource")
-
-    mock_planner = mocker.patch("meal_planner.planner_handler.PlannerHandler")
-    instance = MagicMock()
-    mock_planner.return_value = instance
-
-    event = {"user_id": "12345", "chat_id": 12345}
-    res = lambda_handler(event, None)
-
-    assert res == {"statusCode": 200, "body": "ok"}
-    instance.generate_plan.assert_called_once_with("12345", 12345)
-
-
-def test_lambda_handler_invalid_event(mocker: Any) -> None:
-    res = lambda_handler({}, None)
-    assert res["statusCode"] == 400
+    planner_class = mocker.patch("meal_planner.planner_handler.PlannerHandler")
+    planner_class.return_value.handle_event.return_value = True
+    assert (
+        lambda_handler({"user_id": "user", "chat_id": 1}, None)["statusCode"]
+        == 200
+    )
+    planner_class.return_value.handle_event.return_value = False
+    assert lambda_handler({}, None)["statusCode"] == 400
