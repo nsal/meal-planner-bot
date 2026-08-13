@@ -3,13 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from meal_planner.config import (
-    Settings,
-    WebhookSettings,
-    external_call_budget_seconds,
-    get_settings,
-    get_webhook_secret,
-)
+from meal_planner.config import Settings, get_settings
 
 
 def test_config_loading_valid_env(mock_env: None) -> None:
@@ -17,9 +11,11 @@ def test_config_loading_valid_env(mock_env: None) -> None:
     settings = get_settings()
     expected_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
     assert settings.telegram_bot_token == expected_token
-    assert get_webhook_secret() == "test-webhook-secret"
     assert settings.llm_api_key == "test-api-key"
-    assert settings.llm_model == "gpt-4o-mini"
+    assert settings.conversational_llm_model == "gpt-5.6-luna"
+    assert settings.conversational_llm_reasoning_effort == "medium"
+    assert settings.planner_llm_model == "gpt-5.6-terra"
+    assert settings.planner_llm_reasoning_effort == "medium"
     assert settings.dynamodb_table_name == "test-meal-planner"
     assert settings.aws_region == "us-east-1"
 
@@ -30,7 +26,10 @@ def test_config_uppercase_properties(mock_env: None) -> None:
     expected_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
     assert settings.TELEGRAM_BOT_TOKEN == expected_token
     assert settings.LLM_API_KEY == "test-api-key"
-    assert settings.LLM_MODEL == "gpt-4o-mini"
+    assert settings.CONVERSATIONAL_LLM_MODEL == "gpt-5.6-luna"
+    assert settings.CONVERSATIONAL_LLM_REASONING_EFFORT == "medium"
+    assert settings.PLANNER_LLM_MODEL == "gpt-5.6-terra"
+    assert settings.PLANNER_LLM_REASONING_EFFORT == "medium"
     assert settings.DYNAMODB_TABLE_NAME == "test-meal-planner"
     assert settings.AWS_REGION == "us-east-1"
 
@@ -39,19 +38,22 @@ def test_config_default_values(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test configuration defaults for optional fields."""
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token123")
     monkeypatch.setenv("LLM_API_KEY", "key123")
-    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret123")
-    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("CONVERSATIONAL_LLM_MODEL", raising=False)
+    monkeypatch.delenv("CONVERSATIONAL_LLM_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("PLANNER_LLM_MODEL", raising=False)
+    monkeypatch.delenv("PLANNER_LLM_REASONING_EFFORT", raising=False)
     monkeypatch.delenv("DYNAMODB_TABLE_NAME", raising=False)
     monkeypatch.delenv("AWS_REGION", raising=False)
 
     settings = Settings()
     assert settings.telegram_bot_token == "token123"
     assert settings.llm_api_key == "key123"
-    assert settings.llm_model == "gpt-4o-mini"
+    assert settings.conversational_llm_model == "gpt-5.6-luna"
+    assert settings.conversational_llm_reasoning_effort == "medium"
+    assert settings.planner_llm_model == "gpt-5.6-terra"
+    assert settings.planner_llm_reasoning_effort == "medium"
     assert settings.dynamodb_table_name == "meal-planner"
     assert settings.aws_region == "us-east-1"
-    assert settings.bot_llm_request_timeout_seconds == 6
-    assert settings.planner_llm_request_timeout_seconds == 20
 
 
 def test_config_missing_required_token(
@@ -60,7 +62,6 @@ def test_config_missing_required_token(
     """Test error when TELEGRAM_BOT_TOKEN is missing."""
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.setenv("LLM_API_KEY", "key123")
-    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret123")
 
     with pytest.raises(ValidationError) as exc_info:
         Settings()
@@ -73,107 +74,7 @@ def test_config_missing_required_api_key(
     """Test error when LLM_API_KEY is missing."""
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token123")
     monkeypatch.delenv("LLM_API_KEY", raising=False)
-    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret123")
 
     with pytest.raises(ValidationError) as exc_info:
         Settings()
     assert "llm_api_key" in str(exc_info.value)
-
-
-def test_config_rejects_missing_webhook_secret(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Test error when TELEGRAM_WEBHOOK_SECRET is missing."""
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token123")
-    monkeypatch.setenv("LLM_API_KEY", "key123")
-    monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET", raising=False)
-
-    with pytest.raises(ValidationError) as exc_info:
-        WebhookSettings()
-    assert "telegram_webhook_secret" in str(exc_info.value)
-
-
-def test_config_rejects_whitespace_webhook_secret(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Test error when TELEGRAM_WEBHOOK_SECRET contains only whitespace."""
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token123")
-    monkeypatch.setenv("LLM_API_KEY", "key123")
-    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "   ")
-
-    with pytest.raises(ValidationError) as exc_info:
-        WebhookSettings()
-    assert "telegram_webhook_secret" in str(exc_info.value)
-
-
-@pytest.mark.parametrize(
-    ("name", "value"),
-    [
-        ("BOT_TELEGRAM_REQUEST_TIMEOUT_SECONDS", "0"),
-        ("BOT_LLM_REQUEST_TIMEOUT_SECONDS", "30"),
-        ("BOT_LLM_MAX_RETRIES", "0"),
-        ("BOT_LLM_INITIAL_BACKOFF_SECONDS", "10"),
-    ],
-)
-def test_config_rejects_unbounded_function_call_settings(
-    mock_env: None,
-    monkeypatch: pytest.MonkeyPatch,
-    name: str,
-    value: str,
-) -> None:
-    monkeypatch.setenv(name, value)
-    with pytest.raises(ValidationError):
-        Settings()
-
-
-def test_external_call_budget_includes_maximum_provider_waits() -> None:
-    assert (
-        external_call_budget_seconds(
-            llm_attempts=3,
-            llm_request_timeout_seconds=7,
-            llm_initial_backoff_seconds=0.1,
-            telegram_allowance_seconds=5,
-            handler_safety_margin_seconds=2,
-        )
-        == 38
-    )
-
-
-def test_external_call_budget_counts_sequential_telegram_requests() -> None:
-    assert (
-        external_call_budget_seconds(
-            llm_attempts=3,
-            llm_request_timeout_seconds=7,
-            llm_initial_backoff_seconds=0.1,
-            telegram_allowance_seconds=5,
-            handler_safety_margin_seconds=2,
-            telegram_request_count=2,
-        )
-        == 43
-    )
-
-
-def test_legacy_external_call_settings_are_tolerated(
-    mock_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("TELEGRAM_REQUEST_TIMEOUT_SECONDS", "10")
-    monkeypatch.setenv("LLM_REQUEST_TIMEOUT_SECONDS", "20")
-    monkeypatch.setenv("LLM_MAX_RETRIES", "3")
-    monkeypatch.setenv("LLM_INITIAL_BACKOFF_SECONDS", "1")
-
-    settings = Settings()
-
-    assert settings.bot_telegram_request_timeout_seconds == 5
-    assert settings.bot_llm_request_timeout_seconds == 6
-    assert settings.bot_llm_max_retries == 2
-
-
-def test_function_budgets_are_safe_by_default(mock_env: None) -> None:
-    settings = Settings()
-    assert settings.bot_function_timeout_seconds == 30
-    assert settings.planner_function_timeout_seconds == 120
-
-
-def test_function_budget_rejects_timeout_overrun(mock_env: None) -> None:
-    with pytest.raises(ValidationError, match="Bot external-call budget"):
-        Settings(bot_function_timeout_seconds=20)
