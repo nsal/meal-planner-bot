@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
-from typing import Any, Optional
+import math
+from collections.abc import Callable, Iterable
+from typing import Any, Optional, cast
 
 import litellm
 
@@ -24,14 +26,85 @@ class LLMClient:
         api_key: str = "",
         reasoning_effort: str = "medium",
         max_retries: int = 3,
-        initial_backoff: float = 0.01,
+        initial_backoff: float = 1.0,
+        request_timeout: float = 20.0,
     ) -> None:
         """Initialize LLM client with model settings and retry parameters."""
         self.model = model
         self.api_key = api_key
         self.reasoning_effort = reasoning_effort
         self.max_retries = max_retries
-        self.initial_backoff = initial_backoff
+        self.initial_backoff: float = initial_backoff
+        self.request_timeout: float = request_timeout
+
+    @staticmethod
+    def _is_transient(exc: Exception) -> bool:
+        """Return whether an error is safe to retry."""
+        if isinstance(
+            exc, (TimeoutError, ConnectionError, asyncio.TimeoutError)
+        ):
+            return True
+        status = getattr(exc, "status_code", None)
+        return status in {408, 409, 429, 500, 502, 503, 504}
+
+    @staticmethod
+    def _retry_after_from_headers(headers: object) -> float | None:
+        """Read a valid Retry-After value from a mapping-like object."""
+        items_method = getattr(headers, "items", None)
+        if not callable(items_method):
+            return None
+        typed_items_method = cast(Callable[[], object], items_method)
+        try:
+            header_items = typed_items_method()
+        except AttributeError, TypeError, ValueError:
+            return None
+        if not isinstance(header_items, Iterable):
+            return None
+        for item in header_items:
+            if not isinstance(item, tuple) or len(item) != 2:
+                continue
+            name, value = item
+            if not isinstance(name, str) or name.lower() != "retry-after":
+                continue
+            parsed = LLMClient._parse_retry_after(value)
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
+    def _parse_retry_after(value: object) -> float | None:
+        """Parse finite guidance and cap it at five seconds."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            parsed = float(value)
+        elif isinstance(value, str):
+            try:
+                parsed = float(value.strip())
+            except ValueError:
+                return None
+        else:
+            return None
+        if not math.isfinite(parsed) or parsed < 0:
+            return None
+        return min(parsed, 5.0)
+
+    def _retry_delay(self, exc: Exception, attempt: int) -> float:
+        """Use provider retry guidance or bounded exponential backoff."""
+        for headers in (
+            getattr(exc, "headers", None),
+            getattr(getattr(exc, "response", None), "headers", None),
+        ):
+            guided_delay = self._retry_after_from_headers(headers)
+            if guided_delay is not None:
+                return guided_delay
+        guided_delay = self._parse_retry_after(
+            getattr(exc, "retry_after", None)
+        )
+        if guided_delay is not None:
+            return guided_delay
+        delay: float = self.initial_backoff * float(2**attempt)
+        return delay if delay < 5.0 else 5.0
 
     async def _execute_with_retry(
         self,
@@ -42,6 +115,8 @@ class LLMClient:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
+            "timeout": self.request_timeout,
+            "max_retries": 0,
             "reasoning_effort": self.reasoning_effort,
         }
         if self.api_key:
@@ -70,12 +145,13 @@ class LLMClient:
                 logger.warning(
                     "LLM request attempt %d failed: %s", attempt + 1, exc
                 )
-                if attempt < self.max_retries - 1:
-                    sleep_time = self.initial_backoff * (2**attempt)
-                    await asyncio.sleep(sleep_time)
-                else:
-                    logger.error("LLM request failed after max retries.")
+                if not self._is_transient(exc):
+                    logger.error("LLM request failed permanently")
                     return None
+                if attempt >= self.max_retries - 1:
+                    logger.error("LLM request failed after max retries")
+                    return None
+                await asyncio.sleep(self._retry_delay(exc, attempt))
         return None
 
     async def chat(self, system_prompt: str, user_message: str) -> str:

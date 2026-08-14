@@ -12,6 +12,7 @@ def mock_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "TELEGRAM_BOT_TOKEN", "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
     )
     monkeypatch.setenv("LLM_API_KEY", "test-api-key")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "test-webhook-secret")
     monkeypatch.setenv("CONVERSATIONAL_LLM_MODEL", "gpt-5.6-luna")
     monkeypatch.setenv("CONVERSATIONAL_LLM_REASONING_EFFORT", "medium")
     monkeypatch.setenv("PLANNER_LLM_MODEL", "gpt-5.6-terra")

@@ -5,6 +5,7 @@ from typing import Any, Generator
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from meal_planner.db.dynamo import DynamoRepository
@@ -85,6 +86,177 @@ def test_meal_history_includes_multiple_meals_and_date_boundaries(
     ]
 
 
+def test_meal_log_retries_are_idempotent_per_source_update(
+    repo: DynamoRepository,
+) -> None:
+    first = _meal(8, 12, "first description")
+    retry = MealLogEntry(
+        date=date(2026, 8, 9),
+        meal_type="dinner",
+        description="retry description",
+        created_at=datetime(2026, 8, 8, 13, tzinfo=timezone.utc),
+    )
+    distinct = MealLogEntry(
+        date=date(2026, 8, 8),
+        meal_type="dinner",
+        description="distinct update",
+        created_at=datetime(2026, 8, 8, 14, tzinfo=timezone.utc),
+    )
+
+    repo.log_meal("user", first, source_update_id="100")
+    repo.log_meal("user", retry, source_update_id="100")
+    repo.log_meal("user", distinct, source_update_id="101")
+
+    saved = repo.table.get_item(
+        Key={
+            "PK": "USER#user",
+            "SK": "MEAL#2026-08-08#UPDATE#100#lunch",
+        }
+    )["Item"]
+    assert saved["description"] == "first description"
+    assert (
+        repo.table.get_item(Key={"PK": "USER#user", "SK": "MEAL_UPDATE#100"})[
+            "Item"
+        ]["SK"]
+        == "MEAL_UPDATE#100"
+    )
+    history = repo.get_meal_history("user", days=1, on_date=date(2026, 8, 8))
+    assert [entry.description for entry in history] == [
+        "distinct update",
+        "first description",
+    ]
+
+
+def test_source_meal_transaction_contains_stable_marker_after_meal(
+    mocker: Any,
+) -> None:
+    """Greenfield writes make markerless source updates unreachable."""
+    table = mocker.MagicMock()
+    table.name = "test-meal-planner"
+
+    DynamoRepository(table).log_meal(
+        "user", _meal(8, 12, "meal"), source_update_id="100"
+    )
+
+    request = table.meta.client.transact_write_items.call_args.kwargs
+    meal_put, marker_put = request["TransactItems"]
+    assert list(meal_put) == ["Put"]
+    assert list(marker_put) == ["Put"]
+    assert meal_put["Put"]["Item"]["SK"].startswith(
+        "MEAL#2026-08-08#UPDATE#100#"
+    )
+    assert marker_put["Put"] == {
+        "TableName": "test-meal-planner",
+        "Item": {"PK": "USER#user", "SK": "MEAL_UPDATE#100"},
+        "ConditionExpression": "attribute_not_exists(PK)",
+    }
+
+
+def test_marker_only_transaction_cancellation_is_distinguishable(
+    mocker: Any,
+) -> None:
+    """A marker conflict is distinct from an unexpected transaction failure."""
+    table = mocker.MagicMock()
+    table.name = "test-meal-planner"
+    error = ClientError(
+        {
+            "Error": {"Code": "TransactionCanceledException"},
+            "CancellationReasons": [
+                {"Code": "None"},
+                {"Code": "ConditionalCheckFailed"},
+            ],
+        },
+        "TransactWriteItems",
+    )
+    table.meta.client.transact_write_items.side_effect = error
+
+    DynamoRepository(table).log_meal(
+        "user", _meal(8, 12, "retry"), source_update_id="100"
+    )
+
+
+def test_meal_marker_conflict_is_an_idempotent_success(mocker: Any) -> None:
+    table = mocker.MagicMock()
+    table.name = "test-meal-planner"
+    table.meta.client.transact_write_items.side_effect = ClientError(
+        {
+            "Error": {"Code": "TransactionCanceledException"},
+            "CancellationReasons": [
+                {"Code": "None"},
+                {"Code": "ConditionalCheckFailed"},
+            ],
+        },
+        "TransactWriteItems",
+    )
+
+    DynamoRepository(table).log_meal(
+        "user", _meal(8, 12, "duplicate"), source_update_id="100"
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException"}},
+            "TransactWriteItems",
+        ),
+        ClientError(
+            {
+                "Error": {"Code": "TransactionCanceledException"},
+                "CancellationReasons": [
+                    {"Code": "None"},
+                    {"Code": "TransactionConflict"},
+                ],
+            },
+            "TransactWriteItems",
+        ),
+    ],
+)
+def test_meal_transaction_unexpected_failures_propagate(
+    mocker: Any, error: ClientError
+) -> None:
+    table = mocker.MagicMock()
+    table.name = "test-meal-planner"
+    table.meta.client.transact_write_items.side_effect = error
+
+    with pytest.raises(ClientError) as raised:
+        DynamoRepository(table).log_meal(
+            "user", _meal(8, 12, "meal"), source_update_id="100"
+        )
+
+    assert raised.value is error
+
+
+def test_meal_log_without_source_id_and_legacy_keys_are_queryable(
+    repo: DynamoRepository,
+) -> None:
+    timestamped = _meal(8, 12, "timestamped")
+    legacy = _meal(8, 13, "legacy")
+
+    repo.log_meal("user", timestamped)
+    repo.table.put_item(
+        Item={
+            "PK": "USER#user",
+            "SK": "MEAL#2026-08-08#2026-08-08T13:00:00+00:00#lunch",
+            **legacy.model_dump(mode="json"),
+        }
+    )
+
+    saved = repo.table.get_item(
+        Key={
+            "PK": "USER#user",
+            "SK": "MEAL#2026-08-08#TIME#2026-08-08T12:00:00+00:00#lunch",
+        }
+    )["Item"]
+    assert saved["description"] == "timestamped"
+    history = repo.get_meal_history("user", days=1, on_date=date(2026, 8, 8))
+    assert [entry.description for entry in history] == [
+        "legacy",
+        "timestamped",
+    ]
+
+
 def test_meal_history_paginates_and_skips_malformed_items(mocker: Any) -> None:
     table = mocker.MagicMock()
     valid = {
@@ -117,6 +289,184 @@ def test_plan_selection_distinguishes_latest_exact_and_active(
     assert repo.get_plan("user", "2026-08-04") == active
     assert repo.get_active_plan("user", date(2026, 8, 10)) == active
     assert repo.get_active_plan("user", date(2026, 8, 11)) is None
+
+
+def test_active_plan_snapshot_returns_legacy_absent_epoch(
+    repo: DynamoRepository,
+) -> None:
+    plan = make_plan(week_start=date(2026, 8, 10), status=PlanStatus.CONFIRMED)
+    repo.save_plan("user", plan)
+
+    snapshot = repo.get_active_plan_snapshot("user", on_date=date(2026, 8, 13))
+
+    assert snapshot is not None
+    assert snapshot.plan == plan
+    assert snapshot.active_epoch is None
+
+
+def test_active_callback_write_rejects_older_overlapping_plan(
+    repo: DynamoRepository,
+) -> None:
+    older = make_plan(week_start=date(2026, 8, 10), status=PlanStatus.CONFIRMED)
+    repo.save_plan("user", older)
+    snapshot = repo.get_active_plan_snapshot("user", on_date=date(2026, 8, 13))
+    assert snapshot is not None
+    assert snapshot.active_epoch is None
+
+    newer = make_plan(week_start=date(2026, 8, 12))
+    repo.save_plan("user", newer)
+    assert repo.confirm_plan("user", newer.week_start_date, 0)
+
+    assert not repo.update_meal_outcome(
+        "user",
+        older.week_start_date,
+        1,
+        "lunch",
+        MealOutcome.COOKED,
+        expected_epoch=snapshot.active_epoch,
+    )
+    saved_older = repo.get_plan("user", older.week_start_date)
+    assert saved_older is not None
+    assert saved_older.days[0].meals[0].outcome is MealOutcome.UNREPORTED
+
+
+def test_active_callback_write_accepts_present_epoch(
+    repo: DynamoRepository,
+) -> None:
+    plan = make_plan(week_start=date(2026, 8, 10))
+    repo.save_plan("user", plan)
+    assert repo.confirm_plan("user", plan.week_start_date, 0)
+
+    snapshot = repo.get_active_plan_snapshot("user", on_date=date(2026, 8, 13))
+    assert snapshot is not None
+    assert snapshot.active_epoch == 1
+    assert repo.update_meal_outcome(
+        "user",
+        plan.week_start_date,
+        1,
+        "lunch",
+        MealOutcome.COOKED,
+        expected_epoch=snapshot.active_epoch,
+    )
+    saved = repo.get_plan("user", plan.week_start_date)
+    assert saved is not None
+    assert saved.days[0].meals[0].outcome is MealOutcome.COOKED
+
+
+def test_present_epoch_values_are_scoped_to_condition_check(
+    mocker: Any,
+) -> None:
+    table = mocker.MagicMock()
+    table.name = "test-meal-planner"
+    plan = make_plan(status=PlanStatus.CONFIRMED)
+    repo = DynamoRepository(table)
+    mocker.patch.object(repo, "get_plan", return_value=plan)
+
+    assert repo.update_meal_outcome(
+        "user",
+        plan.week_start_date,
+        1,
+        "lunch",
+        MealOutcome.COOKED,
+        expected_epoch=7,
+    )
+
+    request = table.meta.client.transact_write_items.call_args.kwargs
+    update, condition_check = request["TransactItems"]
+    update_values = update["Update"]["ExpressionAttributeValues"]
+    condition_values = condition_check["ConditionCheck"][
+        "ExpressionAttributeValues"
+    ]
+    assert ":expected_epoch" not in update_values
+    assert condition_values == {":expected_epoch": 7}
+
+
+def test_get_plan_consistency_is_opt_in(mocker: Any) -> None:
+    table = mocker.MagicMock()
+    plan = make_plan()
+    table.get_item.return_value = {
+        "Item": {
+            "PK": "USER#user",
+            "SK": f"PLAN#{plan.week_start_date}",
+            **plan.model_dump(by_alias=True, mode="json"),
+        }
+    }
+    repo = DynamoRepository(table)
+
+    assert repo.get_plan("user", plan.week_start_date) == plan
+    assert "ConsistentRead" not in table.get_item.call_args.kwargs
+
+    assert (
+        repo.get_plan("user", plan.week_start_date, consistent_read=True)
+        == plan
+    )
+    assert table.get_item.call_args.kwargs["ConsistentRead"] is True
+
+
+def test_transaction_conditional_conflict_returns_false(
+    mocker: Any,
+) -> None:
+    table = mocker.MagicMock()
+    table.name = "test-meal-planner"
+    plan = make_plan(status=PlanStatus.CONFIRMED)
+    repo = DynamoRepository(table)
+    mocker.patch.object(repo, "get_plan", return_value=plan)
+    table.meta.client.transact_write_items.side_effect = ClientError(
+        {
+            "Error": {
+                "Code": "TransactionCanceledException",
+                "Message": "conditional conflict",
+            },
+            "CancellationReasons": [
+                {"Code": "None"},
+                {"Code": "ConditionalCheckFailed"},
+            ],
+        },
+        "TransactWriteItems",
+    )
+
+    assert not repo.update_meal_outcome(
+        "user",
+        plan.week_start_date,
+        1,
+        "lunch",
+        MealOutcome.COOKED,
+        expected_epoch=1,
+    )
+
+
+def test_transaction_service_failure_is_reraised(mocker: Any) -> None:
+    table = mocker.MagicMock()
+    table.name = "test-meal-planner"
+    plan = make_plan(status=PlanStatus.CONFIRMED)
+    repo = DynamoRepository(table)
+    mocker.patch.object(repo, "get_plan", return_value=plan)
+    error = ClientError(
+        {
+            "Error": {
+                "Code": "TransactionCanceledException",
+                "Message": "transaction conflict",
+            },
+            "CancellationReasons": [
+                {"Code": "None"},
+                {"Code": "TransactionConflict"},
+            ],
+        },
+        "TransactWriteItems",
+    )
+    table.meta.client.transact_write_items.side_effect = error
+
+    with pytest.raises(ClientError) as raised:
+        repo.update_meal_outcome(
+            "user",
+            plan.week_start_date,
+            1,
+            "lunch",
+            MealOutcome.COOKED,
+            expected_epoch=1,
+        )
+
+    assert raised.value is error
 
 
 def test_atomic_outcome_updates_preserve_independent_meals(
@@ -152,15 +502,60 @@ def test_generated_draft_cannot_replace_confirmed_plan(
 ) -> None:
     week = date(2026, 8, 10)
     draft = make_plan(week_start=week)
-    assert repo.save_generated_draft("user", draft)
-    replacement = make_plan(week_start=week)
+    assert repo.save_generated_draft("user", draft, expected_revision=None)
+    replacement = make_plan(week_start=week, revision=1)
     replacement.days[0].meals[0].name = "Replacement"
-    assert repo.save_generated_draft("user", replacement)
-    assert repo.confirm_plan("user", draft.week_start_date, 0)
-    assert not repo.save_generated_draft("user", replacement)
+    assert repo.save_generated_draft("user", replacement, expected_revision=0)
+    assert repo.confirm_plan("user", draft.week_start_date, 1)
+    assert not repo.save_generated_draft(
+        "user", replacement, expected_revision=1
+    )
     saved = repo.get_plan("user", week)
     assert saved is not None
     assert saved.status is PlanStatus.CONFIRMED
+
+
+def test_generated_draft_rejects_stale_edit_and_duplicate_worker(
+    repo: DynamoRepository,
+) -> None:
+    week = date(2026, 8, 10)
+    draft = make_plan(week_start=week)
+    assert repo.save_generated_draft("user", draft, expected_revision=None)
+    edited_meal = draft.days[0].meals[0].model_copy(update={"name": "Edit"})
+    assert repo.update_meal(
+        "user",
+        draft.week_start_date,
+        1,
+        "lunch",
+        edited_meal,
+        expected_revision=0,
+        expected_status=PlanStatus.DRAFT,
+    )
+
+    replacement = make_plan(week_start=week, revision=1)
+    assert not repo.save_generated_draft(
+        "user", replacement, expected_revision=0
+    )
+    assert not repo.save_generated_draft(
+        "user", replacement, expected_revision=None
+    )
+
+
+def test_generated_draft_reraises_nonconditional_dynamodb_errors(
+    mocker: Any,
+) -> None:
+    table = mocker.MagicMock()
+    error = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException"}},
+        "PutItem",
+    )
+    table.put_item.side_effect = error
+    repo = DynamoRepository(table)
+
+    with pytest.raises(ClientError) as raised:
+        repo.save_generated_draft("user", make_plan(), expected_revision=None)
+
+    assert raised.value is error
 
 
 def test_plan_lifecycle_writes_are_revision_checked(
