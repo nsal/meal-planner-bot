@@ -1,7 +1,9 @@
 """DynamoDB repository for profiles, meal history, and weekly plans."""
 
 import logging
+from dataclasses import dataclass
 from datetime import date, timedelta
+from decimal import Decimal
 from typing import Any, Optional
 
 from boto3.dynamodb.conditions import Key  # type: ignore[import-untyped]
@@ -18,6 +20,14 @@ from meal_planner.models.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ActivePlanSnapshot:
+    """Active plan and the activity epoch observed with it."""
+
+    plan: WeeklyPlan
+    active_epoch: int | None
 
 
 class DynamoRepository:
@@ -76,19 +86,56 @@ class DynamoRepository:
             Key={"PK": f"USER#{user_id}", "SK": "PROFILE_DRAFT"}
         )
 
-    def log_meal(self, user_id: str, entry: MealLogEntry) -> None:
-        """Store a meal without overwriting another meal of the same type."""
-        created_key = entry.created_at.isoformat()
-        self.table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": (
-                    f"MEAL#{entry.date_key}#{created_key}#"
-                    f"{entry.meal_type.value}"
-                ),
-                **entry.model_dump(mode="json"),
-            }
-        )
+    def log_meal(
+        self,
+        user_id: str,
+        entry: MealLogEntry,
+        *,
+        source_update_id: str | None = None,
+    ) -> None:
+        """Store a meal, retaining the first result for a source update."""
+        meal_item = {
+            "PK": f"USER#{user_id}",
+            "SK": (
+                f"MEAL#{entry.date_key}#UPDATE#{source_update_id}#"
+                f"{entry.meal_type.value}"
+            )
+            if source_update_id is not None
+            else (
+                f"MEAL#{entry.date_key}#TIME#{entry.created_at.isoformat()}#"
+                f"{entry.meal_type.value}"
+            ),
+            **entry.model_dump(mode="json"),
+        }
+        if source_update_id is None:
+            self.table.put_item(Item=meal_item)
+            return
+
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": meal_item,
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": {
+                                "PK": f"USER#{user_id}",
+                                "SK": f"MEAL_UPDATE#{source_update_id}",
+                            },
+                            "ConditionExpression": ("attribute_not_exists(PK)"),
+                        }
+                    },
+                ]
+            )
+        except ClientError as exc:
+            if self._is_meal_duplicate_transaction(exc):
+                return
+            raise
 
     def get_meal_history(
         self,
@@ -142,23 +189,80 @@ class DynamoRepository:
         code = error.get("Code") if isinstance(error, dict) else None
         return code == "ConditionalCheckFailedException"
 
-    def save_generated_draft(self, user_id: str, plan: WeeklyPlan) -> bool:
-        """Save a generated draft unless the week is already confirmed."""
-        try:
-            self.table.put_item(
-                Item={
-                    "PK": f"USER#{user_id}",
-                    "SK": f"PLAN#{plan.week_start_date}",
-                    **plan.model_dump(by_alias=True, mode="json"),
-                },
-                ConditionExpression=(
-                    "attribute_not_exists(#status) OR #status = :draft"
-                ),
-                ExpressionAttributeNames={"#status": "status"},
-                ExpressionAttributeValues={
-                    ":draft": PlanStatus.DRAFT.value,
-                },
+    @staticmethod
+    def _is_transaction_conditional_failure(exc: ClientError) -> bool:
+        """Return whether a transaction failed only on an expected condition."""
+        error = exc.response.get("Error", {})
+        code = error.get("Code") if isinstance(error, dict) else None
+        if code != "TransactionCanceledException":
+            return False
+        reasons = exc.response.get("CancellationReasons")
+        if not isinstance(reasons, list):
+            return False
+        reason_codes = {
+            reason.get("Code") for reason in reasons if isinstance(reason, dict)
+        }
+        return "ConditionalCheckFailed" in reason_codes and reason_codes <= {
+            "ConditionalCheckFailed",
+            "None",
+        }
+
+    @staticmethod
+    def _is_meal_duplicate_transaction(exc: ClientError) -> bool:
+        """Return whether only the source-update marker already exists."""
+        error = exc.response.get("Error", {})
+        code = error.get("Code") if isinstance(error, dict) else None
+        if code != "TransactionCanceledException":
+            return False
+        reasons = exc.response.get("CancellationReasons")
+        if not isinstance(reasons, list) or len(reasons) != 2:
+            return False
+        first = reasons[0] if isinstance(reasons[0], dict) else {}
+        second = reasons[1] if isinstance(reasons[1], dict) else {}
+        return (
+            first.get("Code") == "None"
+            and second.get("Code") == "ConditionalCheckFailed"
+        )
+
+    def save_generated_draft(
+        self,
+        user_id: str,
+        plan: WeeklyPlan,
+        *,
+        expected_revision: int | None,
+    ) -> bool:
+        """Save a generated draft only when its snapshot is still current."""
+        if expected_revision is None:
+            condition_expression = "attribute_not_exists(#pk)"
+            expression_attribute_names = {"#pk": "PK"}
+            expression_attribute_values: dict[str, Any] = {}
+        else:
+            condition_expression = (
+                "#status = :draft AND #revision = :expected_revision"
             )
+            expression_attribute_names = {
+                "#status": "status",
+                "#revision": "revision",
+            }
+            expression_attribute_values = {
+                ":draft": PlanStatus.DRAFT.value,
+                ":expected_revision": expected_revision,
+            }
+        put_kwargs: dict[str, Any] = {
+            "Item": {
+                "PK": f"USER#{user_id}",
+                "SK": f"PLAN#{plan.week_start_date}",
+                **plan.model_dump(by_alias=True, mode="json"),
+            },
+            "ConditionExpression": condition_expression,
+            "ExpressionAttributeNames": expression_attribute_names,
+        }
+        if expression_attribute_values:
+            put_kwargs["ExpressionAttributeValues"] = (
+                expression_attribute_values
+            )
+        try:
+            self.table.put_item(**put_kwargs)
         except ClientError as exc:
             if self._is_conditional_failure(exc):
                 return False
@@ -170,35 +274,62 @@ class DynamoRepository:
     ) -> bool:
         """Atomically confirm a draft and start grocery generation."""
         try:
-            self.table.update_item(
-                Key={
-                    "PK": f"USER#{user_id}",
-                    "SK": f"PLAN#{week_start}",
-                },
-                UpdateExpression=(
-                    "SET #status = :confirmed, "
-                    "#grocery_status = :pending, "
-                    "#grocery_list = :empty"
-                ),
-                ConditionExpression=(
-                    "#status = :draft AND #revision = :revision"
-                ),
-                ExpressionAttributeNames={
-                    "#status": "status",
-                    "#revision": "revision",
-                    "#grocery_status": "grocery_status",
-                    "#grocery_list": "grocery_list",
-                },
-                ExpressionAttributeValues={
-                    ":confirmed": PlanStatus.CONFIRMED.value,
-                    ":draft": PlanStatus.DRAFT.value,
-                    ":pending": "pending",
-                    ":empty": [],
-                    ":revision": expected_revision,
-                },
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Update": {
+                            "TableName": self.table.name,
+                            "Key": {
+                                "PK": f"USER#{user_id}",
+                                "SK": f"PLAN#{week_start}",
+                            },
+                            "UpdateExpression": (
+                                "SET #status = :confirmed, "
+                                "#grocery_status = :pending, "
+                                "#grocery_list = :empty"
+                            ),
+                            "ConditionExpression": (
+                                "#status = :draft AND #revision = :revision"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#status": "status",
+                                "#revision": "revision",
+                                "#grocery_status": "grocery_status",
+                                "#grocery_list": "grocery_list",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":confirmed": PlanStatus.CONFIRMED.value,
+                                ":draft": PlanStatus.DRAFT.value,
+                                ":pending": "pending",
+                                ":empty": [],
+                                ":revision": expected_revision,
+                            },
+                        }
+                    },
+                    {
+                        "Update": {
+                            "TableName": self.table.name,
+                            "Key": {
+                                "PK": f"USER#{user_id}",
+                                "SK": "PLAN_STATE",
+                            },
+                            "UpdateExpression": (
+                                "SET #active_epoch = "
+                                "if_not_exists(#active_epoch, :zero) + :one"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#active_epoch": "active_epoch",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":zero": 0,
+                                ":one": 1,
+                            },
+                        }
+                    },
+                ]
             )
         except ClientError as exc:
-            if self._is_conditional_failure(exc):
+            if self._is_transaction_conditional_failure(exc):
                 return False
             raise
         return True
@@ -388,16 +519,24 @@ class DynamoRepository:
         return True
 
     def get_plan(
-        self, user_id: str, week_start: str | date
+        self,
+        user_id: str,
+        week_start: str | date,
+        *,
+        consistent_read: bool = False,
     ) -> Optional[WeeklyPlan]:
+        """Return one exact plan, optionally using a consistent read."""
         week_key = (
             week_start.isoformat()
             if isinstance(week_start, date)
             else week_start
         )
-        response = self.table.get_item(
-            Key={"PK": f"USER#{user_id}", "SK": f"PLAN#{week_key}"}
-        )
+        get_kwargs: dict[str, Any] = {
+            "Key": {"PK": f"USER#{user_id}", "SK": f"PLAN#{week_key}"}
+        }
+        if consistent_read:
+            get_kwargs["ConsistentRead"] = True
+        response = self.table.get_item(**get_kwargs)
         item = response.get("Item")
         return WeeklyPlan.model_validate(self._data(item)) if item else None
 
@@ -432,6 +571,40 @@ class DynamoRepository:
                 return plan
         return None
 
+    def get_active_plan_snapshot(
+        self, user_id: str, on_date: date | None = None
+    ) -> ActivePlanSnapshot | None:
+        """Return the active plan and strongly consistent epoch snapshot."""
+        state_response = self.table.get_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PLAN_STATE"},
+            ConsistentRead=True,
+        )
+        state_item = state_response.get("Item")
+        active_epoch: int | None = None
+        if state_item is not None:
+            raw_epoch = state_item.get("active_epoch")
+            if isinstance(raw_epoch, bool) or not isinstance(
+                raw_epoch, (int, Decimal)
+            ):
+                raise ValueError("PLAN_STATE active_epoch must be an integer")
+            active_epoch = int(raw_epoch)
+
+        target = on_date or date.today()
+        response = self.table.query(
+            KeyConditionExpression=Key("PK").eq(f"USER#{user_id}")
+            & Key("SK").begins_with("PLAN#"),
+            ScanIndexForward=False,
+            ConsistentRead=True,
+        )
+        for item in response.get("Items", []):
+            plan = WeeklyPlan.model_validate(self._data(item))
+            if (
+                plan.status is PlanStatus.CONFIRMED
+                and plan.week_start <= target <= plan.week_end
+            ):
+                return ActivePlanSnapshot(plan=plan, active_epoch=active_epoch)
+        return None
+
     def update_meal_outcome(
         self,
         user_id: str,
@@ -439,8 +612,10 @@ class DynamoRepository:
         day: int,
         meal_type: str,
         outcome: MealOutcome,
+        *,
+        expected_epoch: int | None = None,
     ) -> bool:
-        """Atomically update one nested outcome without rewriting the plan."""
+        """Update an outcome only if the active-plan epoch is unchanged."""
         plan = self.get_plan(user_id, week_start)
         if not plan or plan.status is not PlanStatus.CONFIRMED:
             return False
@@ -457,32 +632,65 @@ class DynamoRepository:
         if day_index is None or meal_index is None:
             return False
         try:
-            self.table.update_item(
-                Key={
+            epoch_condition: dict[str, Any]
+            if expected_epoch is None:
+                epoch_condition = {
+                    "ConditionExpression": "attribute_not_exists(#pk)",
+                    "ExpressionAttributeNames": {"#pk": "PK"},
+                }
+                epoch_values: dict[str, Any] = {}
+            else:
+                epoch_condition = {
+                    "ConditionExpression": "#active_epoch = :expected_epoch",
+                    "ExpressionAttributeNames": {
+                        "#active_epoch": "active_epoch"
+                    },
+                }
+                epoch_values = {":expected_epoch": expected_epoch}
+                epoch_condition["ExpressionAttributeValues"] = epoch_values
+
+            plan_names = {
+                "#days": "days",
+                "#meals": "meals",
+                "#outcome": "outcome",
+                "#status": "status",
+            }
+            plan_values: dict[str, Any] = {
+                ":outcome": outcome.value,
+                ":confirmed": PlanStatus.CONFIRMED.value,
+            }
+            transaction_update = {
+                "TableName": self.table.name,
+                "Key": {
                     "PK": f"USER#{user_id}",
                     "SK": f"PLAN#{week_start}",
                 },
-                UpdateExpression=(
+                "UpdateExpression": (
                     f"SET #days[{day_index}].#meals[{meal_index}].#outcome "
                     "= :outcome"
                 ),
-                ConditionExpression="#status = :confirmed",
-                ExpressionAttributeNames={
-                    "#days": "days",
-                    "#meals": "meals",
-                    "#outcome": "outcome",
-                    "#status": "status",
-                },
-                ExpressionAttributeValues={
-                    ":outcome": outcome.value,
-                    ":confirmed": PlanStatus.CONFIRMED.value,
-                },
+                "ConditionExpression": "#status = :confirmed",
+                "ExpressionAttributeNames": plan_names,
+                "ExpressionAttributeValues": plan_values,
+            }
+            transaction_check = {
+                "ConditionCheck": {
+                    "TableName": self.table.name,
+                    "Key": {
+                        "PK": f"USER#{user_id}",
+                        "SK": "PLAN_STATE",
+                    },
+                    **epoch_condition,
+                }
+            }
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {"Update": transaction_update},
+                    transaction_check,
+                ]
             )
         except ClientError as exc:
-            if (
-                exc.response.get("Error", {}).get("Code")
-                == "ConditionalCheckFailedException"
-            ):
+            if self._is_transaction_conditional_failure(exc):
                 return False
             raise
         return True

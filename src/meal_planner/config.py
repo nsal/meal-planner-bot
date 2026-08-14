@@ -50,7 +50,18 @@ class Settings(BaseSettings):
     )
 
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
-    llm_model: str = Field(default="gpt-4o-mini", alias="LLM_MODEL")
+    conversational_llm_model: str = Field(
+        default="gpt-5.6-luna", alias="CONVERSATIONAL_LLM_MODEL"
+    )
+    conversational_llm_reasoning_effort: str = Field(
+        default="medium", alias="CONVERSATIONAL_LLM_REASONING_EFFORT"
+    )
+    planner_llm_model: str = Field(
+        default="gpt-5.6-terra", alias="PLANNER_LLM_MODEL"
+    )
+    planner_llm_reasoning_effort: str = Field(
+        default="medium", alias="PLANNER_LLM_REASONING_EFFORT"
+    )
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
     dynamodb_table_name: str = Field(
         default="meal-planner", alias="DYNAMODB_TABLE_NAME"
@@ -174,8 +185,20 @@ class Settings(BaseSettings):
         return self.telegram_bot_token
 
     @property
-    def LLM_MODEL(self) -> str:
-        return self.llm_model
+    def CONVERSATIONAL_LLM_MODEL(self) -> str:
+        return self.conversational_llm_model
+
+    @property
+    def CONVERSATIONAL_LLM_REASONING_EFFORT(self) -> str:
+        return self.conversational_llm_reasoning_effort
+
+    @property
+    def PLANNER_LLM_MODEL(self) -> str:
+        return self.planner_llm_model
+
+    @property
+    def PLANNER_LLM_REASONING_EFFORT(self) -> str:
+        return self.planner_llm_reasoning_effort
 
     @property
     def LLM_API_KEY(self) -> str:

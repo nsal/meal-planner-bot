@@ -12,20 +12,79 @@ from tests.factories import make_plan, make_plan_payload, make_profile
 
 def test_generate_plan_saves_draft_without_groceries(mocker: Any) -> None:
     repo = mocker.MagicMock()
+    events: list[str] = []
     repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
     repo.get_meal_history.return_value = []
     repo.get_latest_plan.return_value = None
     api = mocker.MagicMock()
     llm = mocker.MagicMock()
     week = date(2026, 8, 10)
     llm.chat_json_sync.return_value = make_plan_payload(week)
-    repo.save_generated_draft.return_value = True
+    repo.save_generated_draft.side_effect = lambda *_args, **_kwargs: (
+        events.append("persist") or True
+    )
+    api.send_plan.side_effect = lambda *_args: events.append("send_plan")
+    api.send_message.side_effect = lambda *_args: events.append("send_message")
     PlannerHandler(repo, api, llm).generate_plan("user", 1, week_start=week)
     saved = repo.save_generated_draft.call_args.args[1]
     assert saved.status is PlanStatus.DRAFT
     assert saved.grocery_status is GroceryStatus.NOT_REQUESTED
     assert saved.grocery_list == []
+    repo.save_generated_draft.assert_called_once_with(
+        "user", saved, expected_revision=None
+    )
     api.send_plan.assert_called_once()
+    api.send_message.assert_called_once_with(
+        1, "Review this draft, request edits, then tell me to confirm it."
+    )
+    assert events == ["persist", "send_plan", "send_message"]
+
+
+def test_generate_plan_delivery_failure_keeps_persisted_draft(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.save_generated_draft.return_value = True
+    api = mocker.MagicMock()
+    api.send_plan.side_effect = RuntimeError("offline")
+    llm = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    llm.chat_json_sync.return_value = make_plan_payload(week)
+
+    PlannerHandler(repo, api, llm).generate_plan("user", 1, week_start=week)
+
+    repo.save_generated_draft.assert_called_once()
+    api.send_plan.assert_called_once()
+    api.send_message.assert_not_called()
+
+
+def test_generate_plan_follow_up_delivery_failure_keeps_persisted_draft(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.save_generated_draft.return_value = True
+    api = mocker.MagicMock()
+    api.send_message.side_effect = RuntimeError("offline")
+    llm = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    llm.chat_json_sync.return_value = make_plan_payload(week)
+
+    PlannerHandler(repo, api, llm).generate_plan("user", 1, week_start=week)
+
+    repo.save_generated_draft.assert_called_once()
+    api.send_plan.assert_called_once()
+    api.send_message.assert_called_once_with(
+        1, "Review this draft, request edits, then tell me to confirm it."
+    )
 
 
 def test_generate_plan_normalizes_provider_lifecycle_fields(
@@ -33,6 +92,7 @@ def test_generate_plan_normalizes_provider_lifecycle_fields(
 ) -> None:
     repo = mocker.MagicMock()
     repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
     repo.get_meal_history.return_value = []
     repo.get_latest_plan.return_value = None
     api = mocker.MagicMock()
@@ -74,6 +134,7 @@ def test_generate_plan_rejects_missing_profile_and_malformed_plan(
     PlannerHandler(repo, api).generate_plan("user", 1)
     repo.save_plan.assert_not_called()
     repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
     llm = mocker.MagicMock()
     llm.chat_json_sync.return_value = {}
     PlannerHandler(repo, api, llm).generate_plan(
@@ -87,6 +148,7 @@ def test_generate_plan_rejects_ambiguous_daily_meals(
 ) -> None:
     repo = mocker.MagicMock()
     repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
     repo.get_meal_history.return_value = []
     repo.get_latest_plan.return_value = None
     api = mocker.MagicMock()
@@ -109,6 +171,7 @@ def test_late_generation_result_does_not_replace_confirmed_week(
 ) -> None:
     repo = mocker.MagicMock()
     repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
     repo.get_meal_history.return_value = []
     repo.get_latest_plan.return_value = None
     repo.save_generated_draft.return_value = False
@@ -120,7 +183,103 @@ def test_late_generation_result_does_not_replace_confirmed_week(
     )
     repo.save_generated_draft.assert_called_once()
     api.send_plan.assert_not_called()
-    assert "already confirmed" in api.send_message.call_args.args[1]
+    assert "discarded the stale result" in api.send_message.call_args.args[1]
+
+
+def test_generate_plan_uses_draft_revision_snapshot(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    existing = make_plan(week_start=week, revision=4)
+    events: list[str] = []
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.side_effect = lambda *_args, **_kwargs: (
+        events.append("snapshot") or existing
+    )
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = existing
+    repo.save_generated_draft.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.side_effect = lambda *_args: (
+        events.append("llm") or make_plan_payload(week)
+    )
+
+    PlannerHandler(repo, api, llm).generate_plan("user", 1, week_start=week)
+
+    saved = repo.save_generated_draft.call_args.args[1]
+    assert saved.revision == 5
+    assert events == ["snapshot", "llm"]
+    assert repo.get_plan.call_args.kwargs == {"consistent_read": True}
+    repo.save_generated_draft.assert_called_once_with(
+        "user", saved, expected_revision=4
+    )
+
+
+def test_generate_plan_skips_llm_for_confirmed_exact_week(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(
+        week_start=week, status=PlanStatus.CONFIRMED
+    )
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+
+    PlannerHandler(repo, api, llm).generate_plan("user", 1, week_start=week)
+
+    llm.chat_json_sync.assert_not_called()
+    repo.get_plan.assert_called_once_with("user", week, consistent_read=True)
+    repo.get_meal_history.assert_not_called()
+    repo.save_generated_draft.assert_not_called()
+    api.send_plan.assert_not_called()
+
+
+def test_generate_plan_notifies_when_snapshot_read_fails(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.side_effect = RuntimeError("database unavailable")
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user", 1, week_start=date(2026, 8, 10)
+    )
+
+    repo.get_plan.assert_called_once_with(
+        "user", date(2026, 8, 10), consistent_read=True
+    )
+    llm.chat_json_sync.assert_not_called()
+    repo.save_generated_draft.assert_not_called()
+    assert (
+        api.send_message.call_args.args[1]
+        == "Sorry, an error occurred while generating your plan."
+    )
+
+
+def test_generate_plan_does_not_send_rejected_stale_result(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(week_start=week, revision=2)
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.save_generated_draft.return_value = False
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = make_plan_payload(week)
+
+    PlannerHandler(repo, api, llm).generate_plan("user", 1, week_start=week)
+
+    api.send_plan.assert_not_called()
+    assert "discarded the stale result" in api.send_message.call_args.args[1]
 
 
 def test_finalize_grocery_success(mocker: Any) -> None:
@@ -138,6 +297,9 @@ def test_finalize_grocery_success(mocker: Any) -> None:
     repo.complete_grocery.return_value = True
     PlannerHandler(repo, api, llm).finalize_grocery(
         "user", 1, plan.week_start_date
+    )
+    repo.get_plan.assert_called_once_with(
+        "user", plan.week_start_date, consistent_read=True
     )
     repo.complete_grocery.assert_called_once()
     assert repo.complete_grocery.call_args.args[2] == plan.revision

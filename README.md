@@ -50,7 +50,10 @@ Local development reads these variables from the environment or an ignored
 | `TELEGRAM_BOT_TOKEN` | required | BotFather token |
 | `TELEGRAM_WEBHOOK_SECRET` | required for bot | Telegram webhook secret token |
 | `LLM_API_KEY` | required | Provider credential used by LiteLLM |
-| `LLM_MODEL` | `gpt-4o-mini` | LiteLLM model identifier |
+| `CONVERSATIONAL_LLM_MODEL` | `gpt-5.6-luna` | Conversational LiteLLM model |
+| `CONVERSATIONAL_LLM_REASONING_EFFORT` | `medium` | Conversational reasoning effort |
+| `PLANNER_LLM_MODEL` | `gpt-5.6-terra` | Planner and grocery LiteLLM model |
+| `PLANNER_LLM_REASONING_EFFORT` | `medium` | Planner reasoning effort |
 | `DYNAMODB_TABLE_NAME` | `meal-planner` | DynamoDB table |
 | `AWS_REGION` | `us-east-1` | AWS client region |
 | `BOT_FUNCTION_TIMEOUT_SECONDS` | `30` | Bot Lambda deadline |
@@ -179,6 +182,42 @@ aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
   --region "$AWS_REGION" --query 'Stacks[0].Outputs' --output table
 ```
 
+Before a smoke test, verify the deployed Bot execution role has the
+transaction permission required by meal logging, plan confirmation, and meal
+outcome callbacks. The verifier is read-only and requires the calling
+principal to have `cloudformation:DescribeStacks`,
+`lambda:GetFunctionConfiguration`, `dynamodb:DescribeTable`, and
+`iam:SimulatePrincipalPolicy` for the selected region and stack. It does not
+change the role or substitute for an end-to-end Telegram test:
+
+```bash
+uv run python scripts/verify_transaction_permission.py \
+  --stack-name "$STACK_NAME" \
+  --region "$AWS_REGION"
+```
+
+Success prints an explicit allow for `dynamodb:TransactWriteItems` on the
+stack's exact table ARN. Missing outputs, malformed responses, denied or
+implicit-deny decisions, and AWS API errors are failures; stop and correct the
+deployment before continuing. The command does not print credentials.
+
+This project is greenfield: source-backed meal writes have always created the
+date-indexed meal and its `MEAL_UPDATE#<telegram_update_id>` marker together.
+No backfill, scan, migration, or markerless-record compatibility lookup is
+included. If a markerless `MEAL#...#UPDATE#...` item is discovered before a
+deployment, stop the release and investigate the data and deployment history
+before using this workflow.
+
+For a non-production Telegram smoke test, send one conversational meal log,
+then inspect the table using the update ID shown in the webhook or Lambda
+logs. Confirm that the user partition contains one date-indexed meal and one
+`MEAL_UPDATE#<update_id>` marker. Replay the same Telegram update (even with
+different extracted date, meal type, description, or timestamp) and confirm
+that the original meal remains the only meal for that update. Also confirm a
+plan confirmation and a meal check-in callback to exercise the other Bot
+transaction paths. Remove the webhook and delete the test stack only after
+preserving any data needed for investigation.
+
 To rotate a secret, update one secret at a time, then deploy with a new unique
 `SecretRefreshToken`. The marker changes both Lambda resources, forcing
 CloudFormation to re-resolve the versionless Secrets Manager references. For
@@ -225,7 +264,9 @@ aws cloudformation delete-stack --stack-name "$STACK_NAME" \
   onboarding fields carry across conversational turns, so provide only the
   fields the bot still requests.
 - `/profile` shows the persisted profile.
-- `/plan` asynchronously generates a complete seven-day draft.
+- `/plan` asynchronously generates a complete seven-day draft. The draft is
+  persisted before Telegram delivery; if delivery fails, the draft remains
+  valid and requesting `/plan` again is the recovery path.
 - Ask conversationally to edit an existing meal; missing days or meal types
   are rejected rather than silently created.
 - Tell the bot to confirm the draft. Confirmation starts grocery generation.
@@ -264,6 +305,9 @@ non-empty section before it can become ready.
   the current week's plan instead.
 - Grocery state `ready` is persisted before its Telegram notification. If the
   notification fails, retry `/grocery` after Telegram connectivity returns.
+- Generated drafts are persisted before their Telegram messages. A delivery
+  failure does not roll back or invalidate the draft; request `/plan` again to
+  recover if the draft was not delivered.
 - A slow grocery worker whose plan revision is stale is discarded without
   changing state or sending a notification. Meal outcomes are targeted writes
   and do not invalidate grocery content; meal edits advance the revision and

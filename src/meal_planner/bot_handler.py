@@ -241,20 +241,25 @@ class BotHandler:
             ):
                 return
             callback = parse_checkin_callback(route.callback_data)
-            if not callback:
+            if callback is None:
+                acknowledgement = "Invalid check-in"
                 self.telegram_api.send_message(
                     route.chat_id,
                     "That check-in button is invalid or outdated.",
                 )
                 return
-            plan = self.repo.get_active_plan(route.user_id)
+
+            snapshot = self.repo.get_active_plan_snapshot(route.user_id)
             today = date.today()
             if (
-                not plan
-                or plan.status is not PlanStatus.CONFIRMED
-                or not plan.week_start <= today <= plan.week_end
-                or plan.week_start_date != callback.week_start
+                snapshot is None
+                or snapshot.plan.status is not PlanStatus.CONFIRMED
+                or not snapshot.plan.week_start
+                <= today
+                <= snapshot.plan.week_end
+                or snapshot.plan.week_start_date != callback.week_start
             ):
+                acknowledgement = "Inactive plan"
                 self.telegram_api.send_message(
                     route.chat_id, "That check-in belongs to an inactive plan."
                 )
@@ -265,18 +270,33 @@ class BotHandler:
                 callback.day,
                 callback.meal_type.value,
                 callback.outcome,
+                expected_epoch=snapshot.active_epoch,
             )
             if not updated:
+                acknowledgement = "Meal changed"
                 self.telegram_api.send_message(
-                    route.chat_id, "That meal could not be updated."
+                    route.chat_id,
+                    "That meal changed before it could be updated. "
+                    "Please try again.",
                 )
                 return
             acknowledgement = "Meal updated"
-            self.telegram_api.send_message(
-                route.chat_id,
-                f"Marked {callback.meal_type.value} as "
-                f"{callback.outcome.value}.",
-            )
+        except Exception as exc:
+            logger.exception("Error handling callback: %s", exc)
+            if route.chat_id is not None:
+                self.telegram_api.send_message(
+                    route.chat_id,
+                    "Sorry, I couldn't update that meal. Please try again.",
+                )
+        else:
+            try:
+                self.telegram_api.send_message(
+                    route.chat_id,
+                    f"Marked {callback.meal_type.value} as "
+                    f"{callback.outcome.value}.",
+                )
+            except TelegramAPIError as exc:
+                logger.error("Callback success delivery failed: %s", exc)
         finally:
             if route.callback_query_id:
                 try:
@@ -290,6 +310,7 @@ class BotHandler:
         if route.chat_id is None or not route.user_id or not route.text:
             return
         try:
+            source_update_id = self._get_source_update_id(route)
             profile = self.repo.get_profile(route.user_id)
             profile_draft = self.repo.get_profile_draft(route.user_id)
             prompt = build_conversational_prompt(
@@ -312,6 +333,7 @@ class BotHandler:
                 metadata.intent,
                 metadata.entities,
                 profile,
+                source_update_id=source_update_id,
             )
             if result.message:
                 reply = result.message
@@ -328,6 +350,14 @@ class BotHandler:
                 "Sorry, I couldn't process that request. Please try again.",
             )
 
+    @staticmethod
+    def _get_source_update_id(route: RouteResult) -> str | None:
+        """Return a normalized Telegram update ID for conversational writes."""
+        update_id = route.raw_update.get("update_id")
+        if isinstance(update_id, int) and not isinstance(update_id, bool):
+            return str(update_id)
+        return None
+
     def _apply_intent_metadata(
         self,
         user_id: str,
@@ -335,6 +365,8 @@ class BotHandler:
         intent: ConversationIntent,
         entities: dict[str, Any],
         existing_profile: Optional[UserProfile],
+        *,
+        source_update_id: str | None = None,
     ) -> MutationResult:
         try:
             if intent is ConversationIntent.LOG_MEAL:
@@ -344,7 +376,9 @@ class BotHandler:
                     description=entities.get("description", "Logged meal"),
                     created_at=datetime.now(timezone.utc),
                 )
-                self.repo.log_meal(user_id, entry)
+                self.repo.log_meal(
+                    user_id, entry, source_update_id=source_update_id
+                )
                 return MutationResult(True)
             if intent is ConversationIntent.UPDATE_PROFILE:
                 return self._update_profile(user_id, entities, existing_profile)
@@ -626,8 +660,9 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         request_timeout=settings.bot_telegram_request_timeout_seconds,
     )
     llm_client = LLMClient(
-        model=settings.llm_model,
+        model=settings.conversational_llm_model,
         api_key=settings.llm_api_key,
+        reasoning_effort=settings.conversational_llm_reasoning_effort,
         max_retries=settings.bot_llm_max_retries,
         initial_backoff=settings.bot_llm_initial_backoff_seconds,
         request_timeout=settings.bot_llm_request_timeout_seconds,

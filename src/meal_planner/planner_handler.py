@@ -54,6 +54,16 @@ class PlannerHandler:
                 )
                 return
             target_week = week_start or date.today()
+            current_plan = self.repo.get_plan(
+                user_id, target_week, consistent_read=True
+            )
+            if current_plan and current_plan.status is PlanStatus.CONFIRMED:
+                self.telegram_api.send_message(
+                    chat_id,
+                    "That week's plan is already confirmed, so I kept it "
+                    "unchanged.",
+                )
+                return
             client = self.llm_client or LLMClient()
             prompt = build_plan_prompt(
                 profile=profile,
@@ -71,36 +81,57 @@ class PlannerHandler:
                 )
                 return
             plan.status = PlanStatus.DRAFT
-            plan.revision = 0
+            plan.revision = (
+                0 if current_plan is None else current_plan.revision + 1
+            )
             plan.grocery_status = GroceryStatus.NOT_REQUESTED
             plan.grocery_list = []
             for plan_day in plan.days:
                 for meal in plan_day.meals:
                     meal.outcome = MealOutcome.UNREPORTED
-            if not self.repo.save_generated_draft(user_id, plan):
+            expected_revision = (
+                None if current_plan is None else current_plan.revision
+            )
+            if not self.repo.save_generated_draft(
+                user_id, plan, expected_revision=expected_revision
+            ):
+                logger.info(
+                    "Discarded stale generated plan for user %s week %s",
+                    user_id,
+                    target_week,
+                )
                 self.telegram_api.send_message(
                     chat_id,
-                    "That week's plan was already confirmed, so I kept it "
-                    "unchanged.",
+                    "That week's plan changed while I was generating it, so "
+                    "I discarded the stale result.",
                 )
                 return
-            self.telegram_api.send_plan(chat_id, plan)
-            self.telegram_api.send_message(
-                chat_id,
-                "Review this draft, request edits, then tell me to confirm it.",
-            )
         except Exception as exc:
             logger.error("Plan generation failed for user %s: %s", user_id, exc)
             self._notify_failure(
                 chat_id,
                 "Sorry, an error occurred while generating your plan.",
             )
+            return
+        try:
+            self.telegram_api.send_plan(chat_id, plan)
+            self.telegram_api.send_message(
+                chat_id,
+                "Review this draft, request edits, then tell me to confirm it.",
+            )
+        except Exception as exc:
+            logger.error(
+                "Generated plan delivery failed for user %s week %s: %s",
+                user_id,
+                target_week,
+                exc,
+            )
 
     def finalize_grocery(
         self, user_id: str, chat_id: int | str, week_start: str
     ) -> None:
         """Generate groceries for one exact confirmed week."""
-        plan = self.repo.get_plan(user_id, week_start)
+        plan = self.repo.get_plan(user_id, week_start, consistent_read=True)
         if not plan or plan.week_start_date != week_start:
             self._notify_failure(
                 chat_id, "That meal-plan week no longer exists."
@@ -220,8 +251,9 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         request_timeout=settings.planner_telegram_request_timeout_seconds,
     )
     llm_client = LLMClient(
-        model=settings.llm_model,
+        model=settings.planner_llm_model,
         api_key=settings.llm_api_key,
+        reasoning_effort=settings.planner_llm_reasoning_effort,
         max_retries=settings.planner_llm_max_retries,
         initial_backoff=settings.planner_llm_initial_backoff_seconds,
         request_timeout=settings.planner_llm_request_timeout_seconds,

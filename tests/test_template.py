@@ -183,12 +183,16 @@ def _contains_text(value: object, needle: str) -> bool:
 
 
 def _normalize_build_template(value: object) -> object:
-    """Normalize only SAM's generated function CodeUri values."""
+    """Normalize SAM-generated CodeUri and equivalent GetAtt forms."""
     if isinstance(value, dict):
         return {
             key: "<generated CodeUri>"
             if key == "CodeUri"
-            else _normalize_build_template(item)
+            else (
+                item.split(".", 1)
+                if key == "Fn::GetAtt" and isinstance(item, str)
+                else _normalize_build_template(item)
+            )
             for key, item in value.items()
         }
     if isinstance(value, list):
@@ -356,6 +360,43 @@ def test_lambda_build_configuration() -> None:
         assert function_variables["SECRET_REFRESH_TOKEN"] == {
             "Ref": "SecretRefreshToken"
         }
+
+
+def test_bot_transaction_permission_is_explicit_and_table_scoped() -> None:
+    """Only BotFunction can transact against the application table."""
+    template = _load_template()
+    resources = template["Resources"]
+
+    bot_policies = resources["BotFunction"]["Properties"]["Policies"]
+    transaction_statements = [
+        statement
+        for policy in bot_policies
+        if isinstance(policy, dict)
+        for statement in policy.get("Statement", [])
+        if isinstance(statement, dict)
+        and statement.get("Action") == "dynamodb:TransactWriteItems"
+    ]
+    assert transaction_statements == [
+        {
+            "Effect": "Allow",
+            "Action": "dynamodb:TransactWriteItems",
+            "Resource": {"Fn::GetAtt": "MealPlannerTable.Arn"},
+        }
+    ]
+    assert all(
+        statement["Resource"] != "*" for statement in transaction_statements
+    )
+
+    planner_policies = resources["PlannerFunction"]["Properties"]["Policies"]
+    assert not any(
+        isinstance(policy, dict)
+        and any(
+            isinstance(statement, dict)
+            and statement.get("Action") == "dynamodb:TransactWriteItems"
+            for statement in policy.get("Statement", [])
+        )
+        for policy in planner_policies
+    )
 
 
 @pytest.mark.parametrize(

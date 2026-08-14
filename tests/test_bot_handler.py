@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from meal_planner.bot_handler import BotHandler, lambda_handler
+from meal_planner.db.dynamo import ActivePlanSnapshot
 from meal_planner.models.schemas import (
     ConversationIntent,
     GroceryStatus,
@@ -451,7 +452,9 @@ def test_callback_updates_every_outcome_and_acknowledges(
     handler: BotHandler, outcome: MealOutcome
 ) -> None:
     plan = make_plan(status=PlanStatus.CONFIRMED)
-    handler.repo.get_active_plan.return_value = plan
+    handler.repo.get_active_plan_snapshot.return_value = ActivePlanSnapshot(
+        plan=plan, active_epoch=None
+    )
     handler.repo.update_meal_outcome.return_value = True
     route = RouteResult(
         route_type=RouteType.CALLBACK,
@@ -463,7 +466,11 @@ def test_callback_updates_every_outcome_and_acknowledges(
         ),
     )
     handler.handle_callback(route)
-    assert handler.repo.update_meal_outcome.call_args.args[-1] is outcome
+    update_call = handler.repo.update_meal_outcome.call_args
+    assert update_call is not None
+    assert update_call.args[-1] is outcome
+    assert update_call.kwargs["expected_epoch"] is None
+    handler.repo.get_active_plan.assert_not_called()
     handler.telegram_api.answer_callback_query.assert_called_once()
 
 
@@ -478,7 +485,9 @@ def test_callback_rejects_superseded_overlapping_plan(
         week_start=date.today() - timedelta(days=1),
         status=PlanStatus.CONFIRMED,
     )
-    handler.repo.get_active_plan.return_value = active
+    handler.repo.get_active_plan_snapshot.return_value = ActivePlanSnapshot(
+        plan=active, active_epoch=1
+    )
     route = RouteResult(
         route_type=RouteType.CALLBACK,
         chat_id=1,
@@ -491,10 +500,98 @@ def test_callback_rejects_superseded_overlapping_plan(
 
     handler.repo.update_meal_outcome.assert_not_called()
     handler.telegram_api.answer_callback_query.assert_called_once_with(
-        "query", "Unable to update meal"
+        "query", "Inactive plan"
     )
     assert (
         "inactive plan" in handler.telegram_api.send_message.call_args.args[1]
+    )
+
+
+def test_callback_epoch_conflict_notifies_and_acknowledges(
+    handler: BotHandler,
+) -> None:
+    plan = make_plan(status=PlanStatus.CONFIRMED)
+    handler.repo.get_active_plan_snapshot.return_value = ActivePlanSnapshot(
+        plan=plan, active_epoch=4
+    )
+    handler.repo.update_meal_outcome.return_value = False
+    route = RouteResult(
+        route_type=RouteType.CALLBACK,
+        chat_id=1,
+        user_id="user",
+        callback_query_id="query",
+        callback_data=f"checkin:{plan.week_start_date}:1:lunch:cooked",
+    )
+
+    handler.handle_callback(route)
+
+    assert (
+        "changed before" in handler.telegram_api.send_message.call_args.args[1]
+    )
+    handler.repo.update_meal_outcome.assert_called_once_with(
+        "user",
+        plan.week_start_date,
+        1,
+        "lunch",
+        MealOutcome.COOKED,
+        expected_epoch=4,
+    )
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "query", "Meal changed"
+    )
+
+
+def test_callback_persistence_error_notifies_and_acknowledges(
+    handler: BotHandler,
+) -> None:
+    plan = make_plan(status=PlanStatus.CONFIRMED)
+    handler.repo.get_active_plan_snapshot.return_value = ActivePlanSnapshot(
+        plan=plan, active_epoch=2
+    )
+    handler.repo.update_meal_outcome.side_effect = RuntimeError("db down")
+    route = RouteResult(
+        route_type=RouteType.CALLBACK,
+        chat_id=1,
+        user_id="user",
+        callback_query_id="query",
+        callback_data=f"checkin:{plan.week_start_date}:1:lunch:cooked",
+    )
+
+    handler.handle_callback(route)
+
+    assert (
+        "couldn't update" in handler.telegram_api.send_message.call_args.args[1]
+    )
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "query", "Unable to update meal"
+    )
+
+
+def test_callback_delivery_failure_keeps_committed_update_successful(
+    handler: BotHandler,
+) -> None:
+    plan = make_plan(status=PlanStatus.CONFIRMED)
+    handler.repo.get_active_plan_snapshot.return_value = ActivePlanSnapshot(
+        plan=plan, active_epoch=2
+    )
+    handler.repo.update_meal_outcome.return_value = True
+    handler.telegram_api.send_message.side_effect = TelegramAPIError(
+        "delivery failed"
+    )
+    route = RouteResult(
+        route_type=RouteType.CALLBACK,
+        chat_id=1,
+        user_id="user",
+        callback_query_id="query",
+        callback_data=f"checkin:{plan.week_start_date}:1:lunch:cooked",
+    )
+
+    handler.handle_callback(route)
+
+    handler.repo.update_meal_outcome.assert_called_once()
+    assert handler.telegram_api.send_message.call_count == 1
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "query", "Meal updated"
     )
 
 
@@ -508,6 +605,7 @@ def test_callback_rejects_old_missing_and_persistence_failure(
         callback_query_id="query",
         callback_data="checkin:1:lunch:cooked",
     )
+    handler.repo.get_active_plan_snapshot.return_value = None
     handler.handle_callback(old_route)
     handler.telegram_api.answer_callback_query.assert_called_once()
     handler.telegram_api.answer_callback_query.reset_mock()
@@ -515,7 +613,9 @@ def test_callback_rejects_old_missing_and_persistence_failure(
         week_start=date.today() - timedelta(days=8),
         status=PlanStatus.CONFIRMED,
     )
-    handler.repo.get_plan.return_value = expired
+    handler.repo.get_active_plan_snapshot.return_value = ActivePlanSnapshot(
+        plan=expired, active_epoch=None
+    )
     old_route.callback_data = (
         f"checkin:{expired.week_start_date}:1:lunch:cooked"
     )
@@ -543,6 +643,86 @@ def test_conversation_replaces_false_success_reply(handler: BotHandler) -> None:
     )
     sent = handler.telegram_api.send_message.call_args.args[1]
     assert sent != "Saved!"
+
+
+def test_repeated_conversation_update_passes_same_source_id(
+    handler: BotHandler,
+) -> None:
+    handler.repo.get_profile.return_value = None
+    handler.repo.get_profile_draft.return_value = None
+    handler.repo.get_latest_plan.return_value = None
+    handler.repo.get_meal_history.return_value = []
+    handler.llm_client.chat_sync.return_value = (
+        'Logged.\n```json\n{"intent":"log_meal","entities":'
+        '{"date":"2026-08-05","meal_type":"lunch",'
+        '"description":"Chicken salad"}}\n```'
+    )
+    route = RouteResult(
+        route_type=RouteType.CONVERSATIONAL,
+        chat_id=1,
+        user_id="user",
+        text="I had chicken salad",
+        raw_update={"update_id": 42},
+    )
+
+    handler.handle_conversational(route)
+    handler.handle_conversational(route)
+
+    assert handler.repo.log_meal.call_count == 2
+    assert [
+        call.kwargs["source_update_id"]
+        for call in handler.repo.log_meal.call_args_list
+    ] == ["42", "42"]
+
+
+@pytest.mark.parametrize("update_id", [True, False, "42", 42.0, None])
+def test_invalid_conversation_update_id_uses_timestamp_fallback(
+    handler: BotHandler,
+    update_id: Any,
+) -> None:
+    handler.repo.get_profile.return_value = None
+    handler.repo.get_profile_draft.return_value = None
+    handler.repo.get_latest_plan.return_value = None
+    handler.repo.get_meal_history.return_value = []
+    handler.llm_client.chat_sync.return_value = (
+        'Logged.\n```json\n{"intent":"log_meal","entities":'
+        '{"meal_type":"lunch","description":"Soup"}}\n```'
+    )
+    route = RouteResult(
+        route_type=RouteType.CONVERSATIONAL,
+        chat_id=1,
+        user_id="user",
+        text="I had soup",
+        raw_update={"update_id": update_id},
+    )
+
+    handler.handle_conversational(route)
+
+    assert handler.repo.log_meal.call_args.kwargs["source_update_id"] is None
+
+
+def test_missing_conversation_update_id_uses_timestamp_fallback(
+    handler: BotHandler,
+) -> None:
+    handler.repo.get_profile.return_value = None
+    handler.repo.get_profile_draft.return_value = None
+    handler.repo.get_latest_plan.return_value = None
+    handler.repo.get_meal_history.return_value = []
+    handler.llm_client.chat_sync.return_value = (
+        'Logged.\n```json\n{"intent":"log_meal","entities":'
+        '{"meal_type":"lunch","description":"Soup"}}\n```'
+    )
+    route = RouteResult(
+        route_type=RouteType.CONVERSATIONAL,
+        chat_id=1,
+        user_id="user",
+        text="I had soup",
+        raw_update={},
+    )
+
+    handler.handle_conversational(route)
+
+    assert handler.repo.log_meal.call_args.kwargs["source_update_id"] is None
 
 
 def test_conversation_passes_persisted_profile_draft_to_llm(

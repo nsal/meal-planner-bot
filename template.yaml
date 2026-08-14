@@ -19,10 +19,24 @@ Parameters:
   LlmApiKeySecretName:
     Type: String
     Description: Secrets Manager secret name for the LiteLLM API key
-  LlmModel:
+  ConversationalLlmModel:
     Type: String
-    Default: gpt-4o-mini
-    Description: LiteLLM model identifier
+    Default: gpt-5.6-luna
+    Description: LiteLLM model identifier for conversational replies
+  ConversationalLlmReasoningEffort:
+    Type: String
+    Default: medium
+    AllowedValues: [none, minimal, low, medium, high, xhigh, max]
+    Description: Reasoning effort for conversational replies
+  PlannerLlmModel:
+    Type: String
+    Default: gpt-5.6-terra
+    Description: LiteLLM model identifier for plans and groceries
+  PlannerLlmReasoningEffort:
+    Type: String
+    Default: medium
+    AllowedValues: [none, minimal, low, medium, high, xhigh, max]
+    Description: Reasoning effort for plans and groceries
   SecretRefreshToken:
     Type: String
     Description: Change this non-secret token whenever a referenced secret rotates
@@ -43,7 +57,10 @@ Globals:
         LLM_API_KEY: !Sub
           - '{{resolve:secretsmanager:${SecretName}:SecretString}}'
           - SecretName: !Ref LlmApiKeySecretName
-        LLM_MODEL: !Ref LlmModel
+        CONVERSATIONAL_LLM_MODEL: !Ref ConversationalLlmModel
+        CONVERSATIONAL_LLM_REASONING_EFFORT: !Ref ConversationalLlmReasoningEffort
+        PLANNER_LLM_MODEL: !Ref PlannerLlmModel
+        PLANNER_LLM_REASONING_EFFORT: !Ref PlannerLlmReasoningEffort
         SECRET_REFRESH_TOKEN: !Ref SecretRefreshToken
 
 Resources:
@@ -90,6 +107,10 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref MealPlannerTable
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:TransactWriteItems
+              Resource: !GetAtt MealPlannerTable.Arn
         - LambdaInvokePolicy:
             FunctionName: !Ref PlannerFunction
       Events:
