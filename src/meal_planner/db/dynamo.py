@@ -277,6 +277,75 @@ class DynamoRepository:
                 return
             raise
 
+    def log_meal_and_transition(
+        self,
+        user_id: str,
+        entry: MealLogEntry,
+        state: ConversationState,
+        *,
+        expected_revision: int,
+        source_update_id: str | None = None,
+    ) -> bool:
+        """Atomically record a meal and advance its guided workflow state."""
+        meal_item = {
+            "PK": f"USER#{user_id}",
+            "SK": (
+                f"MEAL#{entry.date_key}#UPDATE#{source_update_id}#"
+                f"{entry.meal_type.value}"
+            )
+            if source_update_id is not None
+            else (
+                f"MEAL#{entry.date_key}#TIME#{entry.created_at.isoformat()}#"
+                f"{entry.meal_type.value}"
+            ),
+            **entry.model_dump(mode="json"),
+        }
+        state_item = {
+            **self._conversation_key(user_id),
+            **state.model_dump(mode="json"),
+        }
+        transact_items: list[dict[str, Any]] = [
+            {
+                "Put": {
+                    "TableName": self.table.name,
+                    "Item": meal_item,
+                }
+            },
+            {
+                "Put": {
+                    "TableName": self.table.name,
+                    "Item": state_item,
+                    "ConditionExpression": "#revision = :revision",
+                    "ExpressionAttributeNames": {"#revision": "revision"},
+                    "ExpressionAttributeValues": {
+                        ":revision": expected_revision
+                    },
+                }
+            },
+        ]
+        if source_update_id is not None:
+            transact_items.append(
+                {
+                    "Put": {
+                        "TableName": self.table.name,
+                        "Item": {
+                            "PK": f"USER#{user_id}",
+                            "SK": f"MEAL_UPDATE#{source_update_id}",
+                        },
+                        "ConditionExpression": "attribute_not_exists(PK)",
+                    }
+                }
+            )
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=transact_items
+            )
+        except ClientError as exc:
+            if self._is_transaction_conditional_failure(exc):
+                return False
+            raise
+        return True
+
     def get_meal_history(
         self,
         user_id: str,

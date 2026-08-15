@@ -14,6 +14,7 @@ from meal_planner.models.schemas import (
     ConversationWorkflowKind,
     ConversationWorkflowStep,
     GroceryStatus,
+    MealLogDraft,
     MealOutcome,
     PlanStatus,
     ProfileUpdateEntities,
@@ -120,6 +121,137 @@ def test_submit_meals_starts_guided_logging_without_active_plan(
     assert saved.workflow_kind is ConversationWorkflowKind.MEAL_LOG
     assert saved.step is ConversationWorkflowStep.AWAITING_DATE
     assert "What date" in handler.telegram_api.send_message.call_args.args[1]
+
+
+def test_guided_meal_workflow_revalidates_draft_across_separate_updates(
+    handler: BotHandler,
+) -> None:
+    """Date, type, and description replies produce one valid meal write."""
+    state = handler._new_meal_state()
+    today = date.today().isoformat()
+
+    assert (
+        "breakfast"
+        in handler._handle_meal_workflow(
+            1,
+            "user",
+            today,
+            state,
+            {"date": today},
+            source_update_id="1",
+        ).lower()
+    )
+    state = handler.repo.transition_conversation_state.call_args.args[1]
+
+    assert (
+        "describe"
+        in handler._handle_meal_workflow(
+            1,
+            "user",
+            "lunch",
+            state,
+            {"meal_type": "lunch"},
+            source_update_id="2",
+        ).lower()
+    )
+    state = handler.repo.transition_conversation_state.call_args.args[1]
+    handler.repo.log_meal_and_transition.return_value = True
+
+    reply = handler._handle_meal_workflow(
+        1,
+        "user",
+        "Soup",
+        state,
+        {"description": "Soup"},
+        source_update_id="3",
+    )
+
+    assert reply.startswith("Meal logged.")
+    handler.repo.log_meal_and_transition.assert_called_once()
+    entry = handler.repo.log_meal_and_transition.call_args.args[1]
+    assert entry.date == date.today()
+    assert entry.meal_type.value == "lunch"
+    assert entry.description == "Soup"
+    handler.repo.log_meal.assert_not_called()
+
+
+def test_guided_meal_workflow_invalid_type_preserves_saved_draft(
+    handler: BotHandler,
+) -> None:
+    """An invalid replacement field does not corrupt earlier draft fields."""
+    draft = MealLogDraft(date=date.today())
+    state = handler._new_meal_state().model_copy(
+        update={
+            "step": ConversationWorkflowStep.AWAITING_MEAL_TYPE,
+            "meal_draft": draft,
+        }
+    )
+
+    reply = handler._handle_meal_workflow(
+        1,
+        "user",
+        "brunch",
+        state,
+        {"meal_type": "brunch"},
+        source_update_id="1",
+    )
+
+    assert "didn't recognize" in reply
+    assert state.meal_draft == draft
+    handler.repo.transition_conversation_state.assert_not_called()
+
+
+@pytest.mark.parametrize("revision", [0, 4])
+def test_replacing_conversation_state_increments_revision(
+    handler: BotHandler, revision: int
+) -> None:
+    previous = handler._new_meal_state().model_copy(
+        update={"revision": revision}
+    )
+    replacement = handler._new_plan_state()
+    handler.repo.save_conversation_state.return_value = True
+
+    assert handler._replace_conversation_state("user", replacement, previous)
+
+    saved = handler.repo.save_conversation_state.call_args.args[1]
+    assert saved.revision == revision + 1
+    assert (
+        handler.repo.save_conversation_state.call_args.kwargs[
+            "expected_revision"
+        ]
+        == revision
+    )
+
+
+def test_competing_completed_drafts_have_one_revision_winner(
+    handler: BotHandler,
+) -> None:
+    """Only the atomic state winner can persist a completed draft."""
+    state = handler._new_meal_state().model_copy(
+        update={
+            "step": ConversationWorkflowStep.AWAITING_DESCRIPTION,
+            "meal_draft": MealLogDraft(date=date.today(), meal_type="lunch"),
+        }
+    )
+    handler.repo.log_meal_and_transition.side_effect = [True, False]
+    entities = {"description": "Soup"}
+
+    first = handler._handle_meal_workflow(
+        1, "user", "Soup", state, entities, source_update_id="1"
+    )
+    second = handler._handle_meal_workflow(
+        1,
+        "user",
+        "Salad",
+        state,
+        {"description": "Salad"},
+        source_update_id="2",
+    )
+
+    assert first.startswith("Meal logged.")
+    assert "workflow changed" in second
+    assert handler.repo.log_meal_and_transition.call_count == 2
+    handler.repo.log_meal.assert_not_called()
 
 
 def test_plan_preference_is_invoked_once_with_request_context(

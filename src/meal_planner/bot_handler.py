@@ -341,6 +341,8 @@ class BotHandler:
         previous: ConversationState | None,
     ) -> bool:
         expected_revision = previous.revision if previous else None
+        if previous is not None:
+            state = state.model_copy(update={"revision": previous.revision + 1})
         return self.repo.save_conversation_state(
             user_id, state, expected_revision=expected_revision
         )
@@ -545,7 +547,7 @@ class BotHandler:
             return "Would you like to log another meal? Reply yes or no."
 
         draft = state.meal_draft or MealLogDraft()
-        values = draft.model_dump()
+        values = draft.model_dump(mode="json")
         for field in ("date", "meal_type", "description"):
             if field not in entities or entities[field] in (None, ""):
                 continue
@@ -622,13 +624,6 @@ class BotHandler:
             description=new_draft.description,
             created_at=now,
         )
-        try:
-            self.repo.log_meal(
-                user_id, entry, source_update_id=source_update_id
-            )
-        except Exception:
-            logger.exception("Meal persistence failed for user %s", user_id)
-            return "I couldn't save that meal. Please try again."
         next_state = state.model_copy(
             update={
                 "step": ConversationWorkflowStep.AWAITING_ANOTHER_MEAL,
@@ -638,10 +633,19 @@ class BotHandler:
                 "last_update_id": source_update_id,
             }
         )
-        if not self.repo.transition_conversation_state(
-            user_id, next_state, expected_revision=state.revision
-        ):
-            return "Your meal was saved. Would you like to log another meal?"
+        try:
+            persisted = self.repo.log_meal_and_transition(
+                user_id,
+                entry,
+                next_state,
+                expected_revision=state.revision,
+                source_update_id=source_update_id,
+            )
+        except Exception:
+            logger.exception("Meal persistence failed for user %s", user_id)
+            return "I couldn't save that meal. Please try again."
+        if not persisted:
+            return "That meal workflow changed. Please use /submit_meals."
         return (
             "Meal logged. Would you like to log another meal? Reply yes or no."
         )

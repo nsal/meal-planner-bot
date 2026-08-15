@@ -46,10 +46,14 @@ class PlannerHandler:
         repo: DynamoRepository,
         telegram_api: TelegramAPI,
         llm_client: Optional[LLMClient] = None,
+        max_attempts: int = 2,
     ) -> None:
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
         self.repo = repo
         self.telegram_api = telegram_api
         self.llm_client = llm_client
+        self.max_attempts = max_attempts
 
     def generate_plan(
         self,
@@ -75,6 +79,12 @@ class PlannerHandler:
                 user_id, target_week, consistent_read=True
             )
             if current_plan and current_plan.status is PlanStatus.CONFIRMED:
+                if request_id and state_revision is not None:
+                    self.repo.clear_conversation_state_if_matches(
+                        user_id,
+                        request_id=request_id,
+                        expected_revision=state_revision,
+                    )
                 self.telegram_api.send_message(
                     chat_id,
                     "That week's plan is already confirmed, so I kept it "
@@ -168,9 +178,10 @@ class PlannerHandler:
         target_week: date,
         chat_id: int | str,
     ) -> Any:
-        """Use at most two provider calls, repairing one invalid response."""
+        """Use the configured number of provider calls for plan generation."""
         repair_feedback: str | None = None
-        for attempt in range(2):
+        for attempt in range(self.max_attempts):
+            is_last_attempt = attempt == self.max_attempts - 1
             user_message = "Generate weekly meal plan"
             if repair_feedback:
                 user_message += (
@@ -180,7 +191,7 @@ class PlannerHandler:
             try:
                 raw = self._strict_json_call(client, prompt, user_message)
             except LLMTimeoutError:
-                if attempt == 1:
+                if is_last_attempt:
                     self._notify_failure(
                         chat_id,
                         "Plan generation timed out. Your preference was saved; "
@@ -189,7 +200,7 @@ class PlannerHandler:
                     return None
                 continue
             except LLMTransientError:
-                if attempt == 1:
+                if is_last_attempt:
                     self._notify_failure(
                         chat_id,
                         "The meal-planning service is temporarily unavailable. "
@@ -205,10 +216,10 @@ class PlannerHandler:
                 )
                 return None
             except LLMResponseFormatError, LLMFailure:
-                if attempt == 1:
+                if is_last_attempt:
                     self._notify_failure(
                         chat_id,
-                        "The AI returned an invalid meal plan twice. Your "
+                        self._invalid_plan_message() + " Your "
                         "preference was saved; use /plan to retry.",
                     )
                     return None
@@ -217,10 +228,10 @@ class PlannerHandler:
             plan, feedback = parse_plan_response_with_feedback(raw)
             if plan and plan.week_start == target_week:
                 return plan
-            if attempt == 1:
+            if is_last_attempt:
                 self._notify_failure(
                     chat_id,
-                    "The AI returned an invalid meal plan twice. Your "
+                    self._invalid_plan_message() + " Your "
                     "preference was saved; use /plan to retry.",
                 )
                 return None
@@ -228,6 +239,16 @@ class PlannerHandler:
                 feedback or "week_start_date must match the request"
             )
         return None
+
+    def _invalid_plan_message(self) -> str:
+        """Return the terminal message for invalid planner output."""
+        if self.max_attempts == 1:
+            return "The AI returned an invalid meal plan."
+        if self.max_attempts == 2:
+            return "The AI returned an invalid meal plan twice."
+        return (
+            f"The AI returned an invalid meal plan {self.max_attempts} times."
+        )
 
     @staticmethod
     def _strict_json_call(
@@ -434,7 +455,12 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         initial_backoff=settings.planner_llm_initial_backoff_seconds,
         request_timeout=settings.planner_llm_request_timeout_seconds,
     )
-    planner = PlannerHandler(repo, telegram_api, llm_client)
+    planner = PlannerHandler(
+        repo,
+        telegram_api,
+        llm_client,
+        max_attempts=settings.planner_llm_max_retries,
+    )
     if not planner.handle_event(event):
         logger.error("Invalid planner event")
         return {"statusCode": 400, "body": "invalid event"}

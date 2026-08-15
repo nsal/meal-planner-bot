@@ -91,6 +91,40 @@ def test_conversation_state_round_trip_and_revision_guard(
     assert repo.get_conversation_state("user") is None
 
 
+def test_replacements_from_one_snapshot_have_one_winner(
+    repo: DynamoRepository,
+) -> None:
+    """A delayed transition cannot overwrite the winning replacement."""
+    now = datetime.now(timezone.utc)
+    initial = ConversationState(
+        workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+        step=ConversationWorkflowStep.AWAITING_DATE,
+        meal_draft=MealLogDraft(),
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    assert repo.save_conversation_state("user", initial)
+    first = initial.model_copy(
+        update={
+            "revision": initial.revision + 1,
+            "updated_at": now + timedelta(seconds=1),
+        }
+    )
+    second = first.model_copy(update={"updated_at": now + timedelta(seconds=2)})
+
+    assert repo.save_conversation_state(
+        "user", first, expected_revision=initial.revision
+    )
+    assert not repo.save_conversation_state(
+        "user", second, expected_revision=initial.revision
+    )
+    assert not repo.transition_conversation_state(
+        "user", initial, expected_revision=initial.revision
+    )
+    assert repo.get_conversation_state("user") == first
+
+
 def _meal(day: int, hour: int, description: str) -> MealLogEntry:
     return MealLogEntry(
         date=date(2026, 8, day),
@@ -98,6 +132,127 @@ def _meal(day: int, hour: int, description: str) -> MealLogEntry:
         description=description,
         created_at=datetime(2026, 8, day, hour, tzinfo=timezone.utc),
     )
+
+
+def _completed_meal_state(
+    *, revision: int = 0, now: datetime | None = None
+) -> ConversationState:
+    current = now or datetime.now(timezone.utc)
+    return ConversationState(
+        workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+        step=ConversationWorkflowStep.AWAITING_ANOTHER_MEAL,
+        meal_draft=MealLogDraft(
+            date=date(2026, 8, 8),
+            meal_type="lunch",
+            description="Soup",
+        ),
+        revision=revision,
+        created_at=current,
+        updated_at=current,
+        expires_at=current + timedelta(hours=24),
+    )
+
+
+def test_atomic_meal_and_state_transition_writes_one_meal_and_marker(
+    repo: DynamoRepository,
+) -> None:
+    state = _completed_meal_state()
+    assert repo.save_conversation_state("user", state)
+    entry = _meal(8, 12, "Soup")
+    next_state = state.model_copy(
+        update={
+            "revision": 1,
+            "updated_at": state.updated_at + timedelta(seconds=1),
+        }
+    )
+
+    assert repo.log_meal_and_transition(
+        "user",
+        entry,
+        next_state,
+        expected_revision=state.revision,
+        source_update_id="100",
+    )
+
+    assert repo.get_conversation_state("user") == next_state
+    assert repo.get_meal_history("user", days=1, on_date=date(2026, 8, 8)) == [
+        entry
+    ]
+    marker = repo.table.get_item(
+        Key={"PK": "USER#user", "SK": "MEAL_UPDATE#100"}
+    )
+    assert marker["Item"]["SK"] == "MEAL_UPDATE#100"
+
+
+def test_atomic_meal_and_state_transition_rejects_stale_revision(
+    repo: DynamoRepository,
+) -> None:
+    state = _completed_meal_state()
+    assert repo.save_conversation_state("user", state)
+    competing = state.model_copy(
+        update={
+            "revision": 1,
+            "updated_at": state.updated_at + timedelta(seconds=1),
+        }
+    )
+    assert repo.transition_conversation_state(
+        "user", competing, expected_revision=state.revision
+    )
+    next_state = state.model_copy(
+        update={
+            "revision": 1,
+            "updated_at": state.updated_at + timedelta(seconds=2),
+        }
+    )
+
+    assert not repo.log_meal_and_transition(
+        "user",
+        _meal(8, 12, "Stale meal"),
+        next_state,
+        expected_revision=state.revision,
+        source_update_id="101",
+    )
+    assert repo.get_conversation_state("user") == competing
+    assert repo.get_meal_history("user", days=1, on_date=date(2026, 8, 8)) == []
+    assert (
+        repo.table.get_item(
+            Key={"PK": "USER#user", "SK": "MEAL_UPDATE#101"}
+        ).get("Item")
+        is None
+    )
+
+
+def test_atomic_meal_and_state_transition_propagates_transaction_error(
+    repo: DynamoRepository, mocker: Any
+) -> None:
+    state = _completed_meal_state()
+    assert repo.save_conversation_state("user", state)
+    error = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException"}},
+        "TransactWriteItems",
+    )
+    mocker.patch.object(
+        repo.table.meta.client, "transact_write_items", side_effect=error
+    )
+    next_state = state.model_copy(
+        update={
+            "revision": 1,
+            "updated_at": state.updated_at + timedelta(seconds=1),
+        }
+    )
+
+    with pytest.raises(ClientError) as raised:
+        repo.log_meal_and_transition(
+            "user",
+            _meal(8, 12, "Failed meal"),
+            next_state,
+            expected_revision=state.revision,
+            source_update_id="102",
+        )
+
+    assert raised.value is error
+    assert repo.get_conversation_state("user") == state
+    assert repo.get_meal_history("user", days=1, on_date=date(2026, 8, 8)) == []
 
 
 def test_meal_history_includes_multiple_meals_and_date_boundaries(
