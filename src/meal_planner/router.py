@@ -24,6 +24,7 @@ class RouteResult(BaseModel):
 
     route_type: RouteType
     chat_id: int | str | None = None
+    chat_type: str | None = None
     user_id: str | None = None
     command: str | None = None
     args: str | None = None
@@ -83,14 +84,26 @@ def route_update(update: dict[str, Any]) -> RouteResult:
         from_user = msg.get("from", {})
         chat = msg.get("chat", {})
 
-        user_id = str(from_user.get("id")) if "id" in from_user else None
-        chat_id = chat.get("id") if "id" in chat else user_id
+        user_id = (
+            str(from_user.get("id"))
+            if isinstance(from_user, dict) and "id" in from_user
+            else None
+        )
+        chat_id = (
+            chat.get("id") if isinstance(chat, dict) and "id" in chat else None
+        )
+        chat_type = (
+            chat.get("type")
+            if isinstance(chat, dict) and isinstance(chat.get("type"), str)
+            else None
+        )
 
         text = msg.get("text")
         if not text or not isinstance(text, str):
             return RouteResult(
                 route_type=RouteType.UNKNOWN,
                 chat_id=chat_id,
+                chat_type=chat_type,
                 user_id=user_id,
                 raw_update=update,
             )
@@ -104,6 +117,7 @@ def route_update(update: dict[str, Any]) -> RouteResult:
             return RouteResult(
                 route_type=RouteType.COMMAND,
                 chat_id=chat_id,
+                chat_type=chat_type,
                 user_id=user_id,
                 command=cmd_part,
                 args=args_part,
@@ -114,6 +128,7 @@ def route_update(update: dict[str, Any]) -> RouteResult:
         return RouteResult(
             route_type=RouteType.CONVERSATIONAL,
             chat_id=chat_id,
+            chat_type=chat_type,
             user_id=user_id,
             text=text,
             raw_update=update,
@@ -127,8 +142,19 @@ def route_update(update: dict[str, Any]) -> RouteResult:
         msg = cb.get("message", {})
         chat = msg.get("chat", {}) if isinstance(msg, dict) else {}
 
-        user_id = str(from_user.get("id")) if "id" in from_user else None
-        chat_id = chat.get("id") if "id" in chat else user_id
+        user_id = (
+            str(from_user.get("id"))
+            if isinstance(from_user, dict) and "id" in from_user
+            else None
+        )
+        chat_id = (
+            chat.get("id") if isinstance(chat, dict) and "id" in chat else None
+        )
+        chat_type = (
+            chat.get("type")
+            if isinstance(chat, dict) and isinstance(chat.get("type"), str)
+            else None
+        )
 
         cb_data = cb.get("data")
         cb_id = cb.get("id")
@@ -136,6 +162,7 @@ def route_update(update: dict[str, Any]) -> RouteResult:
         return RouteResult(
             route_type=RouteType.CALLBACK,
             chat_id=chat_id,
+            chat_type=chat_type,
             user_id=user_id,
             callback_data=str(cb_data) if cb_data is not None else None,
             callback_query_id=str(cb_id) if cb_id is not None else None,

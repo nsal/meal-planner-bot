@@ -4,7 +4,14 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Annotated, Any
 
-from pydantic import BaseModel, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StringConstraints,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 ShortText = Annotated[
     str,
@@ -14,6 +21,18 @@ MealDescription = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
 ]
+
+_GENERIC_NO_VALUE_PHRASES = frozenset(
+    {"none", "no", "nothing", "n/a", "not applicable"}
+)
+_FIELD_NO_VALUE_PHRASES = {
+    "allergies": frozenset({"no allergies"}),
+    "dietary_preferences": frozenset(
+        {"no dietary preferences", "no preferences"}
+    ),
+    "restrictions": frozenset({"no restrictions"}),
+    "goals": frozenset({"no goals"}),
+}
 
 
 class ConversationIntent(str, Enum):
@@ -112,6 +131,27 @@ class ProfileUpdateEntities(BaseModel):
     dietary_preferences: list[ShortText] | None = None
     restrictions: list[ShortText] | None = None
     goals: list[ShortText] | None = None
+
+    @field_validator(
+        "allergies",
+        "dietary_preferences",
+        "restrictions",
+        "goals",
+        mode="before",
+    )
+    @classmethod
+    def normalize_no_value_phrase(cls, value: Any, info: ValidationInfo) -> Any:
+        """Convert explicit no-value answers to empty lists."""
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().casefold().rstrip(".!?,;:")
+        field_name = info.field_name
+        if field_name is None:
+            return value
+        no_value_phrases = (
+            _GENERIC_NO_VALUE_PHRASES | (_FIELD_NO_VALUE_PHRASES[field_name])
+        )
+        return [] if normalized in no_value_phrases else value
 
 
 class Ingredient(BaseModel):

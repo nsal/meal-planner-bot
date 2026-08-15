@@ -32,7 +32,7 @@ def build_conversational_prompt(
         restrictions_str = ", ".join(profile.restrictions) or "None"
         goals_str = ", ".join(profile.goals) or "None"
         profile_text = (
-            f"User: {profile.name}\n"
+            f"Family Name: {profile.name}\n"
             f"People Count: {profile.people_count}\n"
             f"Family Members: {members_str}\n"
             f"Allergies: {allergies_str}\n"
@@ -55,7 +55,11 @@ def build_conversational_prompt(
         )
         for field in pending_fields:
             value = getattr(profile_draft, field)
-            label = field.replace("_", " ").title()
+            label = (
+                "Family Name"
+                if field == "name"
+                else field.replace("_", " ").title()
+            )
             if value is None:
                 rendered = "Missing"
             elif field == "family_members":
@@ -107,9 +111,14 @@ def build_conversational_prompt(
         "   - 'intent': One of ['log_meal', 'edit_plan', 'update_profile', "
         "'confirm_plan', 'suggestion', 'chitchat']\n"
         "   - 'entities': Key-value details relevant to intent. Profile "
-        "updates may include name, people_count, family_members with name and "
-        "calorie_target, allergies, dietary_preferences, restrictions, and "
-        "goals. Meal dates must use YYYY-MM-DD.\n"
+        "updates may include 'name', 'people_count', and 'family_members'. "
+        "The top-level 'name' field means the household's family "
+        "name, and must be collected separately from each individual "
+        "member's name. Use family_members with each member's name and "
+        "calorie_target, plus allergies, dietary_preferences, restrictions, "
+        "and goals. Never use an individual member's name as the family "
+        "name unless the user explicitly provides it. Meal dates must use "
+        "YYYY-MM-DD.\n"
     )
 
 
@@ -134,7 +143,7 @@ def build_plan_prompt(
         restrictions_str = ", ".join(profile.restrictions) or "None"
         goals_str = ", ".join(profile.goals) or "None"
         profile_text = (
-            f"Primary User: {profile.name}\n"
+            f"Family Name: {profile.name}\n"
             f"Total People Count: {profile.people_count}\n"
             f"Family Members & Calorie Targets: {members_str}\n"
             f"Allergies: {allergies_str}\n"

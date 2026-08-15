@@ -15,6 +15,7 @@ from meal_planner.models.schemas import (
     PlanDay,
     PlannedMeal,
     PlanStatus,
+    ProfileUpdateEntities,
     UserProfile,
     WeeklyPlan,
 )
@@ -69,6 +70,88 @@ def test_user_profile_invalid_people_count() -> None:
     """Test UserProfile with invalid people_count (< 1)."""
     with pytest.raises(ValidationError):
         UserProfile(name="John", people_count=0)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "allergies",
+        "dietary_preferences",
+        "restrictions",
+        "goals",
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    ["none", " NO ", "nothing.", "N/A!", "not applicable?"],
+)
+def test_profile_update_normalizes_generic_no_value_phrases(
+    field: str, value: str
+) -> None:
+    """Normalize exact generic no-value answers to empty lists."""
+    update = ProfileUpdateEntities.model_validate({field: value})
+
+    assert getattr(update, field) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("allergies", "no allergies"),
+        ("dietary_preferences", "no dietary preferences."),
+        ("dietary_preferences", "NO PREFERENCES"),
+        ("restrictions", " No restrictions! "),
+        ("goals", "not applicable"),
+        ("goals", "no goals"),
+    ],
+)
+def test_profile_update_normalizes_field_specific_no_value_phrases(
+    field: str, value: str
+) -> None:
+    """Normalize field-specific exact no-value answers."""
+    update = ProfileUpdateEntities.model_validate({field: value})
+
+    assert getattr(update, field) == []
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "allergies",
+        "dietary_preferences",
+        "restrictions",
+        "goals",
+    ],
+)
+@pytest.mark.parametrize("value", [None, [], ["peanuts"]])
+def test_profile_update_preserves_none_and_lists(
+    field: str, value: object
+) -> None:
+    """Keep missing values and list values on their existing code paths."""
+    update = ProfileUpdateEntities.model_validate({field: value})
+
+    assert getattr(update, field) == value
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "allergies",
+        "dietary_preferences",
+        "restrictions",
+        "goals",
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    ["no peanuts", "vegetarian", "", "no allergies for now"],
+)
+def test_profile_update_rejects_ambiguous_scalar_values(
+    field: str, value: str
+) -> None:
+    """Reject scalar values that could contain meaningful profile data."""
+    with pytest.raises(ValidationError):
+        ProfileUpdateEntities.model_validate({field: value})
 
 
 def test_ingredient_and_planned_meal() -> None:

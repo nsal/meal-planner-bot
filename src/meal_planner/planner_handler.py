@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 import boto3  # type: ignore[import-untyped]
 
-from meal_planner.config import get_settings
+from meal_planner.config import get_planner_settings
 from meal_planner.db.dynamo import DynamoRepository
 from meal_planner.llm.client import LLMClient
 from meal_planner.llm.parser import parse_grocery_response, parse_plan_response
@@ -243,7 +243,7 @@ class PlannerHandler:
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Lambda entry point for asynchronous planner events."""
-    settings = get_settings()
+    settings = get_planner_settings()
     dynamodb = boto3.resource("dynamodb", region_name=settings.aws_region)
     repo = DynamoRepository(dynamodb.Table(settings.dynamodb_table_name))
     telegram_api = TelegramAPI(

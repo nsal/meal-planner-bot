@@ -19,6 +19,12 @@ Parameters:
   LlmApiKeySecretName:
     Type: String
     Description: Secrets Manager secret name for the LiteLLM API key
+  TelegramAllowedUserIds:
+    Type: String
+    AllowedPattern: '^[1-9][0-9]*(,[1-9][0-9]*)*$'
+    Description: >
+      Comma-separated positive numeric Telegram user IDs allowed to use the
+      Bot Lambda
   ConversationalLlmModel:
     Type: String
     Default: gpt-5.6-luna
@@ -97,6 +103,7 @@ Resources:
           TELEGRAM_WEBHOOK_SECRET: !Sub
             - '{{resolve:secretsmanager:${SecretName}:SecretString}}'
             - SecretName: !Ref TelegramWebhookSecretName
+          TELEGRAM_ALLOWED_USER_IDS: !Ref TelegramAllowedUserIds
           BOT_FUNCTION_TIMEOUT_SECONDS: '30'
           BOT_TELEGRAM_REQUEST_TIMEOUT_SECONDS: '5'
           BOT_LLM_REQUEST_TIMEOUT_SECONDS: '6'

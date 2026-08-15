@@ -12,7 +12,11 @@ from typing import Any, Optional
 import boto3  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
-from meal_planner.config import get_settings, get_webhook_secret
+from meal_planner.config import (
+    BotConfigurationError,
+    get_settings,
+    get_webhook_secret,
+)
 from meal_planner.db.dynamo import DynamoRepository
 from meal_planner.llm.client import LLMClient
 from meal_planner.llm.parser import parse_conversational_response
@@ -37,6 +41,7 @@ from meal_planner.router import (
     parse_checkin_callback,
     route_update,
 )
+from meal_planner.telegram.access import TelegramAccessPolicy
 from meal_planner.telegram.api import TelegramAPI, TelegramAPIError
 
 logger = logging.getLogger(__name__)
@@ -83,15 +88,28 @@ class BotHandler:
         lambda_client: Any = None,
         planner_function_name: str = "",
         llm_client: Optional[LLMClient] = None,
+        access_policy: TelegramAccessPolicy | None = None,
     ) -> None:
         self.repo = repo
         self.telegram_api = telegram_api
         self.lambda_client = lambda_client
         self.planner_function_name = planner_function_name
         self.llm_client = llm_client
+        self.access_policy = access_policy or TelegramAccessPolicy(frozenset())
 
     def handle_update(self, update: dict[str, Any]) -> dict[str, Any]:
         route = route_update(update)
+        if route.route_type is RouteType.UNKNOWN:
+            return {"statusCode": 200, "body": "ok"}
+        decision = self.access_policy.evaluate(route)
+        if not decision.allowed:
+            logger.info(
+                "Telegram update denied: user_id=%s chat_type=%s reason=%s",
+                route.user_id,
+                route.chat_type,
+                decision.reason.value,
+            )
+            return {"statusCode": 200, "body": "ok"}
         try:
             if route.route_type is RouteType.COMMAND:
                 self.handle_command(route)
@@ -127,14 +145,15 @@ class BotHandler:
         profile = self.repo.get_profile(user_id)
         if profile and profile.is_complete:
             message = (
-                f"Welcome back, {profile.name}! Use /plan to generate a plan "
+                f"Welcome back, {profile.name} family! Use /plan to "
+                "generate a plan "
                 "or /profile to review your details."
             )
         else:
             message = (
-                "Welcome to Meal Planner Bot! Tell me your name, household "
-                "size, each person's name and calorie target, allergies, "
-                "preferences, restrictions, and goals."
+                "Welcome to Meal Planner Bot! Tell me your family name, "
+                "household size, each household member's name and calorie "
+                "target, allergies, preferences, restrictions, and goals."
             )
         self.telegram_api.send_message(chat_id, message)
 
@@ -146,7 +165,7 @@ class BotHandler:
             )
             return
         lines = [
-            f"Profile: {profile.name}",
+            f"Family name: {profile.name}",
             f"People count: {profile.people_count}",
             "Family members:",
             *(
@@ -430,9 +449,23 @@ class BotHandler:
         )
         missing = [field for field in required if getattr(draft, field) is None]
         if missing:
+            missing_labels = {
+                "name": "family name",
+                "people_count": "household size",
+                "family_members": (
+                    "each household member's name and calorie target"
+                ),
+                "allergies": "allergies",
+                "dietary_preferences": "dietary preferences",
+                "restrictions": "restrictions",
+                "goals": "goals",
+            }
             self.repo.save_profile_draft(user_id, draft)
             return MutationResult(
-                True, "I still need: " + ", ".join(missing) + "."
+                True,
+                "I still need: "
+                + ", ".join(missing_labels[field] for field in missing)
+                + ".",
             )
         if (
             draft.family_members is None
@@ -441,7 +474,8 @@ class BotHandler:
             self.repo.save_profile_draft(user_id, draft)
             return MutationResult(
                 True,
-                "Please provide one name and calorie target for each person.",
+                "Please provide one household member name and calorie "
+                "target for each person.",
             )
         profile = UserProfile.model_validate(draft.model_dump())
         self.repo.save_profile(user_id, profile)
@@ -652,7 +686,13 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         update = json.loads(body) if body else {}
     except json.JSONDecodeError:
         return {"statusCode": 200, "body": "ok"}
-    settings = get_settings()
+    try:
+        settings = get_settings()
+    except BotConfigurationError:
+        logger.error(
+            "Ignored Telegram update because Bot configuration is invalid"
+        )
+        return {"statusCode": 200, "body": "ok"}
     dynamodb = boto3.resource("dynamodb", region_name=settings.aws_region)
     repo = DynamoRepository(dynamodb.Table(settings.dynamodb_table_name))
     telegram_api = TelegramAPI(
@@ -675,5 +715,6 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             "PLANNER_FUNCTION_NAME", "meal-planner-planner"
         ),
         llm_client=llm_client,
+        access_policy=TelegramAccessPolicy(settings.telegram_allowed_user_ids),
     )
     return handler.handle_update(update)
