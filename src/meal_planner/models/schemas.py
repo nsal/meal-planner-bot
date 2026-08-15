@@ -1,6 +1,6 @@
 """Pydantic models for meal-planner persistence and LLM contracts."""
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Annotated, Any
 
@@ -20,6 +20,15 @@ ShortText = Annotated[
 MealDescription = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
+]
+DateValue = date
+PlanPreference = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
+]
+RequestId = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
 ]
 
 _GENERIC_NO_VALUE_PHRASES = frozenset(
@@ -78,6 +87,141 @@ class MealType(str, Enum):
     LUNCH = "lunch"
     DINNER = "dinner"
     SNACK = "snack"
+
+
+class ConversationWorkflowKind(str, Enum):
+    """Kinds of durable, multi-turn conversation workflows."""
+
+    MEAL_LOG = "meal_log"
+    PLAN_REQUEST = "plan_request"
+
+
+class ConversationWorkflowStep(str, Enum):
+    """Steps supported by durable conversation workflows."""
+
+    AWAITING_DATE = "awaiting_date"
+    AWAITING_MEAL_TYPE = "awaiting_meal_type"
+    AWAITING_DESCRIPTION = "awaiting_description"
+    AWAITING_ANOTHER_MEAL = "awaiting_another_meal"
+    AWAITING_PREFERENCE = "awaiting_preference"
+    GENERATING = "generating"
+    RETRY_READY = "retry_ready"
+
+
+class MealLogDraft(BaseModel):
+    """Partially collected fields for one actual meal."""
+
+    date: DateValue | None = None
+    meal_type: MealType | None = None
+    description: MealDescription | None = None
+
+
+class ConversationState(BaseModel):
+    """Persisted state for one user's unfinished workflow."""
+
+    workflow_kind: ConversationWorkflowKind
+    step: ConversationWorkflowStep
+    meal_draft: MealLogDraft | None = None
+    preference: PlanPreference | None = None
+    request_id: str | None = None
+    revision: int = Field(default=0, ge=0)
+    created_at: datetime
+    updated_at: datetime
+    expires_at: int = Field(ge=1)
+    last_update_id: str | None = None
+
+    @field_validator("created_at", "updated_at")
+    @classmethod
+    def require_aware_timestamp(cls, value: datetime) -> datetime:
+        """Require timezone-aware timestamps for persisted state."""
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("conversation timestamps must be timezone-aware")
+        return value.astimezone(timezone.utc)
+
+    @field_validator("expires_at", mode="before")
+    @classmethod
+    def normalize_expiry(cls, value: Any) -> Any:
+        """Accept a datetime while persisting expiry as DynamoDB TTL."""
+        if isinstance(value, datetime):
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError("conversation expiry must be timezone-aware")
+            return int(value.timestamp())
+        return value
+
+    @model_validator(mode="after")
+    def validate_workflow_shape(self) -> "ConversationState":
+        """Reject steps and fields that belong to another workflow."""
+        meal_steps = {
+            ConversationWorkflowStep.AWAITING_DATE,
+            ConversationWorkflowStep.AWAITING_MEAL_TYPE,
+            ConversationWorkflowStep.AWAITING_DESCRIPTION,
+            ConversationWorkflowStep.AWAITING_ANOTHER_MEAL,
+        }
+        plan_steps = {
+            ConversationWorkflowStep.AWAITING_PREFERENCE,
+            ConversationWorkflowStep.GENERATING,
+            ConversationWorkflowStep.RETRY_READY,
+        }
+        if self.workflow_kind is ConversationWorkflowKind.MEAL_LOG:
+            if self.step not in meal_steps or self.meal_draft is None:
+                raise ValueError("meal workflows require a meal draft step")
+            if self.preference is not None or self.request_id is not None:
+                raise ValueError("meal workflows cannot contain plan fields")
+        else:
+            if self.step not in plan_steps or self.request_id is None:
+                raise ValueError("plan workflows require a request ID step")
+            if self.meal_draft is not None:
+                raise ValueError("plan workflows cannot contain meal fields")
+            if (
+                self.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+                and self.preference is not None
+            ):
+                raise ValueError(
+                    "awaiting-preference state cannot contain a preference"
+                )
+        if self.updated_at < self.created_at:
+            raise ValueError("conversation state timestamps are out of order")
+        if self.expires_at <= int(self.updated_at.timestamp()):
+            raise ValueError(
+                "conversation state must expire after it is updated"
+            )
+        if self.workflow_kind is ConversationWorkflowKind.MEAL_LOG:
+            assert self.meal_draft is not None
+            expected_step = (
+                ConversationWorkflowStep.AWAITING_DATE
+                if self.meal_draft.date is None
+                else ConversationWorkflowStep.AWAITING_MEAL_TYPE
+                if self.meal_draft.meal_type is None
+                else ConversationWorkflowStep.AWAITING_DESCRIPTION
+                if self.meal_draft.description is None
+                else ConversationWorkflowStep.AWAITING_ANOTHER_MEAL
+            )
+            if self.step is not expected_step:
+                raise ValueError("meal workflow step does not match its draft")
+        return self
+
+
+# Short aliases keep the public contract convenient for callers and tests.
+WorkflowKind = ConversationWorkflowKind
+WorkflowStep = ConversationWorkflowStep
+PartialMealLog = MealLogDraft
+
+
+class PlanGenerationContext(BaseModel):
+    """Validated request-specific context carried to the planner Lambda."""
+
+    preference: PlanPreference | None = None
+    request_id: RequestId | None = None
+    state_revision: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_request_pair(self) -> "PlanGenerationContext":
+        """Require all lifecycle fields together for stateful requests."""
+        if (self.request_id is None) != (self.state_revision is None):
+            raise ValueError(
+                "request_id and state_revision must be supplied together"
+            )
+        return self
 
 
 class LLMResponseMetadata(BaseModel):

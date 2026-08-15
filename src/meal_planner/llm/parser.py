@@ -104,6 +104,36 @@ def parse_plan_response(
         return None
 
 
+def parse_plan_response_with_feedback(
+    raw_text_or_dict: Union[str, dict[str, Any]],
+) -> tuple[Optional[WeeklyPlan], str | None]:
+    """Parse a plan and return bounded Pydantic feedback for one repair."""
+    data: Any = raw_text_or_dict
+    if isinstance(raw_text_or_dict, str):
+        if not raw_text_or_dict.strip():
+            return None, "response was empty"
+        _, json_dict = _extract_json_block(raw_text_or_dict)
+        if json_dict is not None:
+            data = json_dict
+        else:
+            try:
+                data = json.loads(raw_text_or_dict.strip())
+            except json.JSONDecodeError:
+                return None, "response was not valid JSON"
+    if not isinstance(data, dict):
+        return None, "response must be a JSON object"
+    try:
+        return WeeklyPlan.model_validate(data), None
+    except ValidationError as exc:
+        errors = exc.errors(include_url=False)
+        details = [
+            f"{error.get('loc', ())}: {error.get('msg', 'invalid value')}"
+            for error in errors[:6]
+        ]
+        feedback = "; ".join(details)
+        return None, feedback[:800]
+
+
 def parse_grocery_response(
     raw_text_or_dict: Union[str, dict[str, Any]],
 ) -> list[GrocerySection]:

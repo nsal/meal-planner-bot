@@ -6,8 +6,9 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
+from uuid import uuid4
 
 import boto3  # type: ignore[import-untyped]
 from pydantic import ValidationError
@@ -23,8 +24,12 @@ from meal_planner.llm.parser import parse_conversational_response
 from meal_planner.llm.prompts import build_conversational_prompt
 from meal_planner.models.schemas import (
     ConversationIntent,
+    ConversationState,
+    ConversationWorkflowKind,
+    ConversationWorkflowStep,
     GroceryStatus,
     Ingredient,
+    MealLogDraft,
     MealLogEntry,
     MealOutcome,
     MealType,
@@ -131,6 +136,8 @@ class BotHandler:
             "grocery": self._cmd_grocery,
             "today": self._cmd_today,
             "submit_meals": self._cmd_submit_meals,
+            "checkin": self._cmd_checkin,
+            "cancel": self._cmd_cancel,
         }
         handler = handlers.get(route.command or "")
         if handler:
@@ -147,13 +154,17 @@ class BotHandler:
             message = (
                 f"Welcome back, {profile.name} family! Use /plan to "
                 "generate a plan "
-                "or /profile to review your details."
+                "or /profile to review your details. Use /submit_meals to "
+                "log actual meals, /checkin for planned meal outcomes, and "
+                "/cancel to stop an unfinished workflow."
             )
         else:
             message = (
                 "Welcome to Meal Planner Bot! Tell me your family name, "
                 "household size, each household member's name and calorie "
-                "target, allergies, preferences, restrictions, and goals."
+                "target, allergies, preferences, restrictions, and goals. "
+                "After setup, use /plan, /submit_meals, /checkin, or "
+                "/cancel."
             )
         self.telegram_api.send_message(chat_id, message)
 
@@ -186,16 +197,29 @@ class BotHandler:
                 chat_id, "Complete your profile before generating a plan."
             )
             return
-        if self._invoke_planner(
-            user_id, chat_id, GENERATE_PLAN, week_start=date.today().isoformat()
+        state = self._get_conversation_state(user_id)
+        if (
+            state
+            and state.workflow_kind is ConversationWorkflowKind.PLAN_REQUEST
+            and state.step is ConversationWorkflowStep.RETRY_READY
         ):
+            self._retry_plan_request(user_id, chat_id, state)
+            return
+        replaced = state is not None
+        request_state = self._new_plan_state()
+        if not self._replace_conversation_state(user_id, request_state, state):
             self.telegram_api.send_message(
-                chat_id, "Working on your weekly meal plan."
+                chat_id,
+                "That workflow changed while I was starting /plan. "
+                "Please try again.",
             )
-        else:
-            self.telegram_api.send_message(
-                chat_id, "I couldn't start plan generation. Please retry."
-            )
+            return
+        prefix = "I replaced your unfinished workflow. " if replaced else ""
+        self.telegram_api.send_message(
+            chat_id,
+            prefix + "Do you have any preferences for the next plan? "
+            "Reply with a preference, or say 'no preference'.",
+        )
 
     def _cmd_grocery(self, chat_id: int | str, user_id: str) -> None:
         plan = self.repo.get_active_plan(user_id)
@@ -231,6 +255,25 @@ class BotHandler:
         self.telegram_api.send_message(chat_id, "\n".join(lines))
 
     def _cmd_submit_meals(self, chat_id: int | str, user_id: str) -> None:
+        state = self._get_conversation_state(user_id)
+        meal_state = self._new_meal_state()
+        if not self._replace_conversation_state(user_id, meal_state, state):
+            self.telegram_api.send_message(
+                chat_id,
+                "That workflow changed while I was starting meal logging. "
+                "Please try again.",
+            )
+            return
+        prefix = "I replaced your unfinished workflow. " if state else ""
+        self.telegram_api.send_message(
+            chat_id,
+            prefix
+            + "What date was the meal? Use YYYY-MM-DD, from today through "
+            "the previous seven days.",
+        )
+
+    def _cmd_checkin(self, chat_id: int | str, user_id: str) -> None:
+        """Show planned-meal outcome buttons for today's active plan."""
         plan = self.repo.get_active_plan(user_id)
         plan_day = self._get_todays_plan_day(plan) if plan else None
         if not plan or not plan_day:
@@ -241,6 +284,67 @@ class BotHandler:
             plan_day.meals,
             week_start=plan.week_start_date,
             day=plan_day.day,
+        )
+
+    def _cmd_cancel(self, chat_id: int | str, user_id: str) -> None:
+        state = self._get_conversation_state(user_id)
+        if state is None:
+            self.telegram_api.send_message(
+                chat_id, "There is nothing to cancel."
+            )
+            return
+        if not self.repo.delete_conversation_state(
+            user_id, expected_revision=state.revision
+        ):
+            self.telegram_api.send_message(
+                chat_id, "That workflow changed. Please use /cancel again."
+            )
+            return
+        self.telegram_api.send_message(
+            chat_id, "Cancelled the unfinished workflow."
+        )
+
+    def _get_conversation_state(self, user_id: str) -> ConversationState | None:
+        state = self.repo.get_conversation_state(user_id)
+        return state if isinstance(state, ConversationState) else None
+
+    @staticmethod
+    def _new_meal_state() -> ConversationState:
+        now = datetime.now(timezone.utc)
+        return ConversationState(
+            workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+            step=ConversationWorkflowStep.AWAITING_DATE,
+            meal_draft=MealLogDraft(),
+            revision=0,
+            created_at=now,
+            updated_at=now,
+            expires_at=int((now + timedelta(hours=24)).timestamp()),
+        )
+
+    @staticmethod
+    def _new_plan_state() -> ConversationState:
+        now = datetime.now(timezone.utc)
+        return ConversationState(
+            workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+            step=ConversationWorkflowStep.AWAITING_PREFERENCE,
+            request_id=str(uuid4()),
+            revision=0,
+            created_at=now,
+            updated_at=now,
+            expires_at=int((now + timedelta(hours=24)).timestamp()),
+        )
+
+    def _replace_conversation_state(
+        self,
+        user_id: str,
+        state: ConversationState,
+        previous: ConversationState | None,
+    ) -> bool:
+        expected_revision = previous.revision if previous else None
+        if previous is not None:
+            state = state.model_copy(update={"revision": previous.revision + 1})
+        return self.repo.save_conversation_state(
+            user_id, state, expected_revision=expected_revision
         )
 
     @staticmethod
@@ -330,6 +434,19 @@ class BotHandler:
             return
         try:
             source_update_id = self._get_source_update_id(route)
+            state = self._get_conversation_state(route.user_id)
+            if (
+                state
+                and state.workflow_kind is ConversationWorkflowKind.PLAN_REQUEST
+            ):
+                self._handle_plan_preference(
+                    route.chat_id,
+                    route.user_id,
+                    route.text,
+                    state,
+                    source_update_id=source_update_id,
+                )
+                return
             profile = self.repo.get_profile(route.user_id)
             profile_draft = self.repo.get_profile_draft(route.user_id)
             prompt = build_conversational_prompt(
@@ -341,11 +458,27 @@ class BotHandler:
                 ),
                 current_plan=self.repo.get_latest_plan(route.user_id),
                 recent_meals=self.repo.get_meal_history(route.user_id, days=14),
+                conversation_state=state,
+                current_date=date.today(),
             )
             client = self.llm_client or LLMClient()
             reply, metadata = parse_conversational_response(
                 client.chat_sync(prompt, route.text)
             )
+            if (
+                state
+                and state.workflow_kind is ConversationWorkflowKind.MEAL_LOG
+            ):
+                reply = self._handle_meal_workflow(
+                    route.chat_id,
+                    route.user_id,
+                    route.text,
+                    state,
+                    metadata.entities,
+                    source_update_id=source_update_id,
+                )
+                self.telegram_api.send_message(route.chat_id, reply)
+                return
             result = self._apply_intent_metadata(
                 route.user_id,
                 route.chat_id,
@@ -369,6 +502,288 @@ class BotHandler:
                 "Sorry, I couldn't process that request. Please try again.",
             )
 
+    def _handle_meal_workflow(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        text: str,
+        state: ConversationState,
+        entities: dict[str, Any],
+        *,
+        source_update_id: str | None,
+    ) -> str:
+        """Merge explicit meal fields and advance one durable workflow."""
+        if state.step is ConversationWorkflowStep.AWAITING_ANOTHER_MEAL:
+            normalized = text.strip().casefold().rstrip(".!?,;:")
+            if source_update_id and state.last_update_id == source_update_id:
+                return "Would you like to log another meal? Reply yes or no."
+            if normalized in {"yes", "y", "sure", "ok", "okay", "another"}:
+                now = datetime.now(timezone.utc)
+                next_state = state.model_copy(
+                    update={
+                        "step": ConversationWorkflowStep.AWAITING_DATE,
+                        "meal_draft": MealLogDraft(),
+                        "revision": state.revision + 1,
+                        "updated_at": now,
+                        "last_update_id": source_update_id,
+                    }
+                )
+                if not self.repo.transition_conversation_state(
+                    user_id, next_state, expected_revision=state.revision
+                ):
+                    return (
+                        "That meal workflow changed. Please use /submit_meals."
+                    )
+                return (
+                    "Okay. What date was the next meal? Use YYYY-MM-DD, "
+                    "from today through the previous seven days."
+                )
+            if normalized in {"no", "n", "nope", "done", "stop"}:
+                if not self.repo.delete_conversation_state(
+                    user_id, expected_revision=state.revision
+                ):
+                    return "That workflow changed. Please try again."
+                return "Done — your meal was logged."
+            return "Would you like to log another meal? Reply yes or no."
+
+        draft = state.meal_draft or MealLogDraft()
+        values = draft.model_dump(mode="json")
+        for field in ("date", "meal_type", "description"):
+            if field not in entities or entities[field] in (None, ""):
+                continue
+            values[field] = entities[field]
+        try:
+            if values.get("date") is not None:
+                parsed_date = date.fromisoformat(str(values["date"]))
+                earliest = date.today() - timedelta(days=7)
+                if not earliest <= parsed_date <= date.today():
+                    return (
+                        "That date must be today or within the previous seven "
+                        "days. What date was the meal?"
+                    )
+                values["date"] = parsed_date
+            if values.get("meal_type") is not None:
+                values["meal_type"] = MealType(
+                    str(values["meal_type"]).strip().casefold()
+                )
+            if values.get("description") is not None:
+                description = str(values["description"]).strip()
+                if not description:
+                    raise ValueError("description must not be empty")
+                values["description"] = description
+            new_draft = MealLogDraft.model_validate(values)
+        except TypeError, ValueError, ValidationError:
+            if "meal_type" in entities:
+                return (
+                    "I didn't recognize that meal type. Please use "
+                    "breakfast, lunch, dinner, or snack."
+                )
+            if "description" in entities:
+                return "Please provide a non-empty description of the meal."
+            return "I couldn't understand that meal detail. Please try again."
+
+        missing = (
+            ("date", "What date was the meal? Use YYYY-MM-DD.")
+            if new_draft.date is None
+            else ("meal_type", "Was it breakfast, lunch, dinner, or snack?")
+            if new_draft.meal_type is None
+            else ("description", "What did you eat? Please describe the meal.")
+            if new_draft.description is None
+            else None
+        )
+        now = datetime.now(timezone.utc)
+        if missing:
+            next_state = state.model_copy(
+                update={
+                    "step": {
+                        "date": ConversationWorkflowStep.AWAITING_DATE,
+                        "meal_type": (
+                            ConversationWorkflowStep.AWAITING_MEAL_TYPE
+                        ),
+                        "description": (
+                            ConversationWorkflowStep.AWAITING_DESCRIPTION
+                        ),
+                    }[missing[0]],
+                    "meal_draft": new_draft,
+                    "revision": state.revision + 1,
+                    "updated_at": now,
+                }
+            )
+            if not self.repo.transition_conversation_state(
+                user_id, next_state, expected_revision=state.revision
+            ):
+                return "That meal workflow changed. Please use /submit_meals."
+            return missing[1]
+
+        assert new_draft.date is not None
+        assert new_draft.meal_type is not None
+        assert new_draft.description is not None
+        entry = MealLogEntry(
+            date=new_draft.date,
+            meal_type=new_draft.meal_type,
+            description=new_draft.description,
+            created_at=now,
+        )
+        next_state = state.model_copy(
+            update={
+                "step": ConversationWorkflowStep.AWAITING_ANOTHER_MEAL,
+                "meal_draft": new_draft,
+                "revision": state.revision + 1,
+                "updated_at": now,
+                "last_update_id": source_update_id,
+            }
+        )
+        try:
+            persisted = self.repo.log_meal_and_transition(
+                user_id,
+                entry,
+                next_state,
+                expected_revision=state.revision,
+                source_update_id=source_update_id,
+            )
+        except Exception:
+            logger.exception("Meal persistence failed for user %s", user_id)
+            return "I couldn't save that meal. Please try again."
+        if not persisted:
+            return "That meal workflow changed. Please use /submit_meals."
+        return (
+            "Meal logged. Would you like to log another meal? Reply yes or no."
+        )
+
+    def _handle_plan_preference(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        text: str,
+        state: ConversationState,
+        *,
+        source_update_id: str | None,
+    ) -> None:
+        if state.step is not ConversationWorkflowStep.AWAITING_PREFERENCE:
+            self.telegram_api.send_message(
+                chat_id,
+                "Plan generation is already in progress. Use /plan to retry "
+                "if it fails.",
+            )
+            return
+        if source_update_id and state.last_update_id == source_update_id:
+            self.telegram_api.send_message(
+                chat_id, "Working on your weekly meal plan."
+            )
+            return
+        normalized = text.strip().casefold().rstrip(".!?,;:")
+        preference = (
+            None
+            if normalized
+            in {
+                "anything",
+                "no preference",
+                "no preferences",
+                "none",
+                "whatever",
+            }
+            else text.strip()
+        )
+        try:
+            candidate = ConversationState.model_validate(
+                {
+                    **state.model_dump(),
+                    "step": ConversationWorkflowStep.GENERATING,
+                    "preference": preference,
+                    "revision": state.revision + 1,
+                    "updated_at": datetime.now(timezone.utc),
+                    "last_update_id": source_update_id,
+                }
+            )
+        except ValidationError:
+            self.telegram_api.send_message(
+                chat_id,
+                "That preference is too long. Please keep it under 500 "
+                "characters.",
+            )
+            return
+        if not self.repo.transition_conversation_state(
+            user_id, candidate, expected_revision=state.revision
+        ):
+            self.telegram_api.send_message(
+                chat_id, "That plan request changed. Please use /plan again."
+            )
+            return
+        invoked = self._invoke_planner(
+            user_id,
+            chat_id,
+            GENERATE_PLAN,
+            week_start=date.today().isoformat(),
+            preference=preference,
+            request_id=candidate.request_id,
+            state_revision=candidate.revision,
+        )
+        if not invoked:
+            retry_state = candidate.model_copy(
+                update={
+                    "step": ConversationWorkflowStep.RETRY_READY,
+                    "revision": candidate.revision + 1,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
+            self.repo.mark_conversation_retry_ready(
+                user_id, retry_state, expected_revision=candidate.revision
+            )
+            self.telegram_api.send_message(
+                chat_id,
+                "I couldn't start plan generation. Your preference was saved; "
+                "use /plan to retry.",
+            )
+            return
+        self.telegram_api.send_message(
+            chat_id, "Working on your weekly meal plan."
+        )
+
+    def _retry_plan_request(
+        self, user_id: str, chat_id: int | str, state: ConversationState
+    ) -> None:
+        candidate = state.model_copy(
+            update={
+                "step": ConversationWorkflowStep.GENERATING,
+                "revision": state.revision + 1,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+        if not self.repo.transition_conversation_state(
+            user_id, candidate, expected_revision=state.revision
+        ):
+            self.telegram_api.send_message(
+                chat_id, "That plan request changed. Please try /plan again."
+            )
+            return
+        if not self._invoke_planner(
+            user_id,
+            chat_id,
+            GENERATE_PLAN,
+            week_start=date.today().isoformat(),
+            preference=candidate.preference,
+            request_id=candidate.request_id,
+            state_revision=candidate.revision,
+        ):
+            retry_state = candidate.model_copy(
+                update={
+                    "step": ConversationWorkflowStep.RETRY_READY,
+                    "revision": candidate.revision + 1,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
+            self.repo.mark_conversation_retry_ready(
+                user_id, retry_state, expected_revision=candidate.revision
+            )
+            self.telegram_api.send_message(
+                chat_id,
+                "I couldn't start plan generation. Please use /plan to retry.",
+            )
+            return
+        self.telegram_api.send_message(
+            chat_id, "Working on your weekly meal plan."
+        )
+
     @staticmethod
     def _get_source_update_id(route: RouteResult) -> str | None:
         """Return a normalized Telegram update ID for conversational writes."""
@@ -390,9 +805,9 @@ class BotHandler:
         try:
             if intent is ConversationIntent.LOG_MEAL:
                 entry = MealLogEntry(
-                    date=entities.get("date", date.today().isoformat()),
-                    meal_type=entities.get("meal_type", MealType.SNACK.value),
-                    description=entities.get("description", "Logged meal"),
+                    date=entities["date"],
+                    meal_type=entities["meal_type"],
+                    description=entities["description"],
                     created_at=datetime.now(timezone.utc),
                 )
                 self.repo.log_meal(
@@ -650,21 +1065,31 @@ class BotHandler:
         action: str,
         *,
         week_start: str,
+        preference: str | None = None,
+        request_id: str | None = None,
+        state_revision: int | None = None,
     ) -> bool:
         if not self.lambda_client or not self.planner_function_name:
             return False
         try:
+            payload: dict[str, Any] = {
+                "action": action,
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "week_start": week_start,
+            }
+            if action == GENERATE_PLAN:
+                payload.update(
+                    {
+                        "preference": preference,
+                        "request_id": request_id,
+                        "state_revision": state_revision,
+                    }
+                )
             self.lambda_client.invoke(
                 FunctionName=self.planner_function_name,
                 InvocationType="Event",
-                Payload=json.dumps(
-                    {
-                        "action": action,
-                        "user_id": user_id,
-                        "chat_id": chat_id,
-                        "week_start": week_start,
-                    }
-                ),
+                Payload=json.dumps(payload),
             )
         except Exception as exc:
             logger.error("Planner invocation failed: %s", exc)

@@ -41,6 +41,8 @@ SUPPORTED_COMMANDS = {
     "grocery",
     "today",
     "submit_meals",
+    "checkin",
+    "cancel",
 }
 
 

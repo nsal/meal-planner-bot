@@ -1,13 +1,19 @@
 """Tests for prompt builders and context assembly."""
 
+from datetime import date, datetime, timedelta, timezone
+
 from meal_planner.llm.prompts import (
     build_conversational_prompt,
     build_grocery_prompt,
     build_plan_prompt,
 )
 from meal_planner.models.schemas import (
+    ConversationState,
+    ConversationWorkflowKind,
+    ConversationWorkflowStep,
     FamilyMember,
     Ingredient,
+    MealLogDraft,
     MealLogEntry,
     MealOutcome,
     PlanDay,
@@ -23,6 +29,25 @@ def test_build_conversational_prompt_empty() -> None:
     prompt = build_conversational_prompt()
     assert "No user profile established yet." in prompt
     assert "No active meal plan." in prompt
+
+
+def test_conversational_prompt_renders_pending_meal_without_defaults() -> None:
+    """Pending meal context gives extraction rules and today's date."""
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+        step=ConversationWorkflowStep.AWAITING_DATE,
+        meal_draft=MealLogDraft(),
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    prompt = build_conversational_prompt(
+        conversation_state=state, current_date=date(2026, 8, 15)
+    )
+    assert "Today's date is 2026-08-15" in prompt
+    assert "never invent a date" in prompt
+    assert "Step: awaiting_date" in prompt
     assert "No recent meal history logged." in prompt
     assert "log_meal" in prompt
 
@@ -191,6 +216,18 @@ def test_build_plan_prompt_with_context() -> None:
     assert "Skipped: Soup" in prompt
     assert "Swapped: Pasta" in prompt
     assert "Fruit" not in prompt
+
+
+def test_plan_prompt_renders_preference_and_constraints() -> None:
+    """A request preference is visible without mutating profile context."""
+    prompt = build_plan_prompt(
+        profile=UserProfile(name="Alice", allergies=["peanuts"]),
+        preference="Indian and pasta",
+    )
+    assert "REQUEST-SPECIFIC PREFERENCE" in prompt
+    assert "Indian and pasta" in prompt
+    assert "Allergies: peanuts" in prompt
+    assert "always take precedence" in prompt
 
 
 def test_build_grocery_prompt() -> None:

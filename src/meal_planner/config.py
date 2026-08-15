@@ -92,7 +92,7 @@ class _SharedSettings(BaseSettings):
         alias="BOT_FUNCTION_TIMEOUT_SECONDS",
     )
     planner_function_timeout_seconds: float = Field(
-        default=120.0,
+        default=180.0,
         gt=0,
         le=900,
         alias="PLANNER_FUNCTION_TIMEOUT_SECONDS",
@@ -116,16 +116,16 @@ class _SharedSettings(BaseSettings):
         alias="BOT_LLM_REQUEST_TIMEOUT_SECONDS",
     )
     planner_llm_request_timeout_seconds: float = Field(
-        default=20.0,
+        default=45.0,
         gt=0,
-        le=25,
+        le=60,
         alias="PLANNER_LLM_REQUEST_TIMEOUT_SECONDS",
     )
     bot_llm_max_retries: int = Field(
         default=2, ge=1, le=5, alias="BOT_LLM_MAX_RETRIES"
     )
     planner_llm_max_retries: int = Field(
-        default=3, ge=1, le=5, alias="PLANNER_LLM_MAX_RETRIES"
+        default=2, ge=1, le=2, alias="PLANNER_LLM_MAX_RETRIES"
     )
     bot_llm_initial_backoff_seconds: float = Field(
         default=1.0,

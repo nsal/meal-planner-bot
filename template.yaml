@@ -85,6 +85,9 @@ Resources:
           KeyType: HASH
         - AttributeName: SK
           KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
 
   BotFunction:
     Type: AWS::Serverless::Function
@@ -136,14 +139,14 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-planner
       CodeUri: ./
       Handler: meal_planner.planner_handler.lambda_handler
-      Timeout: 120
+      Timeout: 180
       MemorySize: 512
       Environment:
         Variables:
-          PLANNER_FUNCTION_TIMEOUT_SECONDS: '120'
+          PLANNER_FUNCTION_TIMEOUT_SECONDS: '180'
           PLANNER_TELEGRAM_REQUEST_TIMEOUT_SECONDS: '10'
-          PLANNER_LLM_REQUEST_TIMEOUT_SECONDS: '20'
-          PLANNER_LLM_MAX_RETRIES: '3'
+          PLANNER_LLM_REQUEST_TIMEOUT_SECONDS: '45'
+          PLANNER_LLM_MAX_RETRIES: '2'
           PLANNER_LLM_INITIAL_BACKOFF_SECONDS: '1'
           PLANNER_HANDLER_SAFETY_MARGIN_SECONDS: '20'
           SECRET_REFRESH_TOKEN: !Ref SecretRefreshToken

@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from meal_planner.llm.client import LLMTransientError
 from meal_planner.models.schemas import GroceryStatus, MealOutcome, PlanStatus
 from meal_planner.planner_handler import PlannerHandler, lambda_handler
 from tests.factories import make_plan, make_plan_payload, make_profile
@@ -236,6 +237,126 @@ def test_generate_plan_skips_llm_for_confirmed_exact_week(
     repo.get_meal_history.assert_not_called()
     repo.save_generated_draft.assert_not_called()
     api.send_plan.assert_not_called()
+    repo.clear_conversation_state_if_matches.assert_not_called()
+
+
+def test_confirmed_stateful_plan_clears_matching_request(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(
+        week_start=week, status=PlanStatus.CONFIRMED
+    )
+    api = mocker.MagicMock()
+
+    PlannerHandler(repo, api).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        request_id="request-1",
+        state_revision=3,
+    )
+
+    repo.clear_conversation_state_if_matches.assert_called_once_with(
+        "user", request_id="request-1", expected_revision=3
+    )
+    assert "already confirmed" in api.send_message.call_args.args[1]
+
+
+def test_confirmed_stateful_plan_does_not_delete_when_cleanup_loses_race(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(
+        week_start=week, status=PlanStatus.CONFIRMED
+    )
+    repo.clear_conversation_state_if_matches.return_value = False
+    api = mocker.MagicMock()
+
+    PlannerHandler(repo, api).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        request_id="request-1",
+        state_revision=3,
+    )
+
+    repo.clear_conversation_state_if_matches.assert_called_once()
+    assert "already confirmed" in api.send_message.call_args.args[1]
+
+
+def test_planner_attempt_limit_one_stops_after_transient_failure(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.side_effect = LLMTransientError("temporary")
+
+    PlannerHandler(repo, api, llm, max_attempts=1).generate_plan(
+        "user", 1, week_start=date(2026, 8, 10)
+    )
+
+    assert llm.chat_json_sync.call_count == 1
+    repo.save_generated_draft.assert_not_called()
+    assert "temporarily unavailable" in api.send_message.call_args.args[1]
+
+
+def test_planner_attempt_limit_one_does_not_repair_invalid_output(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = {}
+
+    PlannerHandler(repo, api, llm, max_attempts=1).generate_plan(
+        "user", 1, week_start=date(2026, 8, 10)
+    )
+
+    assert llm.chat_json_sync.call_count == 1
+    assert "invalid meal plan" in api.send_message.call_args.args[1]
+
+
+def test_planner_attempt_limit_two_keeps_one_repair_attempt(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.save_generated_draft.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.side_effect = [{}, make_plan_payload(week)]
+
+    PlannerHandler(repo, api, llm, max_attempts=2).generate_plan(
+        "user", 1, week_start=week
+    )
+
+    assert llm.chat_json_sync.call_count == 2
+    assert (
+        "Repair the previous response" in llm.chat_json_sync.call_args.args[1]
+    )
+
+
+def test_planner_rejects_non_positive_attempt_limit(mocker: Any) -> None:
+    with pytest.raises(ValueError, match="max_attempts"):
+        PlannerHandler(mocker.MagicMock(), mocker.MagicMock(), max_attempts=0)
 
 
 def test_generate_plan_notifies_when_snapshot_read_fails(
@@ -409,5 +530,6 @@ def test_lambda_handler_dispatches_and_rejects_invalid_event(
         lambda_handler({"user_id": "user", "chat_id": 1}, None)["statusCode"]
         == 200
     )
+    assert planner_class.call_args.kwargs["max_attempts"] == 2
     planner_class.return_value.handle_event.return_value = False
     assert lambda_handler({}, None)["statusCode"] == 400

@@ -1,15 +1,21 @@
 """Tests for Pydantic data models and schemas."""
 
+from datetime import date, datetime, timedelta, timezone
+
 import pytest
 from pydantic import ValidationError
 
 from meal_planner.models.schemas import (
     ConversationIntent,
+    ConversationState,
+    ConversationWorkflowKind,
+    ConversationWorkflowStep,
     FamilyMember,
     GrocerySection,
     GroceryStatus,
     Ingredient,
     LLMResponseMetadata,
+    MealLogDraft,
     MealLogEntry,
     MealOutcome,
     PlanDay,
@@ -19,6 +25,31 @@ from meal_planner.models.schemas import (
     UserProfile,
     WeeklyPlan,
 )
+
+
+def test_conversation_state_validates_workflow_shape_and_expiry() -> None:
+    """Meal and plan state contracts reject incompatible fields."""
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+        step=ConversationWorkflowStep.AWAITING_DATE,
+        meal_draft=MealLogDraft(),
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    assert state.expires_at > int(now.timestamp())
+
+    with pytest.raises(ValidationError):
+        ConversationState(
+            workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+            step=ConversationWorkflowStep.AWAITING_DATE,
+            meal_draft=MealLogDraft(date=date.today()),
+            preference="invented plan preference",
+            created_at=now,
+            updated_at=now,
+            expires_at=now + timedelta(hours=24),
+        )
 
 
 def test_family_member_valid() -> None:
