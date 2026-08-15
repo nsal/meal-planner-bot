@@ -1,9 +1,27 @@
 """Configuration settings for meal planner bot."""
 
-from pydantic import Field, ValidationInfo, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+import re
+from typing import Annotated, Self
+
+from pydantic import (
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
+from pydantic_settings import (
+    BaseSettings,
+    NoDecode,
+    SettingsConfigDict,
+    SettingsError,
+)
 
 MAX_PROVIDER_RETRY_DELAY_SECONDS = 5.0
+
+
+class BotConfigurationError(RuntimeError):
+    """Raised when Bot-only configuration cannot be safely loaded."""
 
 
 def worst_case_retry_wait_seconds(
@@ -38,7 +56,7 @@ def external_call_budget_seconds(
     )
 
 
-class Settings(BaseSettings):
+class _SharedSettings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     model_config = SettingsConfigDict(
@@ -135,7 +153,7 @@ class Settings(BaseSettings):
     )
 
     @model_validator(mode="after")
-    def validate_function_budgets(self) -> "Settings":
+    def validate_function_budgets(self) -> Self:
         """Keep worst-case provider and Telegram calls within deadlines."""
         bot_budget = external_call_budget_seconds(
             llm_attempts=self.bot_llm_max_retries,
@@ -213,6 +231,53 @@ class Settings(BaseSettings):
         return self.aws_region
 
 
+class Settings(_SharedSettings):
+    """Bot settings, including the required Telegram user allowlist."""
+
+    telegram_allowed_user_ids: Annotated[frozenset[str], NoDecode] = Field(
+        alias="TELEGRAM_ALLOWED_USER_IDS"
+    )
+
+    @field_validator("telegram_allowed_user_ids", mode="before")
+    @classmethod
+    def validate_allowed_user_ids(cls, value: object) -> frozenset[str]:
+        """Parse positive numeric Telegram IDs into canonical strings."""
+        if not isinstance(value, str):
+            raise ValueError(
+                "telegram_allowed_user_ids must be a comma-separated list"
+            )
+        entries = value.split(",")
+        if not entries or any(not entry.strip() for entry in entries):
+            raise ValueError(
+                "telegram_allowed_user_ids must contain non-empty IDs"
+            )
+        normalized: set[str] = set()
+        for entry in entries:
+            candidate = entry.strip()
+            if not re.fullmatch(r"[0-9]+", candidate):
+                raise ValueError(
+                    "telegram_allowed_user_ids must contain positive numeric "
+                    "IDs"
+                )
+            canonical = str(int(candidate))
+            if canonical == "0":
+                raise ValueError(
+                    "telegram_allowed_user_ids must contain positive numeric "
+                    "IDs"
+                )
+            normalized.add(canonical)
+        return frozenset(normalized)
+
+    @property
+    def TELEGRAM_ALLOWED_USER_IDS(self) -> frozenset[str]:
+        """Return the immutable configured Telegram user IDs."""
+        return self.telegram_allowed_user_ids
+
+
+class PlannerSettings(_SharedSettings):
+    """Planner settings, which intentionally exclude the Bot allowlist."""
+
+
 class WebhookSettings(BaseSettings):
     """Webhook authentication settings loaded from environment variables."""
 
@@ -238,8 +303,16 @@ class WebhookSettings(BaseSettings):
 
 
 def get_settings() -> Settings:
-    """Return an instance of Settings."""
-    return Settings()
+    """Return Bot settings without exposing source values on failure."""
+    try:
+        return Settings()  # type: ignore[call-arg]
+    except SettingsError, ValidationError:
+        raise BotConfigurationError("Bot configuration is invalid") from None
+
+
+def get_planner_settings() -> PlannerSettings:
+    """Return settings required by the Planner Lambda only."""
+    return PlannerSettings()
 
 
 def get_webhook_secret() -> str:

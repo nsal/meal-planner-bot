@@ -505,6 +505,28 @@ def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
     )
 
 
+def test_telegram_allowlist_is_required_and_bot_scoped() -> None:
+    """Only BotFunction receives a validated explicit Telegram allowlist."""
+    template = _load_template()
+    parameter = template["Parameters"]["TelegramAllowedUserIds"]
+    assert parameter["Type"] == "String"
+    assert "Default" not in parameter
+    assert parameter["AllowedPattern"] == ("^[1-9][0-9]*(,[1-9][0-9]*)*$")
+
+    globals_variables = template["Globals"]["Function"]["Environment"][
+        "Variables"
+    ]
+    assert "TELEGRAM_ALLOWED_USER_IDS" not in globals_variables
+    bot_variables = template["Resources"]["BotFunction"]["Properties"]
+    bot_variables = bot_variables["Environment"]["Variables"]
+    assert bot_variables["TELEGRAM_ALLOWED_USER_IDS"] == {
+        "Ref": "TelegramAllowedUserIds"
+    }
+    planner_variables = template["Resources"]["PlannerFunction"]["Properties"]
+    planner_variables = planner_variables["Environment"]["Variables"]
+    assert "TELEGRAM_ALLOWED_USER_IDS" not in planner_variables
+
+
 def test_python_314_project_contract() -> None:
     """Project metadata and static analysis target the deployment Python."""
     project = _load_project_metadata()

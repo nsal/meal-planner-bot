@@ -17,6 +17,7 @@ from meal_planner.models.schemas import (
     ProfileUpdateEntities,
 )
 from meal_planner.router import RouteResult, RouteType
+from meal_planner.telegram.access import TelegramAccessPolicy
 from meal_planner.telegram.api import TelegramAPIError
 from tests.factories import make_plan, make_profile
 
@@ -29,6 +30,7 @@ def handler(mocker: Any) -> BotHandler:
         lambda_client=mocker.MagicMock(),
         planner_function_name="planner",
         llm_client=mocker.MagicMock(),
+        access_policy=TelegramAccessPolicy(frozenset({"1"})),
     )
 
 
@@ -66,6 +68,32 @@ def test_all_commands_have_controlled_success_or_missing_state(
     assert handler.telegram_api.send_message.call_count >= 6
 
 
+def test_start_requests_family_name_separately_from_member_names(
+    handler: BotHandler,
+) -> None:
+    handler.repo.get_profile.return_value = None
+
+    handler.handle_command(_command("start"))
+
+    message = handler.telegram_api.send_message.call_args.args[1].lower()
+    assert "family name" in message
+    assert "each household member's name" in message
+    assert "tell me your name" not in message
+
+
+def test_profile_displays_family_name_and_individual_members(
+    handler: BotHandler,
+) -> None:
+    handler.repo.get_profile.return_value = make_profile()
+
+    handler.handle_command(_command("profile"))
+
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "Family name: Alex" in message
+    assert "Family members:" in message
+    assert "- Alex (2000 kcal/day)" in message
+
+
 def test_plan_command_invokes_explicit_generation_event(
     handler: BotHandler,
 ) -> None:
@@ -88,7 +116,8 @@ def test_profile_onboarding_accumulates_then_saves(handler: BotHandler) -> None:
         None,
     )
     assert partial.success
-    assert partial.message and "family_members" in partial.message
+    assert partial.message and "household member" in partial.message
+    assert "family_members" not in partial.message
     handler.repo.save_profile_draft.assert_called_once()
 
     complete_entities = {
@@ -114,6 +143,85 @@ def test_profile_onboarding_accumulates_then_saves(handler: BotHandler) -> None:
     saved = handler.repo.save_profile.call_args.args[1]
     assert len(saved.family_members) == 2
     handler.repo.delete_profile_draft.assert_called_once_with("user")
+
+
+def test_profile_onboarding_two_turn_no_value_answers_complete_profile(
+    handler: BotHandler,
+) -> None:
+    handler.repo.get_profile_draft.return_value = ProfileUpdateEntities()
+    first_turn = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.UPDATE_PROFILE,
+        {
+            "people_count": 3,
+            "family_members": [
+                {"name": "Nick", "calorie_target": 2200},
+                {"name": "Val", "calorie_target": 1800},
+                {"name": "Mike", "calorie_target": 2000},
+            ],
+            "allergies": "none",
+            "dietary_preferences": "no preferences",
+            "goals": ["eat well"],
+        },
+        None,
+    )
+
+    assert first_turn.success
+    assert first_turn.message and "family name" in first_turn.message
+    assert "restrictions" in first_turn.message
+    handler.repo.delete_profile_draft.assert_not_called()
+
+    saved_draft = handler.repo.save_profile_draft.call_args.args[1]
+    handler.repo.get_profile_draft.return_value = saved_draft
+    second_turn = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.UPDATE_PROFILE,
+        {"name": "Nick", "restrictions": "none"},
+        None,
+    )
+
+    assert second_turn.success
+    saved_profile = handler.repo.save_profile.call_args.args[1]
+    assert saved_profile.name == "Nick"
+    assert [member.name for member in saved_profile.family_members] == [
+        "Nick",
+        "Val",
+        "Mike",
+    ]
+    assert [
+        member.calorie_target for member in saved_profile.family_members
+    ] == [2200, 1800, 2000]
+    assert saved_profile.allergies == []
+    assert saved_profile.dietary_preferences == []
+    assert saved_profile.restrictions == []
+    assert saved_profile.goals == ["eat well"]
+    handler.repo.delete_profile_draft.assert_called_once_with("user")
+
+
+def test_profile_onboarding_rejects_ambiguous_scalar_without_draft_mutation(
+    handler: BotHandler,
+) -> None:
+    draft = ProfileUpdateEntities(
+        name="Nick",
+        people_count=3,
+        restrictions=[],
+    )
+    handler.repo.get_profile_draft.return_value = draft
+
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.UPDATE_PROFILE,
+        {"restrictions": "no peanuts"},
+        None,
+    )
+
+    assert not result.success
+    handler.repo.save_profile_draft.assert_not_called()
+    handler.repo.save_profile.assert_not_called()
+    handler.repo.delete_profile_draft.assert_not_called()
 
 
 def test_profile_update_rejects_invalid_targets_and_reports_db_failure(
@@ -160,7 +268,7 @@ def test_incomplete_complete_looking_profile_is_saved_as_draft(
         None,
     )
     assert result.success
-    assert result.message and "one name" in result.message
+    assert result.message and "household member name" in result.message
     handler.repo.save_profile_draft.assert_called_once()
     handler.repo.save_profile.assert_not_called()
 
@@ -746,7 +854,7 @@ def test_conversation_passes_persisted_profile_draft_to_llm(
     )
 
     prompt = handler.llm_client.chat_sync.call_args.args[0]
-    assert "Name: Alex" in prompt
+    assert "Family Name: Alex" in prompt
     assert "People Count: 2" in prompt
     assert "Family Members: Missing" in prompt
     handler.repo.get_profile_draft.assert_called_once_with("user")
@@ -766,6 +874,149 @@ def test_telegram_failure_is_controlled_at_update_boundary(
         }
     )
     assert result["statusCode"] == 200
+
+
+def test_unauthorized_private_update_is_silent_and_has_no_side_effects(
+    handler: BotHandler,
+) -> None:
+    """Unknown private users cannot reach any Bot Lambda action."""
+    result = handler.handle_update(
+        {
+            "message": {
+                "from": {"id": 999},
+                "chat": {"id": 999, "type": "private"},
+                "text": "/start do-not-log-this",
+            }
+        }
+    )
+
+    assert result == {"statusCode": 200, "body": "ok"}
+    handler.repo.assert_not_called()
+    handler.telegram_api.assert_not_called()
+    handler.lambda_client.assert_not_called()
+    handler.llm_client.assert_not_called()
+
+
+def test_allowlisted_group_update_is_silent_and_has_no_side_effects(
+    handler: BotHandler,
+) -> None:
+    """An authorized sender is still denied outside a private chat."""
+    result = handler.handle_update(
+        {
+            "message": {
+                "from": {"id": 1},
+                "chat": {"id": -1001, "type": "supergroup"},
+                "text": "/start",
+            }
+        }
+    )
+
+    assert result == {"statusCode": 200, "body": "ok"}
+    handler.repo.assert_not_called()
+    handler.telegram_api.assert_not_called()
+    handler.lambda_client.assert_not_called()
+    handler.llm_client.assert_not_called()
+
+
+def test_allowlisted_update_without_chat_id_has_no_side_effects(
+    handler: BotHandler,
+) -> None:
+    """Malformed private updates must not inherit the sender ID as chat ID."""
+    result = handler.handle_update(
+        {
+            "message": {
+                "from": {"id": 1},
+                "chat": {"type": "private"},
+                "text": "/start",
+            }
+        }
+    )
+
+    assert result == {"statusCode": 200, "body": "ok"}
+    handler.repo.assert_not_called()
+    handler.telegram_api.assert_not_called()
+    handler.lambda_client.assert_not_called()
+    handler.llm_client.assert_not_called()
+
+
+def test_denied_callback_does_not_acknowledge_or_mutate(
+    handler: BotHandler,
+) -> None:
+    """Denied callbacks do not answer Telegram or invoke persistence."""
+    result = handler.handle_update(
+        {
+            "callback_query": {
+                "id": "query-secret",
+                "from": {"id": 1},
+                "message": {
+                    "chat": {"id": -1001, "type": "group"},
+                },
+                "data": "checkin:2026-08-10:1:lunch:cooked-secret",
+            }
+        }
+    )
+
+    assert result["statusCode"] == 200
+    handler.repo.assert_not_called()
+    handler.telegram_api.assert_not_called()
+    handler.lambda_client.assert_not_called()
+    handler.llm_client.assert_not_called()
+
+
+def test_denial_log_omits_update_contents(
+    handler: BotHandler, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Operational denial logs contain identity context only."""
+    caplog.set_level("INFO")
+    text = "private message that must not appear"
+    callback_data = "callback payload that must not appear"
+
+    handler.handle_update(
+        {
+            "message": {
+                "from": {"id": 999},
+                "chat": {"id": 999, "type": "private"},
+                "text": text,
+            }
+        }
+    )
+    handler.handle_update(
+        {
+            "callback_query": {
+                "id": "query",
+                "from": {"id": 1},
+                "message": {"chat": {"id": -1001, "type": "group"}},
+                "data": callback_data,
+            }
+        }
+    )
+
+    log_text = caplog.text
+    assert "user_id=999" in log_text
+    assert "chat_type=private" in log_text
+    assert text not in log_text
+    assert callback_data not in log_text
+
+
+def test_allowlisted_private_command_preserves_current_behavior(
+    handler: BotHandler,
+) -> None:
+    """Authorized private commands still reach the normal handler."""
+    handler.repo.get_profile.return_value = None
+
+    result = handler.handle_update(
+        {
+            "message": {
+                "from": {"id": 1},
+                "chat": {"id": 1, "type": "private"},
+                "text": "/start",
+            }
+        }
+    )
+
+    assert result["statusCode"] == 200
+    handler.repo.get_profile.assert_called_once_with("1")
+    handler.telegram_api.send_message.assert_called_once()
 
 
 def test_lambda_handler_authenticates_before_decode(mocker: Any) -> None:
@@ -802,3 +1053,50 @@ def test_lambda_handler_valid_base64_event(mocker: Any, mock_env: None) -> None:
         None,
     )
     assert result["statusCode"] == 200
+
+
+@pytest.mark.parametrize("allowed_user_ids", [None, "invalid"])
+def test_lambda_handler_ignores_invalid_bot_configuration(
+    mocker: Any,
+    mock_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    allowed_user_ids: str | None,
+) -> None:
+    """Bad allowlist settings are silent and do not initialize dependencies."""
+    if allowed_user_ids is None:
+        monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
+    else:
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", allowed_user_ids)
+    dynamodb_resource = mocker.patch("boto3.resource")
+    lambda_client = mocker.patch("boto3.client")
+    llm_client = mocker.patch("meal_planner.bot_handler.LLMClient")
+    handler_class = mocker.patch("meal_planner.bot_handler.BotHandler")
+    caplog.set_level("ERROR")
+
+    result = lambda_handler(
+        {
+            "headers": {
+                "X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret"
+            },
+            "body": json.dumps(
+                {
+                    "message": {
+                        "from": {"id": 1},
+                        "chat": {"id": 1, "type": "private"},
+                        "text": "/start",
+                    }
+                }
+            ),
+        },
+        None,
+    )
+
+    assert result == {"statusCode": 200, "body": "ok"}
+    dynamodb_resource.assert_not_called()
+    lambda_client.assert_not_called()
+    llm_client.assert_not_called()
+    handler_class.assert_not_called()
+    assert "Bot configuration is invalid" in caplog.text
+    assert "test-api-key" not in caplog.text
+    assert "test-webhook-secret" not in caplog.text

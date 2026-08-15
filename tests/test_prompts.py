@@ -74,11 +74,27 @@ def test_build_conversational_prompt_with_partial_profile_draft() -> None:
 
     assert "--- Saved Profile ---" in prompt
     assert "--- Pending Profile Updates ---" in prompt
-    assert "Name: Alex" in prompt
+    assert "Family Name: Alex" in prompt
     assert "People Count: 2" in prompt
     assert "Family Members: Missing" in prompt
     assert "Allergies: Missing" in prompt
     assert "Family Members: None specified" not in prompt
+
+
+def test_conversational_prompt_distinguishes_family_and_member_names() -> None:
+    prompt = build_conversational_prompt(
+        profile_draft=ProfileUpdateEntities(
+            name="Nick",
+            family_members=[{"name": "Val", "calorie_target": 1800}],
+        )
+    )
+
+    assert "Family Name: Nick" in prompt
+    assert "Family Members: Val (1800 kcal)" in prompt
+    assert "top-level 'name' field means the household's family name" in prompt
+    assert "individual member's name" in prompt
+    assert "'name'" in prompt
+    assert "people_count" in prompt
 
 
 def test_prompt_separates_saved_and_pending_values() -> None:
@@ -167,7 +183,7 @@ def test_build_plan_prompt_with_context() -> None:
         previous_plan=prev_plan,
         week_start="2026-08-10",
     )
-    assert "Primary User: Alice" in prompt
+    assert "Family Name: Alice" in prompt
     assert "Bob (2200 kcal/day)" in prompt
     assert "shellfish" in prompt
     assert "Salmon" in prompt

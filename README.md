@@ -49,6 +49,7 @@ Local development reads these variables from the environment or an ignored
 |---|---:|---|
 | `TELEGRAM_BOT_TOKEN` | required | BotFather token |
 | `TELEGRAM_WEBHOOK_SECRET` | required for bot | Telegram webhook secret token |
+| `TELEGRAM_ALLOWED_USER_IDS` | required for bot | Comma-separated numeric Telegram user IDs allowed in private chats |
 | `LLM_API_KEY` | required | Provider credential used by LiteLLM |
 | `CONVERSATIONAL_LLM_MODEL` | `gpt-5.6-luna` | Conversational LiteLLM model |
 | `CONVERSATIONAL_LLM_REASONING_EFFORT` | `medium` | Conversational reasoning effort |
@@ -83,6 +84,28 @@ The former global timeout and retry variables are ignored for compatibility;
 use the function-specific settings above.
 
 Never commit `.env` or secret values.
+
+The allowlist must contain Telegram's immutable numeric user IDs, not
+usernames or display names. Each approved person can retrieve their numeric
+ID with a trusted Telegram ID lookup bot such as `@userinfobot`; verify the
+result before adding it to the deployment. For local development, use a
+comma-separated value in `.env`, with optional surrounding whitespace:
+
+```dotenv
+TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
+```
+
+The IDs are identifiers rather than secrets, but they are visible to
+operators in CloudFormation parameters and the Bot Lambda configuration.
+Only an allowlisted user in a matching private chat can trigger commands,
+conversations, or callbacks. Unauthorized users and all group, supergroup,
+or channel updates receive no Telegram reply; the webhook still returns HTTP
+200 so Telegram does not retry. The webhook secret authenticates Telegram's
+HTTP request, while the allowlist authorizes the individual sender.
+
+As defense in depth, disable the bot's ability to join groups through
+BotFather after deployment. Application enforcement remains authoritative even
+if the bot is later added to a group.
 
 ## AWS deployment
 
@@ -135,6 +158,7 @@ uvx --from aws-sam-cli sam deploy --guided \
   TelegramBotTokenSecretName=meal-planner/bot-token \
   TelegramWebhookSecretName=meal-planner/webhook-secret \
   LlmApiKeySecretName=meal-planner/llm-key \
+  TelegramAllowedUserIds=123456789,987654321 \
   SecretRefreshToken="$(date +%s)"
 ```
 
@@ -155,6 +179,7 @@ uvx --from aws-sam-cli sam deploy \
   TelegramBotTokenSecretName=meal-planner/bot-token \
   TelegramWebhookSecretName=meal-planner/webhook-secret \
   LlmApiKeySecretName=meal-planner/llm-key \
+  TelegramAllowedUserIds=123456789,987654321 \
   SecretRefreshToken="$(date +%s)"
 ```
 
@@ -259,11 +284,14 @@ aws cloudformation delete-stack --stack-name "$STACK_NAME" \
 
 ## User workflow
 
-- `/start` begins onboarding. Supply the household size, every person's name
-  and calorie target, allergies, preferences, restrictions, and goals. Known
-  onboarding fields carry across conversational turns, so provide only the
-  fields the bot still requests.
-- `/profile` shows the persisted profile.
+- `/start` begins onboarding. Supply the family name separately from the
+  household size, every household member's name and calorie target, allergies,
+  preferences, restrictions, and goals. Known onboarding fields carry across
+  conversational turns, so provide only the fields the bot still requests.
+- `/profile` shows the persisted family name and individual member details.
+- Natural-language no-value answers such as `none`, `nothing`, `no allergies`,
+  and `no restrictions` are stored as empty categories. They count as answers,
+  while omitted fields remain missing until supplied.
 - `/plan` asynchronously generates a complete seven-day draft. The draft is
   persisted before Telegram delivery; if delivery fails, the draft remains
   valid and requesting `/plan` again is the recovery path.
