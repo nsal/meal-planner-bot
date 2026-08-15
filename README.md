@@ -34,6 +34,15 @@ the locked `uv` environment.
   generation. `no preference` and `anything` remove the extra constraint; the
   saved family profile is never changed. A failed request retains the
   preference so `/plan` can retry it.
+- After a draft is displayed, describe whole-plan changes in natural language
+  to start an asynchronous revision. The bot replaces the complete draft for
+  the same week, preserves earlier plan-specific instructions, and leaves the
+  household profile unchanged. While a revision is running, confirmation and
+  additional amendments are blocked. A failed revision leaves the original
+  draft intact and accepts `retry` or `/cancel`.
+- A successful revision is shown with another review/edit/confirm prompt.
+  Confirming the final draft starts grocery generation for that exact plan;
+  targeted `edit_plan` changes remain available for active confirmed plans.
 
 Conversation state is stored in the user's `CONVERSATION_STATE` DynamoDB item
 with a 24-hour expiry, revision checks, and Telegram update idempotency. The

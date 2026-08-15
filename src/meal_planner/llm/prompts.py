@@ -1,5 +1,6 @@
 """Prompt builders and templates for LLM context assembly."""
 
+import json
 from datetime import date
 from typing import Optional
 
@@ -11,6 +12,29 @@ from meal_planner.models.schemas import (
     UserProfile,
     WeeklyPlan,
 )
+
+
+def _profile_text(profile: UserProfile | None) -> str:
+    """Render the trusted household profile for planner prompts."""
+    if profile is None:
+        return "No user profile established yet."
+    members = (
+        ", ".join(
+            f"{member.name} ({member.calorie_target} kcal/day)"
+            for member in profile.family_members
+        )
+        or "None specified"
+    )
+    return (
+        f"Family Name: {profile.name}\n"
+        f"People Count: {profile.people_count}\n"
+        f"Family Members: {members}\n"
+        f"Allergies: {', '.join(profile.allergies) or 'None'}\n"
+        f"Dietary Preferences: "
+        f"{', '.join(profile.dietary_preferences) or 'None'}\n"
+        f"Restrictions: {', '.join(profile.restrictions) or 'None'}\n"
+        f"Goals: {', '.join(profile.goals) or 'None'}"
+    )
 
 
 def build_conversational_prompt(
@@ -131,7 +155,7 @@ def build_conversational_prompt(
         "2. At the end of your response, append a JSON block "
         "enclosed in ```json ... ``` with keys:\n"
         "   - 'intent': One of ['log_meal', 'edit_plan', 'update_profile', "
-        "'confirm_plan', 'suggestion', 'chitchat']\n"
+        "'confirm_plan', 'revise_plan', 'suggestion', 'chitchat']\n"
         "   - 'entities': Key-value details relevant to intent. Profile "
         "updates may include 'name', 'people_count', and 'family_members'. "
         "The top-level 'name' field means the household's family "
@@ -145,6 +169,16 @@ def build_conversational_prompt(
         "explicitly present in the user's message; never invent a date, "
         "meal type, or description. Valid meal types are breakfast, lunch, "
         "dinner, and snack.\n"
+        "3. When the current plan is an eligible draft, any request to "
+        "change the whole plan or apply an aggregate rule is revise_plan. "
+        "For revise_plan return only {'amendment': '<faithful request>'}; "
+        "do not invent days, meals, or patch entities. Keep the user's "
+        "natural-language amendment verbatim except for surrounding "
+        "whitespace.\n"
+        "4. Use confirm_plan only when the user asks to accept the current "
+        "draft. Keep edit_plan for one targeted day and meal on an active "
+        "confirmed plan, with entities day, meal_type, and requested meal "
+        "fields.\n"
     )
 
 
@@ -276,6 +310,70 @@ def build_grocery_prompt(
         "    {\n"
         '      "name": "Section Name (e.g. Produce, Dairy, Pantry)",\n'
         '      "items": ["Ingredient item with total quantity"]\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+    )
+
+
+def build_plan_revision_prompt(
+    profile: UserProfile,
+    current_plan: WeeklyPlan,
+    amendment: str,
+    *,
+    week_start: str | None = None,
+) -> str:
+    """Build a complete-plan replacement prompt for a draft revision."""
+    target_week = week_start or current_plan.week_start_date
+    plan_json = json.dumps(
+        current_plan.model_dump(by_alias=True, mode="json"),
+        indent=2,
+        sort_keys=True,
+    )
+    instructions = (
+        "\n".join(
+            f"{index}. {instruction}"
+            for index, instruction in enumerate(
+                current_plan.planning_instructions, start=1
+            )
+        )
+        or "None."
+    )
+    return (
+        "You are an expert nutritionist revising an existing family meal "
+        "plan. Return a complete replacement for the current seven-day "
+        "draft.\n\n"
+        "=== TRUSTED HOUSEHOLD PROFILE AND SAFETY CONSTRAINTS ===\n"
+        f"{_profile_text(profile)}\n\n"
+        "=== TRUSTED CURRENT DRAFT (COMPLETE JSON) ===\n"
+        f"{plan_json}\n\n"
+        "=== TRUSTED PLAN-SPECIFIC INSTRUCTIONS, IN ORDER ===\n"
+        f"{instructions}\n\n"
+        "=== LATEST USER AMENDMENT (HIGHEST REQUEST PRIORITY) ===\n"
+        f"{amendment}\n\n"
+        "Satisfy all compatible instructions and preserve sensible "
+        "unaffected choices. Permanent allergies, dietary restrictions, "
+        "calorie targets, and safety rules take precedence over every "
+        "request-specific instruction. Use the same week and return all "
+        f"seven days for week start {target_week}. Do not return a patch.\n\n"
+        "=== OUTPUT JSON SCHEMA ===\n"
+        "Return strictly valid JSON matching this schema:\n"
+        "{\n"
+        '  "week_start_date": "YYYY-MM-DD",\n'
+        '  "status": "draft",\n'
+        '  "days": [\n'
+        "    {\n"
+        '      "day": 1,\n'
+        '      "meals": [\n'
+        "        {\n"
+        '          "meal_type": "breakfast|lunch|dinner|snack",\n'
+        '          "name": "Meal Name",\n'
+        '          "ingredients": [{"item": "Ingredient", '
+        '"amount": "Quantity"}],\n'
+        '          "est_calories": 500,\n'
+        '          "outcome": "unreported"\n'
+        "        }\n"
+        "      ]\n"
         "    }\n"
         "  ]\n"
         "}\n"

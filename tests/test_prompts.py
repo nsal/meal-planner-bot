@@ -6,6 +6,7 @@ from meal_planner.llm.prompts import (
     build_conversational_prompt,
     build_grocery_prompt,
     build_plan_prompt,
+    build_plan_revision_prompt,
 )
 from meal_planner.models.schemas import (
     ConversationState,
@@ -228,6 +229,55 @@ def test_plan_prompt_renders_preference_and_constraints() -> None:
     assert "Indian and pasta" in prompt
     assert "Allergies: peanuts" in prompt
     assert "always take precedence" in prompt
+
+
+def test_conversational_prompt_contracts_draft_revision() -> None:
+    prompt = build_conversational_prompt(
+        current_plan=WeeklyPlan(
+            week_start="2026-08-10",
+            days=[PlanDay(day=value) for value in range(1, 8)],
+        )
+    )
+    assert "revise_plan" in prompt
+    assert "only {'amendment': '<faithful request>'}" in prompt
+    assert "Keep edit_plan for one targeted day and meal" in prompt
+
+
+def test_build_plan_revision_prompt_contains_trusted_full_context() -> None:
+    profile = UserProfile(
+        name="Alex",
+        family_members=[FamilyMember(name="Alex", calorie_target=2000)],
+        allergies=["peanuts"],
+    )
+    plan = WeeklyPlan(
+        week_start="2026-08-10",
+        planning_instructions=["Three egg breakfasts"],
+        days=[
+            PlanDay(
+                day=1,
+                meals=[
+                    PlannedMeal(
+                        meal_type="breakfast",
+                        name="Eggs",
+                        ingredients=[Ingredient(item="Eggs", amount="2")],
+                    )
+                ],
+            ),
+            *(PlanDay(day=value) for value in range(2, 8)),
+        ],
+    )
+    amendment = (
+        "Make breakfasts waffles, crepes, or eggs three times, keep an open "
+        "day, and avoid cauliflower"
+    )
+    prompt = build_plan_revision_prompt(profile, plan, amendment)
+    assert "Allergies: peanuts" in prompt
+    assert '"ingredients"' in prompt
+    assert "Three egg breakfasts" in prompt
+    assert amendment in prompt
+    assert "2026-08-10" in prompt
+    assert "seven days" in prompt
+    assert "Do not return a patch" in prompt
 
 
 def test_build_grocery_prompt() -> None:

@@ -91,6 +91,72 @@ def test_conversation_state_round_trip_and_revision_guard(
     assert repo.get_conversation_state("user") is None
 
 
+def test_revision_replacement_and_state_cleanup_are_atomic(
+    repo: DynamoRepository,
+) -> None:
+    plan = make_plan(revision=3, planning_instructions=["Egg breakfasts"])
+    repo.save_plan("user", plan)
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REVISION,
+        step=ConversationWorkflowStep.GENERATING,
+        amendment="Avoid cauliflower",
+        target_week=plan.week_start,
+        expected_plan_revision=plan.revision,
+        request_id="revision-1",
+        revision=0,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    assert repo.save_conversation_state("user", state)
+    replacement = make_plan(
+        week_start=plan.week_start,
+        revision=4,
+        planning_instructions=["Egg breakfasts", "Avoid cauliflower"],
+    )
+
+    assert repo.replace_draft_and_clear_revision_state(
+        "user",
+        replacement,
+        expected_plan_revision=3,
+        request_id="revision-1",
+        expected_state_revision=0,
+    )
+    assert repo.get_plan("user", plan.week_start) == replacement
+    assert repo.get_conversation_state("user") is None
+
+
+def test_revision_replacement_rejects_stale_plan_or_state(
+    repo: DynamoRepository,
+) -> None:
+    plan = make_plan(revision=1)
+    repo.save_plan("user", plan)
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REVISION,
+        step=ConversationWorkflowStep.GENERATING,
+        amendment="Avoid cauliflower",
+        target_week=plan.week_start,
+        expected_plan_revision=1,
+        request_id="revision-1",
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    assert repo.save_conversation_state("user", state)
+    replacement = make_plan(week_start=plan.week_start, revision=2)
+    assert not repo.replace_draft_and_clear_revision_state(
+        "user",
+        replacement,
+        expected_plan_revision=0,
+        request_id="wrong-request",
+        expected_state_revision=0,
+    )
+    assert repo.get_plan("user", plan.week_start) == plan
+    assert repo.get_conversation_state("user") == state
+
+
 def test_replacements_from_one_snapshot_have_one_winner(
     repo: DynamoRepository,
 ) -> None:

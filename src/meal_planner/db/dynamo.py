@@ -478,6 +478,77 @@ class DynamoRepository:
             raise
         return True
 
+    def replace_draft_and_clear_revision_state(
+        self,
+        user_id: str,
+        plan: WeeklyPlan,
+        *,
+        expected_plan_revision: int,
+        request_id: str,
+        expected_state_revision: int,
+    ) -> bool:
+        """Publish a revision and remove its request in one transaction."""
+        plan_item = {
+            "PK": f"USER#{user_id}",
+            "SK": f"PLAN#{plan.week_start_date}",
+            **plan.model_dump(by_alias=True, mode="json"),
+        }
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": plan_item,
+                            "ConditionExpression": (
+                                "#status = :draft AND "
+                                "#revision = :expected_plan_revision"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#status": "status",
+                                "#revision": "revision",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":draft": PlanStatus.DRAFT.value,
+                                ":expected_plan_revision": (
+                                    expected_plan_revision
+                                ),
+                            },
+                        }
+                    },
+                    {
+                        "Delete": {
+                            "TableName": self.table.name,
+                            "Key": self._conversation_key(user_id),
+                            "ConditionExpression": (
+                                "#request_id = :request_id AND "
+                                "#state_revision = :expected_state_revision"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#request_id": "request_id",
+                                "#state_revision": "revision",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":request_id": request_id,
+                                ":expected_state_revision": (
+                                    expected_state_revision
+                                ),
+                            },
+                        }
+                    },
+                ]
+            )
+        except ClientError as exc:
+            if self._is_transaction_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    # Descriptive alias retained for callers that name the state explicitly.
+    replace_draft_and_clear_conversation_state = (
+        replace_draft_and_clear_revision_state
+    )
+
     def confirm_plan(
         self, user_id: str, week_start: str, expected_revision: int
     ) -> bool:

@@ -1,12 +1,20 @@
 """Planner generation and grocery-finalization workflow tests."""
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 
 from meal_planner.llm.client import LLMTransientError
-from meal_planner.models.schemas import GroceryStatus, MealOutcome, PlanStatus
+from meal_planner.models.schemas import (
+    ConversationState,
+    ConversationWorkflowKind,
+    ConversationWorkflowStep,
+    GroceryStatus,
+    MealOutcome,
+    PlanRevisionContext,
+    PlanStatus,
+)
 from meal_planner.planner_handler import PlannerHandler, lambda_handler
 from tests.factories import make_plan, make_plan_payload, make_profile
 
@@ -40,6 +48,72 @@ def test_generate_plan_saves_draft_without_groceries(mocker: Any) -> None:
         1, "Review this draft, request edits, then tell me to confirm it."
     )
     assert events == ["persist", "send_plan", "send_message"]
+
+
+def test_revise_plan_publishes_normalized_replacement_before_delivery(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date.today()
+    current = make_plan(
+        week_start=week,
+        revision=4,
+        planning_instructions=["Three egg breakfasts"],
+    )
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REVISION,
+        step=ConversationWorkflowStep.GENERATING,
+        amendment="Avoid cauliflower",
+        target_week=week,
+        expected_plan_revision=4,
+        request_id="revision-1",
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = current
+    repo.get_conversation_state.return_value = state
+    repo.replace_draft_and_clear_revision_state.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = make_plan_payload(week)
+    payload["status"] = PlanStatus.CONFIRMED.value
+    payload["revision"] = 99
+    payload["grocery_status"] = GroceryStatus.READY.value
+    payload["grocery_list"] = [{"name": "Produce", "items": ["Apples"]}]
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment="Avoid cauliflower",
+            request_id="revision-1",
+            state_revision=0,
+            expected_plan_revision=4,
+            week_start=week,
+        ),
+    )
+
+    replacement = repo.replace_draft_and_clear_revision_state.call_args.args[1]
+    assert replacement.revision == 5
+    assert replacement.status is PlanStatus.DRAFT
+    assert replacement.grocery_status is GroceryStatus.NOT_REQUESTED
+    assert replacement.grocery_list == []
+    assert replacement.planning_instructions == [
+        "Three egg breakfasts",
+        "Avoid cauliflower",
+    ]
+    assert all(
+        meal.outcome is MealOutcome.UNREPORTED
+        for plan_day in replacement.days
+        for meal in plan_day.meals
+    )
+    repo.replace_draft_and_clear_revision_state.assert_called_once()
+    assert api.send_plan.call_count == 1
+    assert "revised draft" in api.send_message.call_args.args[1]
 
 
 def test_generate_plan_delivery_failure_keeps_persisted_draft(

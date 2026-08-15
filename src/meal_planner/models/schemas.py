@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Annotated, Any
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
     Field,
     StringConstraints,
@@ -26,6 +27,11 @@ PlanPreference = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
 ]
+PlanInstruction = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
+]
+PlanningInstruction = PlanInstruction
 RequestId = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
@@ -51,6 +57,7 @@ class ConversationIntent(str, Enum):
     EDIT_PLAN = "edit_plan"
     UPDATE_PROFILE = "update_profile"
     CONFIRM_PLAN = "confirm_plan"
+    REVISE_PLAN = "revise_plan"
     SUGGESTION = "suggestion"
     CHITCHAT = "chitchat"
 
@@ -94,6 +101,7 @@ class ConversationWorkflowKind(str, Enum):
 
     MEAL_LOG = "meal_log"
     PLAN_REQUEST = "plan_request"
+    PLAN_REVISION = "plan_revision"
 
 
 class ConversationWorkflowStep(str, Enum):
@@ -123,6 +131,12 @@ class ConversationState(BaseModel):
     step: ConversationWorkflowStep
     meal_draft: MealLogDraft | None = None
     preference: PlanPreference | None = None
+    amendment: PlanInstruction | None = None
+    target_week: date | None = Field(
+        default=None,
+        validation_alias=AliasChoices("target_week", "week_start"),
+    )
+    expected_plan_revision: int | None = Field(default=None, ge=0)
     request_id: str | None = None
     revision: int = Field(default=0, ge=0)
     created_at: datetime
@@ -165,19 +179,50 @@ class ConversationState(BaseModel):
         if self.workflow_kind is ConversationWorkflowKind.MEAL_LOG:
             if self.step not in meal_steps or self.meal_draft is None:
                 raise ValueError("meal workflows require a meal draft step")
-            if self.preference is not None or self.request_id is not None:
+            if (
+                self.preference is not None
+                or self.request_id is not None
+                or self.amendment is not None
+                or self.target_week is not None
+                or self.expected_plan_revision is not None
+            ):
                 raise ValueError("meal workflows cannot contain plan fields")
-        else:
+        elif self.workflow_kind is ConversationWorkflowKind.PLAN_REQUEST:
             if self.step not in plan_steps or self.request_id is None:
                 raise ValueError("plan workflows require a request ID step")
             if self.meal_draft is not None:
                 raise ValueError("plan workflows cannot contain meal fields")
+            if (
+                self.amendment is not None
+                or self.target_week is not None
+                or self.expected_plan_revision is not None
+            ):
+                raise ValueError("plan requests cannot contain revision fields")
             if (
                 self.step is ConversationWorkflowStep.AWAITING_PREFERENCE
                 and self.preference is not None
             ):
                 raise ValueError(
                     "awaiting-preference state cannot contain a preference"
+                )
+        else:
+            if self.step not in {
+                ConversationWorkflowStep.GENERATING,
+                ConversationWorkflowStep.RETRY_READY,
+            }:
+                raise ValueError("revision workflows require a generation step")
+            if self.meal_draft is not None or self.preference is not None:
+                raise ValueError(
+                    "revision workflows cannot contain other fields"
+                )
+            if (
+                self.request_id is None
+                or self.amendment is None
+                or self.target_week is None
+                or self.expected_plan_revision is None
+            ):
+                raise ValueError(
+                    "revision workflows require amendment and plan snapshot"
                 )
         if self.updated_at < self.created_at:
             raise ValueError("conversation state timestamps are out of order")
@@ -199,6 +244,11 @@ class ConversationState(BaseModel):
             if self.step is not expected_step:
                 raise ValueError("meal workflow step does not match its draft")
         return self
+
+    @property
+    def week_start(self) -> date | None:
+        """Return the revision's target week using plan terminology."""
+        return self.target_week
 
 
 # Short aliases keep the public contract convenient for callers and tests.
@@ -222,6 +272,20 @@ class PlanGenerationContext(BaseModel):
                 "request_id and state_revision must be supplied together"
             )
         return self
+
+
+class PlanRevisionContext(BaseModel):
+    """Validated context carried by an asynchronous draft revision event."""
+
+    amendment: PlanInstruction
+    request_id: RequestId
+    state_revision: int = Field(ge=0)
+    expected_plan_revision: int = Field(ge=0)
+    week_start: date
+
+
+# Keep the event-oriented name available to callers that prefer explicitness.
+RevisionEventContext = PlanRevisionContext
 
 
 class LLMResponseMetadata(BaseModel):
@@ -351,6 +415,9 @@ class WeeklyPlan(BaseModel):
     days: list[PlanDay]
     grocery_status: GroceryStatus = GroceryStatus.NOT_REQUESTED
     grocery_list: list[GrocerySection] = Field(default_factory=list)
+    planning_instructions: list[PlanInstruction] = Field(
+        default_factory=list, max_length=20
+    )
 
     model_config = {"populate_by_name": True}
 

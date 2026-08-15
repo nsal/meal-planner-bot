@@ -20,6 +20,7 @@ from meal_planner.models.schemas import (
     MealOutcome,
     PlanDay,
     PlannedMeal,
+    PlanRevisionContext,
     PlanStatus,
     ProfileUpdateEntities,
     UserProfile,
@@ -269,6 +270,75 @@ def test_weekly_plan_revision_defaults_and_round_trips() -> None:
     assert plan.revision == 0
     restored = WeeklyPlan.model_validate_json(plan.model_dump_json())
     assert restored.revision == 0
+    assert restored.planning_instructions == []
+
+
+def test_weekly_plan_planning_instructions_are_bounded() -> None:
+    days = [PlanDay(day=day) for day in range(1, 8)]
+    plan = WeeklyPlan(
+        week_start="2026-08-10",
+        days=days,
+        planning_instructions=["Avoid cauliflower"],
+    )
+    assert plan.planning_instructions == ["Avoid cauliflower"]
+    with pytest.raises(ValidationError):
+        WeeklyPlan(
+            week_start="2026-08-10",
+            days=days,
+            planning_instructions=["x" * 501],
+        )
+    with pytest.raises(ValidationError):
+        WeeklyPlan(
+            week_start="2026-08-10",
+            days=days,
+            planning_instructions=["instruction"] * 21,
+        )
+
+
+def test_plan_revision_state_and_event_require_complete_snapshot() -> None:
+    now = datetime.now(timezone.utc)
+    values = {
+        "workflow_kind": ConversationWorkflowKind.PLAN_REVISION,
+        "step": ConversationWorkflowStep.GENERATING,
+        "amendment": "Avoid cauliflower",
+        "target_week": date(2026, 8, 10),
+        "expected_plan_revision": 4,
+        "request_id": "request-1",
+        "revision": 2,
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": now + timedelta(hours=24),
+    }
+    state = ConversationState(**values)
+    assert state.week_start == date(2026, 8, 10)
+    assert state.step is ConversationWorkflowStep.GENERATING
+    retry = state.model_copy(
+        update={
+            "step": ConversationWorkflowStep.RETRY_READY,
+            "revision": 3,
+            "updated_at": now + timedelta(seconds=1),
+        }
+    )
+    assert retry.step is ConversationWorkflowStep.RETRY_READY
+    with pytest.raises(ValidationError):
+        ConversationState(**{**values, "amendment": None})
+    with pytest.raises(ValidationError):
+        ConversationState(
+            **{**values, "workflow_kind": ConversationWorkflowKind.MEAL_LOG}
+        )
+
+    context = PlanRevisionContext(
+        amendment="Avoid cauliflower",
+        request_id="request-1",
+        state_revision=2,
+        expected_plan_revision=4,
+        week_start="2026-08-10",
+    )
+    assert context.week_start == date(2026, 8, 10)
+    with pytest.raises(ValidationError):
+        PlanRevisionContext.model_validate(
+            {"amendment": "Avoid cauliflower", "request_id": "request-1"}
+        )
 
 
 def test_weekly_plan_rejects_negative_revision() -> None:

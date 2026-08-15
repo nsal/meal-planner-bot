@@ -18,6 +18,7 @@ from meal_planner.llm.prompts import (
     build_conversational_prompt,
     build_grocery_prompt,
     build_plan_prompt,
+    build_plan_revision_prompt,
 )
 
 __all__ = [
@@ -30,6 +31,7 @@ __all__ = [
     "build_conversational_prompt",
     "build_grocery_prompt",
     "build_plan_prompt",
+    "build_plan_revision_prompt",
     "parse_conversational_response",
     "parse_grocery_response",
     "parse_plan_response",

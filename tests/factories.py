@@ -39,6 +39,7 @@ def make_plan(
     revision: int = 0,
     grocery_status: GroceryStatus = GroceryStatus.NOT_REQUESTED,
     outcome: MealOutcome = MealOutcome.UNREPORTED,
+    planning_instructions: list[str] | None = None,
 ) -> WeeklyPlan:
     """Return a complete seven-day plan with one lunch per day."""
     groceries = (
@@ -52,6 +53,7 @@ def make_plan(
         revision=revision,
         grocery_status=grocery_status,
         grocery_list=groceries,
+        planning_instructions=planning_instructions or [],
         days=[
             PlanDay(
                 day=day,

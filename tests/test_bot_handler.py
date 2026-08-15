@@ -2,7 +2,7 @@
 
 import base64
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -11,6 +11,7 @@ from meal_planner.bot_handler import BotHandler, lambda_handler
 from meal_planner.db.dynamo import ActivePlanSnapshot
 from meal_planner.models.schemas import (
     ConversationIntent,
+    ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
     GroceryStatus,
@@ -925,6 +926,72 @@ def test_conversation_replaces_false_success_reply(handler: BotHandler) -> None:
     )
     sent = handler.telegram_api.send_message.call_args.args[1]
     assert sent != "Saved!"
+
+
+def test_draft_revision_starts_one_async_exact_snapshot(
+    handler: BotHandler,
+) -> None:
+    plan = make_plan(week_start=date.today(), revision=4)
+    handler.repo.get_latest_plan.return_value = plan
+
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.REVISE_PLAN,
+        {"amendment": "Avoid cauliflower"},
+        make_profile(),
+    )
+
+    assert result.success
+    assert result.message == "I'm revising your draft now."
+    state = handler.repo.save_conversation_state.call_args.args[1]
+    assert state.workflow_kind is ConversationWorkflowKind.PLAN_REVISION
+    assert state.expected_plan_revision == 4
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload == {
+        "action": "revise_plan",
+        "user_id": "user",
+        "chat_id": 1,
+        "week_start": plan.week_start_date,
+        "amendment": "Avoid cauliflower",
+        "request_id": state.request_id,
+        "state_revision": state.revision,
+        "expected_plan_revision": 4,
+    }
+
+
+def test_revision_workflow_blocks_confirmation_and_new_amendments(
+    handler: BotHandler,
+) -> None:
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REVISION,
+        step=ConversationWorkflowStep.GENERATING,
+        amendment="Avoid cauliflower",
+        target_week=date.today(),
+        expected_plan_revision=0,
+        request_id="revision-1",
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    handler.repo.get_conversation_state.return_value = state
+    route = RouteResult(
+        route_type=RouteType.CONVERSATIONAL,
+        chat_id=1,
+        user_id="user",
+        text="confirm it",
+    )
+
+    handler.handle_conversational(route)
+
+    assert (
+        "still being generated"
+        in (handler.telegram_api.send_message.call_args.args[1])
+    )
+    handler.llm_client.chat_sync.assert_not_called()
 
 
 def test_repeated_conversation_update_passes_same_source_id(
