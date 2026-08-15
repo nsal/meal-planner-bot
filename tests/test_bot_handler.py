@@ -11,6 +11,8 @@ from meal_planner.bot_handler import BotHandler, lambda_handler
 from meal_planner.db.dynamo import ActivePlanSnapshot
 from meal_planner.models.schemas import (
     ConversationIntent,
+    ConversationWorkflowKind,
+    ConversationWorkflowStep,
     GroceryStatus,
     MealOutcome,
     PlanStatus,
@@ -94,16 +96,56 @@ def test_profile_displays_family_name_and_individual_members(
     assert "- Alex (2000 kcal/day)" in message
 
 
-def test_plan_command_invokes_explicit_generation_event(
+def test_plan_command_collects_preference_before_generation(
     handler: BotHandler,
 ) -> None:
     handler.repo.get_profile.return_value = make_profile()
     handler.handle_command(_command("plan"))
+    handler.lambda_client.invoke.assert_not_called()
+    state = handler.repo.save_conversation_state.call_args.args[1]
+    assert state.step.value == "awaiting_preference"
+    assert "preference" in handler.telegram_api.send_message.call_args.args[1]
+
+
+def test_submit_meals_starts_guided_logging_without_active_plan(
+    handler: BotHandler,
+) -> None:
+    """Actual meal logging is independent from planned check-in state."""
+    handler.repo.get_conversation_state.return_value = None
+
+    handler.handle_command(_command("submit_meals"))
+
+    handler.repo.get_active_plan.assert_not_called()
+    saved = handler.repo.save_conversation_state.call_args.args[1]
+    assert saved.workflow_kind is ConversationWorkflowKind.MEAL_LOG
+    assert saved.step is ConversationWorkflowStep.AWAITING_DATE
+    assert "What date" in handler.telegram_api.send_message.call_args.args[1]
+
+
+def test_plan_preference_is_invoked_once_with_request_context(
+    handler: BotHandler,
+) -> None:
+    """The preference reply creates one planner event with stable context."""
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.get_conversation_state.return_value = None
+    handler.handle_command(_command("plan"))
+    state = handler.repo.save_conversation_state.call_args.args[1]
+    handler.repo.get_conversation_state.return_value = state
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="Indian and pasta",
+            raw_update={"update_id": 55},
+        )
+    )
     payload = json.loads(
         handler.lambda_client.invoke.call_args.kwargs["Payload"]
     )
-    assert payload["action"] == "generate_plan"
-    assert payload["week_start"] == date.today().isoformat()
+    assert payload["preference"] == "Indian and pasta"
+    assert payload["request_id"] == state.request_id
+    assert payload["state_revision"] == 1
 
 
 def test_profile_onboarding_accumulates_then_saves(handler: BotHandler) -> None:
@@ -794,7 +836,9 @@ def test_invalid_conversation_update_id_uses_timestamp_fallback(
     handler.repo.get_meal_history.return_value = []
     handler.llm_client.chat_sync.return_value = (
         'Logged.\n```json\n{"intent":"log_meal","entities":'
-        '{"meal_type":"lunch","description":"Soup"}}\n```'
+        '{"date":"'
+        + date.today().isoformat()
+        + '","meal_type":"lunch","description":"Soup"}}\n```'
     )
     route = RouteResult(
         route_type=RouteType.CONVERSATIONAL,
@@ -818,7 +862,9 @@ def test_missing_conversation_update_id_uses_timestamp_fallback(
     handler.repo.get_meal_history.return_value = []
     handler.llm_client.chat_sync.return_value = (
         'Logged.\n```json\n{"intent":"log_meal","entities":'
-        '{"meal_type":"lunch","description":"Soup"}}\n```'
+        '{"date":"'
+        + date.today().isoformat()
+        + '","meal_type":"lunch","description":"Soup"}}\n```'
     )
     route = RouteResult(
         route_type=RouteType.CONVERSATIONAL,

@@ -2,7 +2,8 @@
 
 A Telegram assistant that collects a household nutrition profile, generates a
 seven-day meal plan through LiteLLM, confirms edits, builds groceries
-asynchronously, and records cooked, skipped, or swapped meal outcomes.
+asynchronously, records actual meals, and records cooked, skipped, or swapped
+meal outcomes.
 
 ## Architecture
 
@@ -19,6 +20,25 @@ The bot Lambda authenticates every webhook before parsing it. The planner
 Lambda handles plan generation and grocery finalization outside Telegram's
 webhook deadline. Both functions run on Python 3.14 ARM64 and are built from
 the locked `uv` environment.
+
+## Telegram workflows
+
+- `/submit_meals` starts guided actual-meal logging. It collects a date from
+  today through the previous seven days, a meal type, and a description one
+  at a time. Repeated meals of the same type and date are retained.
+- `/checkin` shows buttons for cooked, skipped, or swapped outcomes on today's
+  confirmed plan. `/submit_meals` does not require an active plan.
+- `/cancel` clears an unfinished meal or plan workflow. Starting `/submit_meals`
+  or `/plan` replaces an older unfinished workflow.
+- `/plan` asks for a request-specific preference before starting asynchronous
+  generation. `no preference` and `anything` remove the extra constraint; the
+  saved family profile is never changed. A failed request retains the
+  preference so `/plan` can retry it.
+
+Conversation state is stored in the user's `CONVERSATION_STATE` DynamoDB item
+with a 24-hour expiry, revision checks, and Telegram update idempotency. The
+state is treated as expired immediately even if DynamoDB's TTL cleanup has not
+run yet.
 
 ## Prerequisites
 
@@ -63,10 +83,10 @@ Local development reads these variables from the environment or an ignored
 | `BOT_LLM_MAX_RETRIES` | `2` | Bot transient LLM attempts |
 | `BOT_LLM_INITIAL_BACKOFF_SECONDS` | `1` | Bot initial retry backoff |
 | `BOT_HANDLER_SAFETY_MARGIN_SECONDS` | `4` | Bot non-provider safety margin |
-| `PLANNER_FUNCTION_TIMEOUT_SECONDS` | `120` | Planner Lambda deadline |
+| `PLANNER_FUNCTION_TIMEOUT_SECONDS` | `180` | Planner Lambda deadline |
 | `PLANNER_TELEGRAM_REQUEST_TIMEOUT_SECONDS` | `10` | Planner Telegram HTTP timeout |
-| `PLANNER_LLM_REQUEST_TIMEOUT_SECONDS` | `20` | Per-attempt Planner LLM timeout |
-| `PLANNER_LLM_MAX_RETRIES` | `3` | Planner transient LLM attempts |
+| `PLANNER_LLM_REQUEST_TIMEOUT_SECONDS` | `45` | Per-attempt Planner LLM timeout |
+| `PLANNER_LLM_MAX_RETRIES` | `2` | Planner total provider attempts |
 | `PLANNER_LLM_INITIAL_BACKOFF_SECONDS` | `1` | Planner initial retry backoff |
 | `PLANNER_HANDLER_SAFETY_MARGIN_SECONDS` | `20` | Planner non-provider safety margin |
 
@@ -84,6 +104,11 @@ The former global timeout and retry variables are ignored for compatibility;
 use the function-specific settings above.
 
 Never commit `.env` or secret values.
+
+Planner generation makes at most two whole-week provider requests. A timeout
+failure is reported separately from invalid structured output; an invalid first
+response receives bounded Pydantic validation feedback on the second request.
+Neither failure persists a partial plan.
 
 The allowlist must contain Telegram's immutable numeric user IDs, not
 usernames or display names. Each approved person can retrieve their numeric
@@ -292,9 +317,10 @@ aws cloudformation delete-stack --stack-name "$STACK_NAME" \
 - Natural-language no-value answers such as `none`, `nothing`, `no allergies`,
   and `no restrictions` are stored as empty categories. They count as answers,
   while omitted fields remain missing until supplied.
-- `/plan` asynchronously generates a complete seven-day draft. The draft is
-  persisted before Telegram delivery; if delivery fails, the draft remains
-  valid and requesting `/plan` again is the recovery path.
+- `/plan` asks for a one-time request preference before asynchronously
+  generating a complete seven-day draft. The draft is persisted before
+  Telegram delivery; failed generation retains the preference for `/plan` to
+  retry.
 - Ask conversationally to edit an existing meal; missing days or meal types
   are rejected rather than silently created.
 - Tell the bot to confirm the draft. Confirmation starts grocery generation.
@@ -306,9 +332,11 @@ aws cloudformation delete-stack --stack-name "$STACK_NAME" \
   previous grocery attempt is in `error`; `pending` and `ready` are not reset.
 - `/grocery` reports `pending`, `ready`, or `error`, and shows ready sections.
 - `/today` shows the active confirmed plan's meals for today.
-- `/submit_meals` sends plan-specific buttons for `cooked`, `skipped`, and
-  `swapped`. Old, draft, expired, malformed, and superseded overlapping-plan
-  callbacks are rejected, even if the older plan still covers today.
+- `/submit_meals` guides actual meal logging, including multiple meals of the
+  same type on one date. `/checkin` sends plan-specific buttons for `cooked`,
+  `skipped`, and `swapped`. Old, draft, expired, malformed, and superseded
+  overlapping-plan callbacks are rejected, even if the older plan still
+  covers today.
 
 Conversational metadata supports `log_meal`, `update_profile`, `edit_plan`,
 `confirm_plan`, `suggestion`, and `chitchat`. Mutations are validated before

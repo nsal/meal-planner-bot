@@ -1,6 +1,6 @@
 """DynamoDB repository integration tests."""
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Generator
 
 import boto3
@@ -10,8 +10,12 @@ from moto import mock_aws
 
 from meal_planner.db.dynamo import DynamoRepository
 from meal_planner.models.schemas import (
+    ConversationState,
+    ConversationWorkflowKind,
+    ConversationWorkflowStep,
     GrocerySection,
     GroceryStatus,
+    MealLogDraft,
     MealLogEntry,
     MealOutcome,
     PlanStatus,
@@ -57,6 +61,34 @@ def test_profile_and_onboarding_draft_round_trip(
     assert repo.get_profile("user") == profile
     repo.delete_profile_draft("user")
     assert repo.get_profile_draft("user") is None
+
+
+def test_conversation_state_round_trip_and_revision_guard(
+    repo: DynamoRepository,
+) -> None:
+    """Conversation state is isolated and stale revisions cannot replace it."""
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+        step=ConversationWorkflowStep.AWAITING_DATE,
+        meal_draft=MealLogDraft(),
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    assert repo.save_conversation_state("user", state)
+    assert repo.get_conversation_state("user") == state
+    newer = state.model_copy(
+        update={"revision": 1, "updated_at": now + timedelta(seconds=1)}
+    )
+    assert repo.transition_conversation_state(
+        "user", newer, expected_revision=state.revision
+    )
+    assert not repo.transition_conversation_state(
+        "user", state, expected_revision=state.revision
+    )
+    assert repo.delete_conversation_state("user", expected_revision=1)
+    assert repo.get_conversation_state("user") is None
 
 
 def _meal(day: int, hour: int, description: str) -> MealLogEntry:

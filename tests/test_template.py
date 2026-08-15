@@ -354,8 +354,8 @@ def test_lambda_build_configuration() -> None:
     planner_variables = resources["PlannerFunction"]["Properties"][
         "Environment"
     ]["Variables"]
-    assert planner_variables["PLANNER_FUNCTION_TIMEOUT_SECONDS"] == "120"
-    assert planner_variables["PLANNER_LLM_MAX_RETRIES"] == "3"
+    assert planner_variables["PLANNER_FUNCTION_TIMEOUT_SECONDS"] == "180"
+    assert planner_variables["PLANNER_LLM_MAX_RETRIES"] == "2"
     for function_variables in (bot_variables, planner_variables):
         assert function_variables["SECRET_REFRESH_TOKEN"] == {
             "Ref": "SecretRefreshToken"

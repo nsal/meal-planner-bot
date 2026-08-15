@@ -2,7 +2,7 @@
 
 import logging
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -11,6 +11,7 @@ from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
 from meal_planner.models.schemas import (
+    ConversationState,
     MealLogEntry,
     MealOutcome,
     PlanStatus,
@@ -84,6 +85,145 @@ class DynamoRepository:
     def delete_profile_draft(self, user_id: str) -> None:
         self.table.delete_item(
             Key={"PK": f"USER#{user_id}", "SK": "PROFILE_DRAFT"}
+        )
+
+    @staticmethod
+    def _conversation_key(user_id: str) -> dict[str, str]:
+        return {"PK": f"USER#{user_id}", "SK": "CONVERSATION_STATE"}
+
+    def get_conversation_state(
+        self, user_id: str, *, now: datetime | None = None
+    ) -> ConversationState | None:
+        """Return non-expired conversation state, if present."""
+        response = self.table.get_item(Key=self._conversation_key(user_id))
+        item = response.get("Item")
+        if not item:
+            return None
+        state = ConversationState.model_validate(self._data(item))
+        current = now or datetime.now(timezone.utc)
+        if state.expires_at <= int(current.timestamp()):
+            try:
+                self.table.delete_item(
+                    Key=self._conversation_key(user_id),
+                    ConditionExpression="#expires_at = :expires_at",
+                    ExpressionAttributeNames={"#expires_at": "expires_at"},
+                    ExpressionAttributeValues={":expires_at": state.expires_at},
+                )
+            except ClientError as exc:
+                if not self._is_conditional_failure(exc):
+                    raise
+            return None
+        return state
+
+    def save_conversation_state(
+        self,
+        user_id: str,
+        state: ConversationState,
+        *,
+        expected_revision: int | None = None,
+    ) -> bool:
+        """Create or replace state only when its revision is current."""
+        item = {
+            **self._conversation_key(user_id),
+            **state.model_dump(mode="json"),
+        }
+        if expected_revision is None:
+            condition = "attribute_not_exists(#pk)"
+            names = {"#pk": "PK"}
+            values: dict[str, Any] = {}
+        else:
+            condition = "#revision = :expected_revision"
+            names = {"#revision": "revision"}
+            values = {":expected_revision": expected_revision}
+        kwargs: dict[str, Any] = {
+            "Item": item,
+            "ConditionExpression": condition,
+            "ExpressionAttributeNames": names,
+        }
+        if values:
+            kwargs["ExpressionAttributeValues"] = values
+        try:
+            self.table.put_item(**kwargs)
+        except ClientError as exc:
+            if self._is_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def transition_conversation_state(
+        self,
+        user_id: str,
+        state: ConversationState,
+        *,
+        expected_revision: int,
+    ) -> bool:
+        """Atomically persist a state transition from one revision."""
+        return self.save_conversation_state(
+            user_id, state, expected_revision=expected_revision
+        )
+
+    def delete_conversation_state(
+        self, user_id: str, *, expected_revision: int | None = None
+    ) -> bool:
+        """Delete state conditionally, preventing stale workflow cleanup."""
+        kwargs: dict[str, Any] = {"Key": self._conversation_key(user_id)}
+        if expected_revision is not None:
+            kwargs.update(
+                {
+                    "ConditionExpression": "#revision = :revision",
+                    "ExpressionAttributeNames": {"#revision": "revision"},
+                    "ExpressionAttributeValues": {
+                        ":revision": expected_revision
+                    },
+                }
+            )
+        try:
+            self.table.delete_item(**kwargs)
+        except ClientError as exc:
+            if self._is_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def clear_conversation_state_if_matches(
+        self,
+        user_id: str,
+        *,
+        request_id: str,
+        expected_revision: int,
+    ) -> bool:
+        """Clear only the planner request that produced a persisted draft."""
+        try:
+            self.table.delete_item(
+                Key=self._conversation_key(user_id),
+                ConditionExpression=(
+                    "#revision = :revision AND #request_id = :request_id"
+                ),
+                ExpressionAttributeNames={
+                    "#revision": "revision",
+                    "#request_id": "request_id",
+                },
+                ExpressionAttributeValues={
+                    ":revision": expected_revision,
+                    ":request_id": request_id,
+                },
+            )
+        except ClientError as exc:
+            if self._is_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def mark_conversation_retry_ready(
+        self,
+        user_id: str,
+        state: ConversationState,
+        *,
+        expected_revision: int,
+    ) -> bool:
+        """Move a matching planner request into recoverable retry state."""
+        return self.save_conversation_state(
+            user_id, state, expected_revision=expected_revision
         )
 
     def log_meal(

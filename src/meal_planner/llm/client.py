@@ -17,6 +17,26 @@ FALLBACK_MESSAGE = (
 )
 
 
+class LLMFailure(RuntimeError):
+    """Base class for failures that strict callers must classify."""
+
+
+class LLMTimeoutError(LLMFailure):
+    """The provider request exceeded its transport timeout."""
+
+
+class LLMTransientError(LLMFailure):
+    """The provider returned a retryable transport or service failure."""
+
+
+class LLMPermanentError(LLMFailure):
+    """The provider rejected the request permanently."""
+
+
+class LLMResponseFormatError(LLMFailure):
+    """The provider response was not a JSON object."""
+
+
 class LLMClient:
     """Wrapper around LiteLLM for text and structured JSON completion."""
 
@@ -46,6 +66,13 @@ class LLMClient:
             return True
         status = getattr(exc, "status_code", None)
         return status in {408, 409, 429, 500, 502, 503, 504}
+
+    @staticmethod
+    def _is_timeout(exc: Exception) -> bool:
+        """Recognize native and provider-specific timeout exceptions."""
+        if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+            return True
+        return "timeout" in type(exc).__name__.casefold()
 
     @staticmethod
     def _retry_after_from_headers(headers: object) -> float | None:
@@ -154,6 +181,69 @@ class LLMClient:
                 await asyncio.sleep(self._retry_delay(exc, attempt))
         return None
 
+    async def _execute_strict_once(
+        self,
+        messages: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        """Make exactly one JSON request and retain its failure category."""
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "timeout": self.request_timeout,
+            "max_retries": 0,
+            "reasoning_effort": self.reasoning_effort,
+            "response_format": {"type": "json_object"},
+        }
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        try:
+            response = await litellm.acompletion(**kwargs)
+        except Exception as exc:
+            if self._is_timeout(exc):
+                raise LLMTimeoutError(str(exc)) from exc
+            if self._is_transient(exc):
+                raise LLMTransientError(str(exc)) from exc
+            raise LLMPermanentError(str(exc)) from exc
+
+        choices = getattr(response, "choices", [])
+        if not choices:
+            raise LLMResponseFormatError("provider returned no choices")
+        first = choices[0]
+        if isinstance(first, dict):
+            message = first.get("message", {})
+            content = (
+                message.get("content", "") if isinstance(message, dict) else ""
+            )
+        else:
+            message = getattr(first, "message", None)
+            content = (
+                message.get("content", "")
+                if isinstance(message, dict)
+                else getattr(message, "content", "")
+            )
+        if not isinstance(content, str) or not content.strip():
+            raise LLMResponseFormatError("provider returned empty content")
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise LLMResponseFormatError(
+                "provider returned invalid JSON"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise LLMResponseFormatError("provider JSON was not an object")
+        return parsed
+
+    async def chat_json_strict(
+        self, system_prompt: str, user_message: str
+    ) -> dict[str, Any]:
+        """Return one structured response or a typed, uncensored failure."""
+        return await self._execute_strict_once(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ]
+        )
+
     async def chat(self, system_prompt: str, user_message: str) -> str:
         """Send chat prompt and return text response."""
         messages = [
@@ -215,6 +305,18 @@ class LLMClient:
         try:
             return loop.run_until_complete(
                 self.chat_json(system_prompt, user_message)
+            )
+        finally:
+            loop.close()
+
+    def chat_json_strict_sync(
+        self, system_prompt: str, user_message: str
+    ) -> dict[str, Any]:
+        """Synchronous wrapper for one strict structured request."""
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                self.chat_json_strict(system_prompt, user_message)
             )
         finally:
             loop.close()

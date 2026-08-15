@@ -1,8 +1,10 @@
 """Prompt builders and templates for LLM context assembly."""
 
+from datetime import date
 from typing import Optional
 
 from meal_planner.models.schemas import (
+    ConversationState,
     MealLogEntry,
     MealOutcome,
     ProfileUpdateEntities,
@@ -16,6 +18,8 @@ def build_conversational_prompt(
     profile_draft: Optional[ProfileUpdateEntities] = None,
     current_plan: Optional[WeeklyPlan] = None,
     recent_meals: Optional[list[MealLogEntry]] = None,
+    conversation_state: Optional[ConversationState] = None,
+    current_date: date | None = None,
 ) -> str:
     """Build conversational system prompt with user context."""
     profile_text = "No user profile established yet."
@@ -97,6 +101,23 @@ def build_conversational_prompt(
         ]
         history_text = "\n".join(history_lines)
 
+    workflow_text = "No pending workflow."
+    if conversation_state:
+        workflow_text = (
+            f"Workflow: {conversation_state.workflow_kind.value}\n"
+            f"Step: {conversation_state.step.value}"
+        )
+        if conversation_state.meal_draft:
+            draft = conversation_state.meal_draft
+            workflow_text += (
+                "\nPending meal fields (unknown values are omitted):"
+                f"\ndate: {draft.date.isoformat() if draft.date else 'missing'}"
+                "\nmeal_type: "
+                f"{draft.meal_type.value if draft.meal_type else 'missing'}"
+                f"\ndescription: {draft.description or 'missing'}"
+            )
+    today_text = (current_date or date.today()).isoformat()
+
     return (
         "You are an intelligent family meal planning assistant.\n\n"
         "=== USER CONTEXT ===\n"
@@ -104,6 +125,7 @@ def build_conversational_prompt(
         f"--- Pending Profile Updates ---\n{pending_profile_text}\n\n"
         f"--- Current Plan ---\n{plan_text}\n\n"
         f"--- Recent Meal History ---\n{history_text}\n\n"
+        f"--- Pending Workflow ---\n{workflow_text}\n"
         "=== INSTRUCTIONS ===\n"
         "1. Respond conversationally to the user's message.\n"
         "2. At the end of your response, append a JSON block "
@@ -118,7 +140,11 @@ def build_conversational_prompt(
         "calorie_target, plus allergies, dietary_preferences, restrictions, "
         "and goals. Never use an individual member's name as the family "
         "name unless the user explicitly provides it. Meal dates must use "
-        "YYYY-MM-DD.\n"
+        "YYYY-MM-DD. Today's date is "
+        f"{today_text}. For a pending meal workflow, extract only fields "
+        "explicitly present in the user's message; never invent a date, "
+        "meal type, or description. Valid meal types are breakfast, lunch, "
+        "dinner, and snack.\n"
     )
 
 
@@ -127,6 +153,7 @@ def build_plan_prompt(
     meal_history: Optional[list[MealLogEntry]] = None,
     previous_plan: Optional[WeeklyPlan] = None,
     week_start: str = "2026-08-10",
+    preference: str | None = None,
 ) -> str:
     """Build 7-day meal plan generation prompt."""
     profile_text = "General profile (2000 kcal/day target, 1 person)."
@@ -186,6 +213,11 @@ def build_plan_prompt(
         f"Week Start Date: {week_start}\n"
         "Include at most four meals per day.\n"
         f"Profile & Constraints:\n{profile_text}\n\n"
+        "=== REQUEST-SPECIFIC PREFERENCE (HIGH PRIORITY) ===\n"
+        f"{preference.strip() if preference else 'No additional preference.'}\n"
+        "Use this request preference when compatible with the permanent "
+        "profile constraints below. Allergies, restrictions, calorie "
+        "targets, and safety requirements always take precedence.\n\n"
         f"Recent Meal History (avoid repeating):\n{history_text}\n\n"
         f"Previous Plan Feedback:\n{prev_plan_text}\n\n"
         "=== OUTPUT JSON SCHEMA ===\n"
