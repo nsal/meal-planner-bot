@@ -1114,6 +1114,13 @@ class BotHandler:
         source_update_id: str | None = None,
     ) -> MutationResult:
         """Start one asynchronous replacement of the eligible draft."""
+        if (
+            source_update_id is not None
+            and self.repo.has_plan_revision_update_marker(
+                user_id, source_update_id
+            )
+        ):
+            return MutationResult(True, "I'm revising your draft now.")
         amendment = entities.get("amendment")
         if not isinstance(amendment, str) or not amendment.strip():
             return MutationResult(

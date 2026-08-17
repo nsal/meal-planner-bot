@@ -273,6 +273,39 @@ def test_revision_conflict_clears_and_reports_only_current_owner(
     assert "discarded the stale result" in api.send_message.call_args.args[1]
 
 
+def test_revision_conflict_cleanup_failure_retains_retry_state(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(week_start=week, revision=5)
+    repo.get_conversation_state.return_value = state
+    repo.clear_conversation_state_if_matches.side_effect = RuntimeError(
+        "delete failed"
+    )
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+
+    PlannerHandler(repo, api).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment="Avoid cauliflower",
+            request_id="revision-1",
+            state_revision=0,
+            expected_plan_revision=4,
+            week_start=week,
+        ),
+    )
+
+    retry_state = repo.mark_conversation_retry_ready.call_args.args[1]
+    assert retry_state.step is ConversationWorkflowStep.RETRY_READY
+    assert retry_state.revision == state.revision + 1
+    assert "reply retry" in api.send_message.call_args.args[1]
+
+
 def test_duplicate_revision_worker_suppresses_losing_conflict_message(
     mocker: Any,
 ) -> None:

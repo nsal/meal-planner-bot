@@ -624,27 +624,18 @@ class PlannerHandler:
         message: str,
     ) -> bool:
         """Clear and report a stale revision only while it still owns state."""
-        try:
-            state = self.repo.get_conversation_state(
-                user_id, consistent_read=True
-            )
-            if not self._revision_state_matches(state, context):
-                logger.info(
-                    "Suppressed stale revision conflict for request %s",
-                    context.request_id,
-                )
-                return False
-            cleared = self.repo.clear_conversation_state_if_matches(
-                user_id,
-                request_id=context.request_id,
-                expected_revision=context.state_revision,
-            )
-        except Exception:
-            logger.exception(
-                "Could not resolve stale revision request %s",
+        state = self.repo.get_conversation_state(user_id, consistent_read=True)
+        if not self._revision_state_matches(state, context):
+            logger.info(
+                "Suppressed stale revision conflict for request %s",
                 context.request_id,
             )
             return False
+        cleared = self.repo.clear_conversation_state_if_matches(
+            user_id,
+            request_id=context.request_id,
+            expected_revision=context.state_revision,
+        )
         if not cleared:
             logger.info(
                 "Suppressed stale revision conflict after ownership loss "

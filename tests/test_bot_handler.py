@@ -967,6 +967,7 @@ def test_draft_revision_passes_normalized_source_update_id_to_repository(
 ) -> None:
     plan = make_plan(week_start=date.today(), revision=4)
     handler.repo.get_latest_plan.return_value = plan
+    handler.repo.has_plan_revision_update_marker.return_value = False
     handler.repo.start_plan_revision.return_value = True
 
     result = handler._apply_intent_metadata(
@@ -990,10 +991,6 @@ def test_draft_revision_passes_normalized_source_update_id_to_repository(
 def test_duplicate_revision_update_does_not_invoke_planner(
     handler: BotHandler,
 ) -> None:
-    handler.repo.get_latest_plan.return_value = make_plan(
-        week_start=date.today(), revision=4
-    )
-    handler.repo.start_plan_revision.return_value = False
     handler.repo.has_plan_revision_update_marker.return_value = True
 
     result = handler._apply_intent_metadata(
@@ -1007,6 +1004,8 @@ def test_duplicate_revision_update_does_not_invoke_planner(
 
     assert result.success
     assert result.message == "I'm revising your draft now."
+    handler.repo.get_latest_plan.assert_not_called()
+    handler.repo.start_plan_revision.assert_not_called()
     handler.lambda_client.invoke.assert_not_called()
 
 
