@@ -309,7 +309,7 @@ replacement or snapshot conflict
 - [x] Update `AGENTS.md` only if a reusable project convention is introduced.
 - [x] Confirm every implementation and verification checkbox is complete.
 - [x] Move this plan to `docs/plans/completed/`.
-- [ ] Comment on the associated GitHub issue with the Conventional Commit or PR
+- [x] Comment on the associated GitHub issue with the Conventional Commit or PR
   link and a concise summary of the completed work.
 
 ## Post-Completion
