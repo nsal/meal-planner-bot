@@ -309,7 +309,7 @@ class BotHandler:
         )
 
     def _get_conversation_state(self, user_id: str) -> ConversationState | None:
-        state = self.repo.get_conversation_state(user_id)
+        state = self.repo.get_conversation_state(user_id, consistent_read=True)
         return state if isinstance(state, ConversationState) else None
 
     @staticmethod
@@ -837,7 +837,12 @@ class BotHandler:
             if intent is ConversationIntent.EDIT_PLAN:
                 return self._edit_plan(user_id, chat_id, entities)
             if intent is ConversationIntent.REVISE_PLAN:
-                return self._start_plan_revision(user_id, chat_id, entities)
+                return self._start_plan_revision(
+                    user_id,
+                    chat_id,
+                    entities,
+                    source_update_id=source_update_id,
+                )
             return MutationResult(True)
         except (ValidationError, ValueError, TypeError) as exc:
             logger.warning("Rejected conversational mutation: %s", exc)
@@ -1105,6 +1110,8 @@ class BotHandler:
         user_id: str,
         chat_id: int | str,
         entities: dict[str, Any],
+        *,
+        source_update_id: str | None = None,
     ) -> MutationResult:
         """Start one asynchronous replacement of the eligible draft."""
         amendment = entities.get("amendment")
@@ -1142,9 +1149,24 @@ class BotHandler:
             created_at=now,
             updated_at=now,
             expires_at=int((now + timedelta(hours=24)).timestamp()),
-            last_update_id=entities.get("source_update_id"),
+            last_update_id=source_update_id,
         )
-        if not self.repo.save_conversation_state(user_id, state):
+        if source_update_id is None:
+            started = self.repo.save_conversation_state(user_id, state)
+            duplicate = False
+        else:
+            started = self.repo.start_plan_revision(
+                user_id, state, source_update_id=source_update_id
+            )
+            duplicate = (
+                not started
+                and self.repo.has_plan_revision_update_marker(
+                    user_id, source_update_id
+                )
+            )
+        if duplicate:
+            return MutationResult(True, "I'm revising your draft now.")
+        if not started:
             return MutationResult(
                 False,
                 "A draft revision is already in progress. Please wait for "

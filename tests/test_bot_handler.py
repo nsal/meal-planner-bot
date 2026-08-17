@@ -962,6 +962,54 @@ def test_draft_revision_starts_one_async_exact_snapshot(
     }
 
 
+def test_draft_revision_passes_normalized_source_update_id_to_repository(
+    handler: BotHandler,
+) -> None:
+    plan = make_plan(week_start=date.today(), revision=4)
+    handler.repo.get_latest_plan.return_value = plan
+    handler.repo.start_plan_revision.return_value = True
+
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.REVISE_PLAN,
+        {"amendment": "Avoid cauliflower"},
+        make_profile(),
+        source_update_id="42",
+    )
+
+    assert result.success
+    state = handler.repo.start_plan_revision.call_args.args[1]
+    assert state.last_update_id == "42"
+    assert handler.repo.start_plan_revision.call_args.kwargs == {
+        "source_update_id": "42"
+    }
+    handler.repo.save_conversation_state.assert_not_called()
+
+
+def test_duplicate_revision_update_does_not_invoke_planner(
+    handler: BotHandler,
+) -> None:
+    handler.repo.get_latest_plan.return_value = make_plan(
+        week_start=date.today(), revision=4
+    )
+    handler.repo.start_plan_revision.return_value = False
+    handler.repo.has_plan_revision_update_marker.return_value = True
+
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.REVISE_PLAN,
+        {"amendment": "Avoid cauliflower"},
+        make_profile(),
+        source_update_id="42",
+    )
+
+    assert result.success
+    assert result.message == "I'm revising your draft now."
+    handler.lambda_client.invoke.assert_not_called()
+
+
 def test_revision_workflow_blocks_confirmation_and_new_amendments(
     handler: BotHandler,
 ) -> None:

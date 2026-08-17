@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from meal_planner.models.schemas import (
     ConversationState,
+    ConversationWorkflowStep,
     MealLogEntry,
     MealOutcome,
     PlanStatus,
@@ -92,10 +93,17 @@ class DynamoRepository:
         return {"PK": f"USER#{user_id}", "SK": "CONVERSATION_STATE"}
 
     def get_conversation_state(
-        self, user_id: str, *, now: datetime | None = None
+        self,
+        user_id: str,
+        *,
+        now: datetime | None = None,
+        consistent_read: bool = False,
     ) -> ConversationState | None:
         """Return non-expired conversation state, if present."""
-        response = self.table.get_item(Key=self._conversation_key(user_id))
+        get_kwargs: dict[str, Any] = {"Key": self._conversation_key(user_id)}
+        if consistent_read:
+            get_kwargs["ConsistentRead"] = True
+        response = self.table.get_item(**get_kwargs)
         item = response.get("Item")
         if not item:
             return None
@@ -222,9 +230,86 @@ class DynamoRepository:
         expected_revision: int,
     ) -> bool:
         """Move a matching planner request into recoverable retry state."""
-        return self.save_conversation_state(
-            user_id, state, expected_revision=expected_revision
+        try:
+            self.table.put_item(
+                Item={
+                    **self._conversation_key(user_id),
+                    **state.model_dump(mode="json"),
+                },
+                ConditionExpression=(
+                    "#revision = :revision AND #request_id = :request_id "
+                    "AND #step = :generating"
+                ),
+                ExpressionAttributeNames={
+                    "#revision": "revision",
+                    "#request_id": "request_id",
+                    "#step": "step",
+                },
+                ExpressionAttributeValues={
+                    ":revision": expected_revision,
+                    ":request_id": state.request_id,
+                    ":generating": ConversationWorkflowStep.GENERATING.value,
+                },
+            )
+        except ClientError as exc:
+            if self._is_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def start_plan_revision(
+        self,
+        user_id: str,
+        state: ConversationState,
+        *,
+        source_update_id: str,
+    ) -> bool:
+        """Atomically create a revision lock and its Telegram marker."""
+        state_item = {
+            **self._conversation_key(user_id),
+            **state.model_dump(mode="json"),
+        }
+        marker_item = {
+            "PK": f"USER#{user_id}",
+            "SK": f"PLAN_REVISION_UPDATE#{source_update_id}",
+        }
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": state_item,
+                            "ConditionExpression": "attribute_not_exists(PK)",
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": marker_item,
+                            "ConditionExpression": "attribute_not_exists(PK)",
+                        }
+                    },
+                ]
+            )
+        except ClientError as exc:
+            if self._is_transaction_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def has_plan_revision_update_marker(
+        self, user_id: str, source_update_id: str
+    ) -> bool:
+        """Return whether a Telegram update already started a revision."""
+        response = self.table.get_item(
+            Key={
+                "PK": f"USER#{user_id}",
+                "SK": f"PLAN_REVISION_UPDATE#{source_update_id}",
+            },
+            ConsistentRead=True,
         )
+        return bool(response.get("Item"))
 
     def log_meal(
         self,

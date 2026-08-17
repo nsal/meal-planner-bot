@@ -37,7 +37,7 @@ from meal_planner.models.schemas import (
     PlanStatus,
     WeeklyPlan,
 )
-from meal_planner.telegram.api import TelegramAPI, TelegramAPIError
+from meal_planner.telegram.api import TelegramAPI
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +118,9 @@ class PlannerHandler:
                 )
                 return
             if request_id and state_revision is not None:
-                current_state = self.repo.get_conversation_state(user_id)
+                current_state = self.repo.get_conversation_state(
+                    user_id, consistent_read=True
+                )
                 if not self._request_matches(
                     current_state, request_id, state_revision
                 ):
@@ -338,12 +340,21 @@ class PlannerHandler:
         *,
         request_id: str | None,
         state_revision: int | None,
-    ) -> None:
+    ) -> bool | None:
         if not request_id or state_revision is None:
-            return
-        state = self.repo.get_conversation_state(user_id)
+            return None
+        try:
+            state = self.repo.get_conversation_state(
+                user_id, consistent_read=True
+            )
+        except Exception:
+            logger.exception(
+                "Could not read state while recovering planner request %s",
+                request_id,
+            )
+            return None
         if not self._request_matches(state, request_id, state_revision):
-            return
+            return False
         assert state is not None
         retry_state = state.model_copy(
             update={
@@ -352,9 +363,22 @@ class PlannerHandler:
                 "updated_at": datetime.now(timezone.utc),
             }
         )
-        self.repo.mark_conversation_retry_ready(
-            user_id, retry_state, expected_revision=state_revision
-        )
+        try:
+            transitioned = self.repo.mark_conversation_retry_ready(
+                user_id, retry_state, expected_revision=state_revision
+            )
+        except Exception:
+            logger.exception(
+                "Could not retain retry state for planner request %s",
+                request_id,
+            )
+            return None
+        if not transitioned:
+            logger.info(
+                "Planner request %s changed before retry recovery", request_id
+            )
+            return False
+        return True
 
     def finalize_grocery(
         self, user_id: str, chat_id: int | str, week_start: str
@@ -444,49 +468,51 @@ class PlannerHandler:
             plan = self.repo.get_plan(
                 user_id, context.week_start, consistent_read=True
             )
-            state = self.repo.get_conversation_state(user_id)
+            state = self.repo.get_conversation_state(
+                user_id, consistent_read=True
+            )
             if not self._revision_state_matches(state, context):
                 logger.info(
                     "Discarded stale plan revision %s", context.request_id
                 )
                 return
             if not profile:
-                self._notify_failure(
+                self._resolve_revision_conflict(
+                    user_id,
                     chat_id,
+                    context,
                     "I couldn't revise the draft because your profile is "
                     "missing. Use /plan to create a new draft.",
                 )
                 return
             if not plan:
-                self._notify_failure(
+                self._resolve_revision_conflict(
+                    user_id,
                     chat_id,
+                    context,
                     "That draft is no longer available. Use /plan to create a "
                     "new draft.",
                 )
-                self.repo.clear_conversation_state_if_matches(
-                    user_id,
-                    request_id=context.request_id,
-                    expected_revision=context.state_revision,
-                )
                 return
             if not self._revision_request_matches(state, context, plan):
-                logger.info(
-                    "Discarded stale plan revision %s", context.request_id
+                self._resolve_revision_conflict(
+                    user_id,
+                    chat_id,
+                    context,
+                    "The draft changed while I was revising it, so I "
+                    "discarded the stale result.",
                 )
                 return
             if (
                 plan.status is not PlanStatus.DRAFT
                 or plan.week_end < date.today()
             ):
-                self._notify_failure(
+                self._resolve_revision_conflict(
+                    user_id,
                     chat_id,
+                    context,
                     "That draft is no longer eligible for revision. Use /plan "
                     "to create a new draft.",
-                )
-                self.repo.clear_conversation_state_if_matches(
-                    user_id,
-                    request_id=context.request_id,
-                    expected_revision=context.state_revision,
                 )
                 return
             client = self.llm_client or LLMClient()
@@ -529,10 +555,12 @@ class PlannerHandler:
                 expected_state_revision=context.state_revision,
             )
             if not published:
-                self._notify_failure(
+                self._resolve_revision_conflict(
+                    user_id,
                     chat_id,
-                    "The draft changed while I was revising it, so I discarded "
-                    "the stale result.",
+                    context,
+                    "The draft changed while I was revising it, so I "
+                    "discarded the stale result.",
                 )
                 return
         except Exception as exc:
@@ -542,6 +570,18 @@ class PlannerHandler:
                 context.week_start,
                 exc,
             )
+            recovered = self._retain_retry_state(
+                user_id,
+                request_id=context.request_id,
+                state_revision=context.state_revision,
+            )
+            if recovered is False:
+                logger.info(
+                    "Suppressed failure for planner request %s after "
+                    "ownership loss",
+                    context.request_id,
+                )
+                return
             self._notify_failure(
                 chat_id,
                 "I couldn't revise the draft. Your original draft is "
@@ -576,6 +616,45 @@ class PlannerHandler:
             and plan.revision == context.expected_plan_revision
         )
 
+    def _resolve_revision_conflict(
+        self,
+        user_id: str,
+        chat_id: int | str,
+        context: PlanRevisionContext,
+        message: str,
+    ) -> bool:
+        """Clear and report a stale revision only while it still owns state."""
+        try:
+            state = self.repo.get_conversation_state(
+                user_id, consistent_read=True
+            )
+            if not self._revision_state_matches(state, context):
+                logger.info(
+                    "Suppressed stale revision conflict for request %s",
+                    context.request_id,
+                )
+                return False
+            cleared = self.repo.clear_conversation_state_if_matches(
+                user_id,
+                request_id=context.request_id,
+                expected_revision=context.state_revision,
+            )
+        except Exception:
+            logger.exception(
+                "Could not resolve stale revision request %s",
+                context.request_id,
+            )
+            return False
+        if not cleared:
+            logger.info(
+                "Suppressed stale revision conflict after ownership loss "
+                "for request %s",
+                context.request_id,
+            )
+            return False
+        self._notify_failure(chat_id, message)
+        return True
+
     @staticmethod
     def _revision_state_matches(
         state: ConversationState | None,
@@ -595,8 +674,8 @@ class PlannerHandler:
     def _notify_failure(self, chat_id: int | str, message: str) -> None:
         try:
             self.telegram_api.send_message(chat_id, message)
-        except TelegramAPIError:
-            logger.error("Could not deliver planner failure notification")
+        except Exception:
+            logger.exception("Could not deliver planner failure notification")
 
     def handle_event(self, event: dict[str, Any]) -> bool:
         """Dispatch a validated asynchronous planner event."""
