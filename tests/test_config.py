@@ -17,6 +17,10 @@ def test_config_loading_valid_env(mock_env: None) -> None:
     assert settings.planner_llm_model == "gpt-5.6-luna"
     assert settings.planner_llm_reasoning_effort == "high"
     assert settings.planner_function_timeout_seconds == 300.0
+    assert settings.planner_llm_request_timeout_seconds == 240.0
+    assert settings.planner_llm_max_retries == 1
+    assert settings.planner_grocery_llm_request_timeout_seconds == 120.0
+    assert settings.planner_grocery_llm_max_retries == 2
     assert settings.dynamodb_table_name == "test-meal-planner"
     assert settings.aws_region == "us-east-1"
     assert settings.telegram_allowed_user_ids == frozenset({"1", "2"})
@@ -77,6 +81,51 @@ def test_config_allows_explicit_planner_overrides(
     assert settings.planner_llm_model == "custom-planner"
     assert settings.planner_llm_reasoning_effort == "xhigh"
     assert settings.planner_function_timeout_seconds == 301.0
+
+
+def test_config_allows_single_long_running_planner_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 240-second Planner request fits the application deadline once."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token123")
+    monkeypatch.setenv("LLM_API_KEY", "key123")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "123")
+    monkeypatch.setenv("PLANNER_LLM_REQUEST_TIMEOUT_SECONDS", "240")
+    monkeypatch.setenv("PLANNER_LLM_MAX_RETRIES", "1")
+
+    settings = Settings()
+
+    assert settings.planner_llm_request_timeout_seconds == 240.0
+    assert settings.planner_llm_max_retries == 1
+
+
+def test_config_rejects_planner_budget_over_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long Planner timeout cannot be combined with two attempts."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token123")
+    monkeypatch.setenv("LLM_API_KEY", "key123")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "123")
+    monkeypatch.setenv("PLANNER_LLM_REQUEST_TIMEOUT_SECONDS", "240")
+    monkeypatch.setenv("PLANNER_LLM_MAX_RETRIES", "2")
+
+    with pytest.raises(ValidationError, match="Planner external-call budget"):
+        Settings()
+
+
+def test_config_rejects_grocery_budget_over_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The independent grocery retry budget must fit the deadline."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token123")
+    monkeypatch.setenv("LLM_API_KEY", "key123")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "123")
+    monkeypatch.setenv("PLANNER_FUNCTION_TIMEOUT_SECONDS", "282")
+    monkeypatch.setenv("PLANNER_LLM_REQUEST_TIMEOUT_SECONDS", "230")
+    monkeypatch.setenv("PLANNER_GROCERY_LLM_REQUEST_TIMEOUT_SECONDS", "125")
+
+    with pytest.raises(ValidationError, match="Planner external-call budget"):
+        Settings()
 
 
 def test_config_rejects_planner_deadline_below_external_call_budget(

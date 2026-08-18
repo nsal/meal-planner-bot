@@ -94,22 +94,29 @@ Local development reads these variables from the environment or an ignored
 | `BOT_HANDLER_SAFETY_MARGIN_SECONDS` | `4` | Bot non-provider safety margin |
 | `PLANNER_FUNCTION_TIMEOUT_SECONDS` | `300` | Planner application deadline |
 | `PLANNER_TELEGRAM_REQUEST_TIMEOUT_SECONDS` | `10` | Planner Telegram HTTP timeout |
-| `PLANNER_LLM_REQUEST_TIMEOUT_SECONDS` | `45` | Per-attempt Planner LLM timeout |
-| `PLANNER_LLM_MAX_RETRIES` | `2` | Planner total provider attempts |
+| `PLANNER_LLM_REQUEST_TIMEOUT_SECONDS` | `240` | Whole-plan Planner provider request timeout |
+| `PLANNER_LLM_MAX_RETRIES` | `1` | Total whole-plan Planner provider attempts; manual `/plan` retries remain available |
 | `PLANNER_LLM_INITIAL_BACKOFF_SECONDS` | `1` | Planner initial retry backoff |
+| `PLANNER_GROCERY_LLM_REQUEST_TIMEOUT_SECONDS` | `120` | Per-attempt grocery provider timeout |
+| `PLANNER_GROCERY_LLM_MAX_RETRIES` | `2` | Total grocery provider attempts |
 | `PLANNER_HANDLER_SAFETY_MARGIN_SECONDS` | `20` | Planner non-provider safety margin |
 
 The settings validator includes every LLM attempt, the maximum bounded retry
 wait (5 seconds per retry), each sequential Telegram allowance, and a handler
 safety margin. Each function's worst-case budget must fit its configured
 deadline; the Planner now has a five-minute (300-second) application deadline
-while retaining its 45-second request timeout and two provider attempts. Its
-Lambda timeout is 310 seconds, reserving ten seconds for the application to
-return after the planner deadline. The application retry loop is the sole LLM
-retry layer; provider adapter retries are disabled so the configured attempts
-and backoff remain within that deadline. The Bot budget remains below the
-30-second HTTP API integration limit. Lambda itself permits up to 900 seconds,
-but that larger service limit cannot extend
+while using one 240-second whole-plan provider attempt. The configured Planner
+budget is 280 seconds: 240 seconds for LiteLLM, two sequential 10-second
+Telegram allowances, and a 20-second safety margin. Its Lambda timeout is 310
+seconds, reserving ten seconds for the application to return after the
+300-second Planner application deadline. Grocery generation retains two
+120-second provider attempts; including its maximum five-second retry wait,
+one 10-second Telegram allowance, and the 20-second safety margin, its budget
+is 275 seconds. The application retry loop is the sole LLM retry layer;
+provider adapter retries are disabled. If generation fails, the saved
+preference remains available for a manual `/plan` retry. The Bot budget remains
+below the 30-second HTTP API integration limit. Lambda itself permits up to
+900 seconds, but that larger service limit cannot extend
 the synchronous Telegram webhook deadline ([Lambda timeout quota](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html),
 [HTTP API integration quota](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-quotas.html)).
 
@@ -118,10 +125,19 @@ use the function-specific settings above.
 
 Never commit `.env` or secret values.
 
-Planner generation makes at most two whole-week provider requests. A timeout
-failure is reported separately from invalid structured output; an invalid first
-response receives bounded Pydantic validation feedback on the second request.
-Neither failure persists a partial plan.
+Planner generation makes one whole-week provider request. A timeout failure is
+reported separately from invalid structured output, and neither failure
+persists a partial plan. A failed initial generation retains the saved
+preference so the user can retry with `/plan`.
+
+Planner LLM failures produce one sanitized CloudWatch warning per failed typed
+provider attempt. The record includes `attempt`, `elapsed_ms`, `model`, and a
+normalized `category` such as `timeout`, `transient`, `permanent`, or
+`response_format`. A LiteLLM `timeout` category means the 240-second provider
+request ended without a response; a Planner application deadline is the
+separate 300-second in-process guard and returns a planner-deadline response.
+These diagnostics do not include prompts, preferences, generated plans,
+credentials, raw events, chat IDs, or user IDs.
 
 The allowlist must contain Telegram's immutable numeric user IDs, not
 usernames or display names. Each approved person can retrieve their numeric
