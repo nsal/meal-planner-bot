@@ -80,6 +80,45 @@ def test_set_my_commands_validates_before_transport(
     urlopen.assert_not_called()
 
 
+def test_set_and_get_webhook_use_exact_payloads_and_timeout(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=[_response(), BytesIO(b'{"ok": true, "result": {}}')],
+    )
+    api = TelegramAPI("token", request_timeout=3.0)
+
+    api.set_webhook("https://example.test/webhook", "webhook-secret")
+    api.get_webhook_info()
+
+    set_request = urlopen.call_args_list[0].args[0]
+    assert (
+        set_request.full_url == "https://api.telegram.org/bottoken/setWebhook"
+    )
+    assert json.loads(set_request.data.decode()) == {
+        "url": "https://example.test/webhook",
+        "secret_token": "webhook-secret",
+    }
+    get_request = urlopen.call_args_list[1].args[0]
+    assert get_request.full_url == (
+        "https://api.telegram.org/bottoken/getWebhookInfo"
+    )
+    assert urlopen.call_args_list[0].kwargs["timeout"] == 3.0
+
+
+@pytest.mark.parametrize("url, secret", [("", "secret"), ("url", "")])
+def test_set_webhook_rejects_empty_values(
+    url: str, secret: str, mocker: MockerFixture
+) -> None:
+    urlopen = mocker.patch("urllib.request.urlopen")
+
+    with pytest.raises(ValueError):
+        TelegramAPI("token").set_webhook(url, secret)
+
+    urlopen.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "error",
     [

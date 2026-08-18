@@ -133,6 +133,21 @@ class TelegramAPI:
             },
         )
 
+    def set_webhook(self, url: str, secret_token: str) -> dict[str, Any]:
+        """Configure Telegram to deliver updates to the deployed webhook."""
+        if not url.strip():
+            raise ValueError("Webhook URL must not be empty")
+        if not secret_token.strip():
+            raise ValueError("Webhook secret token must not be empty")
+        return self._post(
+            "setWebhook",
+            {"url": url, "secret_token": secret_token},
+        )
+
+    def get_webhook_info(self) -> dict[str, Any]:
+        """Return Telegram's current webhook status."""
+        return self._post("getWebhookInfo", {})
+
     def answer_callback_query(
         self, callback_query_id: str, text: str | None = None
     ) -> dict[str, Any]:

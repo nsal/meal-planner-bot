@@ -1,5 +1,6 @@
 """Planner generation and grocery-finalization workflow tests."""
 
+import signal
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -15,7 +16,12 @@ from meal_planner.models.schemas import (
     PlanRevisionContext,
     PlanStatus,
 )
-from meal_planner.planner_handler import PlannerHandler, lambda_handler
+from meal_planner.planner_handler import (
+    PlannerDeadlineExceeded,
+    PlannerHandler,
+    lambda_handler,
+    planner_deadline,
+)
 from tests.factories import make_plan, make_plan_payload, make_profile
 
 
@@ -827,3 +833,40 @@ def test_lambda_handler_dispatches_and_rejects_invalid_event(
     assert planner_class.call_args.kwargs["max_attempts"] == 2
     planner_class.return_value.handle_event.return_value = False
     assert lambda_handler({}, None)["statusCode"] == 400
+
+
+def test_planner_deadline_raises_when_the_alarm_fires(mocker: Any) -> None:
+    mocker.patch(
+        "meal_planner.planner_handler.signal.getsignal",
+        return_value=signal.SIG_DFL,
+    )
+    set_signal = mocker.patch("meal_planner.planner_handler.signal.signal")
+    set_timer = mocker.patch("meal_planner.planner_handler.signal.setitimer")
+
+    with pytest.raises(PlannerDeadlineExceeded):
+        with planner_deadline(300.0):
+            deadline_handler = set_signal.call_args.args[1]
+            deadline_handler(signal.SIGALRM, None)
+
+    assert set_timer.call_args_list[0].args == (signal.ITIMER_REAL, 300.0)
+    assert set_timer.call_args_list[1].args == (signal.ITIMER_REAL, 0.0)
+    assert set_signal.call_args_list[-1].args == (
+        signal.SIGALRM,
+        signal.SIG_DFL,
+    )
+
+
+def test_lambda_handler_returns_timeout_after_planner_deadline(
+    mocker: Any, mock_env: None
+) -> None:
+    mocker.patch("boto3.resource")
+    deadline = mocker.patch("meal_planner.planner_handler.planner_deadline")
+    planner_class = mocker.patch("meal_planner.planner_handler.PlannerHandler")
+    planner_class.return_value.handle_event.side_effect = (
+        PlannerDeadlineExceeded
+    )
+
+    result = lambda_handler({"user_id": "user", "chat_id": 1}, None)
+
+    assert result == {"statusCode": 504, "body": "planner deadline exceeded"}
+    deadline.assert_called_once_with(300.0)

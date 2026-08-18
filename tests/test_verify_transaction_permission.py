@@ -164,3 +164,31 @@ def test_mismatched_evaluation_resource_returns_nonzero(
 
     assert verifier.main(["--stack-name", STACK_NAME, "--region", REGION]) == 1
     assert "exact table ARN" in capsys.readouterr().err
+
+
+def test_explicit_profile_uses_profile_aware_session(
+    mocker: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clients = _clients()
+    session = mocker.Mock()
+    session.client.side_effect = lambda service_name: clients[service_name]
+    session_factory = mocker.patch.object(verifier.boto3, "Session")
+    session_factory.return_value = session
+
+    assert (
+        verifier.main(
+            [
+                "--stack-name",
+                STACK_NAME,
+                "--region",
+                "eu-west-1",
+                "--profile",
+                "meal-planner",
+            ]
+        )
+        == 0
+    )
+    session_factory.assert_called_once_with(
+        profile_name="meal-planner", region_name="eu-west-1"
+    )
+    assert "explicitly allows" in capsys.readouterr().out
