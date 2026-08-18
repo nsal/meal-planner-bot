@@ -215,19 +215,29 @@ def test_invalid_settings_are_safe(
 
 
 def test_cli_modes_are_independent_and_composable() -> None:
-    assert deploy.parse_args([]).mode is deploy.DeploymentMode.ROUTINE
-    assert deploy.parse_args(["--guided"]).mode is deploy.DeploymentMode.GUIDED
+    assert deploy.parse_args([]).mode == "routine"
+    assert deploy.parse_args(["--guided"]).mode == "guided"
     options = deploy.parse_args(["--guided", "--sync-secrets"])
     assert options.guided is True
     assert options.sync_secrets is True
-    assert (
-        deploy.parse_args(["--post-deploy-only"]).mode
-        is deploy.DeploymentMode.POST_DEPLOY_ONLY
-    )
+    assert deploy.parse_args(["--post-deploy-only"]).mode == "post-deploy-only"
+
+
+def test_post_deploy_only_help_describes_telegram_recovery(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recovery help must not imply standalone IAM verification runs."""
+    with pytest.raises(SystemExit, match="0"):
+        deploy.parse_args(["--post-deploy-only", "--help"])
+
+    help_text = capsys.readouterr().out
+    assert "Recover Telegram configuration only." in help_text
+    assert "verification configuration" not in help_text
 
 
 def test_command_runner_redacts_secret_failures(
     mocker: MockerFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     mocker.patch(
         "subprocess.run",
@@ -253,6 +263,7 @@ def test_command_runner_redacts_secret_failures(
     assert "--beta-features" in message
     assert "bot-secret" not in message
     assert "llm-secret" not in message
+    assert "Command: tool --safe-argument" in capsys.readouterr().out
 
 
 def test_command_runner_bounds_verbose_diagnostics(
@@ -378,12 +389,14 @@ def test_failed_sam_preflight_prevents_deployment() -> None:
     )
 
 
-def test_routine_and_post_deploy_workflows_have_expected_boundaries() -> None:
+def test_routine_and_post_deploy_workflows_have_expected_boundaries(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     settings = _settings()
     runner = FakeRunner()
     FakeTelegram.calls = []
 
-    summary = deploy.run_deployment(
+    deploy.run_deployment(
         settings,
         deploy.DeploymentOptions(),
         runner=runner,
@@ -391,7 +404,6 @@ def test_routine_and_post_deploy_workflows_have_expected_boundaries() -> None:
         api_factory=FakeTelegram,
     )
 
-    assert summary.mode is deploy.DeploymentMode.ROUTINE
     assert FakeTelegram.calls == ["commands", "set-webhook", "get-webhook"]
     command_text = [" ".join(command) for command in runner.commands]
     assert command_text.index(
@@ -447,4 +459,42 @@ def test_routine_and_post_deploy_workflows_have_expected_boundaries() -> None:
     assert "sam build" not in recovery_text
     assert "secretsmanager" not in recovery_text
     assert "ruff" not in recovery_text
-    assert "verify_transaction_permission.py" in recovery_text
+    assert "verify_transaction_permission.py" not in recovery_text
+    output = capsys.readouterr().out
+    assert "7. AWS deployment completed" in output
+    assert "3. Skip secret checks (post-deploy-only)" in output
+    assert "4. Skip SAM validation, build, and deployment" in output
+    assert "9. Register Telegram commands" in output
+    assert "10. Set Telegram webhook" in output
+    assert "11. Verify Telegram webhook" in output
+
+
+def test_telegram_failure_identifies_successful_aws_deployment() -> None:
+    class FailingTelegram(FakeTelegram):
+        def set_webhook(self, url: str, secret_token: str) -> dict[str, Any]:
+            raise deploy.TelegramAPIError("Telegram setWebhook failed")
+
+    with pytest.raises(deploy.PostDeploymentError) as error:
+        deploy.run_deployment(
+            _settings(),
+            deploy.DeploymentOptions(),
+            runner=FakeRunner(),
+            input_fn=lambda _: "yes",
+            api_factory=FailingTelegram,
+        )
+
+    message = str(error.value)
+    assert "AWS deployment completed" in message
+    assert "post-deployment configuration failed" in message
+    assert "--post-deploy-only" in message
+
+
+def test_readme_documents_runner_contract() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    assert "1. Check deployment prerequisites" in readme
+    assert "7. AWS deployment completed" in readme
+    assert "7. Announce AWS deployment completion" not in readme
+    assert "AWS deployment-completed boundary" in readme
+    assert "--post-deploy-only" in readme
+    assert "not part of routine, guided, or recovery deployment" in readme

@@ -4,7 +4,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 from scripts import verify_transaction_permission as verifier
 
@@ -111,7 +111,45 @@ def test_denied_or_malformed_authorization_returns_nonzero(
     _patch_clients(mocker, clients)
 
     assert verifier.main(["--stack-name", STACK_NAME, "--region", REGION]) == 1
-    assert "AWS_ACCESS_KEY_ID" not in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "IAM transaction permission" in error or "malformed" in error
+
+
+def test_botocore_error_returns_safe_type_and_message(
+    mocker: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Non-service AWS failures retain a useful safe diagnostic."""
+    clients = _clients()
+    clients[
+        "cloudformation"
+    ].describe_stacks.side_effect = EndpointConnectionError(
+        endpoint_url="https://example.invalid/AWS_SECRET_ACCESS_KEY"
+    )
+    _patch_clients(mocker, clients)
+
+    assert verifier.main(["--stack-name", STACK_NAME, "--region", REGION]) == 1
+    error = capsys.readouterr().err
+    assert "EndpointConnectionError" in error
+    assert "AWS_SECRET_ACCESS_KEY" not in error
+
+
+def test_botocore_error_redacts_url_userinfo(
+    mocker: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Endpoint diagnostics must not disclose proxy URL credentials."""
+    clients = _clients()
+    clients[
+        "cloudformation"
+    ].describe_stacks.side_effect = EndpointConnectionError(
+        endpoint_url="https://AKIA1234567890ABCDEF:top-secret@example.invalid"
+    )
+    _patch_clients(mocker, clients)
+
+    assert verifier.main(["--stack-name", STACK_NAME, "--region", REGION]) == 1
+    error = capsys.readouterr().err
+    assert "EndpointConnectionError" in error
+    assert "top-secret" not in error
+    assert "[REDACTED]@example.invalid" in error
 
 
 def test_missing_stack_output_returns_nonzero(
@@ -144,7 +182,11 @@ def test_aws_client_error_returns_nonzero(
     _patch_clients(mocker, clients)
 
     assert verifier.main(["--stack-name", STACK_NAME, "--region", REGION]) == 1
-    assert "AWS_ACCESS_KEY_ID" not in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "DescribeStacks" in error
+    assert "AccessDenied" in error
+    assert "[REDACTED]" in error
+    assert "AWS_ACCESS_KEY_ID" not in error
 
 
 def test_mismatched_evaluation_resource_returns_nonzero(

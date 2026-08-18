@@ -15,9 +15,8 @@ import tempfile
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
-from typing import Annotated, Self
+from typing import Annotated, NoReturn, Self
 
 from pydantic import (
     Field,
@@ -55,12 +54,8 @@ class DeploymentConfigurationError(DeploymentError):
     """Deployment settings are absent or invalid."""
 
 
-class DeploymentMode(str, Enum):
-    """Supported deployment workflows."""
-
-    ROUTINE = "routine"
-    GUIDED = "guided"
-    POST_DEPLOY_ONLY = "post-deploy-only"
+class PostDeploymentError(DeploymentError):
+    """A deployment completed but post-deployment configuration failed."""
 
 
 class DeploymentSettings(BaseSettings):
@@ -247,12 +242,12 @@ class DeploymentOptions:
     post_deploy_only: bool = False
 
     @property
-    def mode(self) -> DeploymentMode:
+    def mode(self) -> str:
         if self.post_deploy_only:
-            return DeploymentMode.POST_DEPLOY_ONLY
+            return "post-deploy-only"
         if self.guided:
-            return DeploymentMode.GUIDED
-        return DeploymentMode.ROUTINE
+            return "guided"
+        return "routine"
 
 
 @dataclass(frozen=True)
@@ -342,6 +337,7 @@ class CommandRunner:
         """Run one command and raise a sanitized error on failure."""
         command = tuple(str(argument) for argument in args)
         command_text = _redact(shlex.join(command), sensitive_values)
+        print(f"Command: {command_text}")
         try:
             completed = subprocess.run(
                 list(command),
@@ -396,7 +392,7 @@ def parse_args(argv: Sequence[str] | None = None) -> DeploymentOptions:
     parser.add_argument(
         "--post-deploy-only",
         action="store_true",
-        help="Recover Telegram and verification configuration only.",
+        help="Recover Telegram configuration only.",
     )
     parsed = parser.parse_args(argv)
     return DeploymentOptions(
@@ -419,6 +415,29 @@ def _aws_command(
 def _safe_error(exc: Exception, settings: DeploymentSettings) -> str:
     """Convert an exception to a credential-safe message."""
     return _redact(str(exc), settings.secret_values)
+
+
+def _announce(number: int, title: str) -> None:
+    """Print a stable, human-readable deployment stage heading."""
+    print(f"{number}. {title}")
+
+
+def _post_deployment_message(detail: str) -> str:
+    """Explain the recoverable boundary after SAM deployment succeeds."""
+    return (
+        "AWS deployment completed, but post-deployment configuration failed: "
+        f"{detail}. Rerun `uv run python scripts/deploy.py "
+        "--post-deploy-only` after correcting the issue."
+    )
+
+
+def _raise_post_deployment_error(
+    exc: Exception, settings: DeploymentSettings
+) -> NoReturn:
+    """Raise the recoverable post-deployment form of a stage failure."""
+    raise PostDeploymentError(
+        _post_deployment_message(_safe_error(exc, settings))
+    ) from None
 
 
 def _parse_aws_version(output: str) -> tuple[int, int, int] | None:
@@ -619,29 +638,26 @@ def synchronize_secrets(
 
 
 def run_sam_preflight(
-    runner: CommandRunner, settings: DeploymentSettings
+    runner: CommandRunner,
+    settings: DeploymentSettings,
+    *,
+    stages: Sequence[str] = ("validate", "build"),
 ) -> None:
     """Validate and build the SAM application before deployment."""
     environment = settings.child_environment()
-    commands: tuple[tuple[str, tuple[str, ...]], ...] = (
-        (
-            "validate SAM template",
-            tuple(
-                _aws_sam_command(
-                    settings, "validate", "--lint", output_json=False
-                )
-            ),
-        ),
-        (
-            "build SAM artifacts",
-            tuple(
-                _aws_sam_command(
-                    settings, "build", "--beta-features", output_json=False
-                )
-            ),
-        ),
-    )
-    for stage, command in commands:
+    for command_name in stages:
+        if command_name == "validate":
+            stage = "validate SAM template"
+            command = _aws_sam_command(
+                settings, "validate", "--lint", output_json=False
+            )
+        elif command_name == "build":
+            stage = "build SAM artifacts"
+            command = _aws_sam_command(
+                settings, "build", "--beta-features", output_json=False
+            )
+        else:
+            raise ValueError(f"unsupported SAM preflight stage: {command_name}")
         runner.run(
             command,
             stage=stage,
@@ -777,11 +793,18 @@ def configure_telegram(
     outputs: StackOutputs,
     *,
     api_factory: Callable[[str], TelegramAPI] = TelegramAPI,
+    announce: Callable[[str], None] | None = None,
 ) -> None:
     """Replace the command menu and configure then verify the webhook."""
     api = api_factory(settings.telegram_bot_token)
+    if announce is not None:
+        announce("Register Telegram commands")
     api.set_my_commands(BOT_COMMANDS)
+    if announce is not None:
+        announce("Set Telegram webhook")
     api.set_webhook(outputs.webhook_url, settings.telegram_webhook_secret)
+    if announce is not None:
+        announce("Verify Telegram webhook")
     info = api.get_webhook_info()
     result = info.get("result")
     if not isinstance(result, dict):
@@ -792,39 +815,6 @@ def configure_telegram(
         raise DeploymentError("Telegram webhook reports an error")
 
 
-def verify_transaction_permission(
-    runner: CommandRunner, settings: DeploymentSettings
-) -> None:
-    """Run the read-only transaction authorization verifier."""
-    runner.run(
-        (
-            "uv",
-            "run",
-            "python",
-            "scripts/verify_transaction_permission.py",
-            "--stack-name",
-            settings.stack_name,
-            "--profile",
-            AWS_PROFILE,
-            "--region",
-            AWS_REGION,
-        ),
-        stage="verify DynamoDB transaction permission",
-        env=settings.child_environment(),
-        sensitive_values=settings.secret_values,
-    )
-
-
-@dataclass(frozen=True)
-class DeploymentSummary:
-    """Non-secret result of a completed deployment workflow."""
-
-    mode: DeploymentMode
-    stack_name: str
-    webhook_url: str
-    table_name: str
-
-
 def run_deployment(
     settings: DeploymentSettings,
     options: DeploymentOptions,
@@ -832,36 +822,58 @@ def run_deployment(
     runner: CommandRunner | None = None,
     input_fn: Callable[[str], str] | None = None,
     api_factory: Callable[[str], TelegramAPI] = TelegramAPI,
-) -> DeploymentSummary:
+) -> None:
     """Run the workflow and fail immediately at the first failed stage."""
     command_runner = runner or CommandRunner()
+    _announce(1, "Check deployment prerequisites")
     check_prerequisites(command_runner, settings)
+    _announce(2, "Authenticate with AWS and confirm identity")
     authenticate_and_confirm(command_runner, settings, input_fn=input_fn)
 
     if options.post_deploy_only:
-        outputs = resolve_stack_outputs(command_runner, settings)
+        _announce(3, "Skip secret checks (post-deploy-only)")
+        _announce(4, "Skip SAM validation, build, and deployment")
+        _announce(5, "Resolve CloudFormation stack outputs")
+        try:
+            outputs = resolve_stack_outputs(command_runner, settings)
+        except (CommandExecutionError, DeploymentError) as exc:
+            _raise_post_deployment_error(exc, settings)
     else:
+        _announce(3, "Check configured Secrets Manager secrets")
         synchronize_secrets(
             command_runner, settings, requested=options.sync_secrets
         )
-        run_sam_preflight(command_runner, settings)
+        _announce(4, "Validate SAM template")
+        run_sam_preflight(command_runner, settings, stages=("validate",))
+        _announce(5, "Build SAM artifacts")
+        run_sam_preflight(command_runner, settings, stages=("build",))
+        _announce(6, "Deploy SAM stack")
         deploy_sam(command_runner, settings, guided=options.guided)
-        outputs = resolve_stack_outputs(command_runner, settings)
+        _announce(7, "AWS deployment completed")
+        _announce(8, "Resolve CloudFormation stack outputs")
+        try:
+            outputs = resolve_stack_outputs(command_runner, settings)
+        except (CommandExecutionError, DeploymentError) as exc:
+            _raise_post_deployment_error(exc, settings)
 
     try:
-        configure_telegram(settings, outputs, api_factory=api_factory)
-        verify_transaction_permission(command_runner, settings)
-    except TelegramAPIError as exc:
-        raise DeploymentError(_safe_error(exc, settings)) from None
-    except CommandExecutionError as exc:
-        raise DeploymentError(_safe_error(exc, settings)) from None
+        next_stage = 6 if options.post_deploy_only else 9
 
-    return DeploymentSummary(
-        mode=options.mode,
-        stack_name=settings.stack_name,
-        webhook_url=outputs.webhook_url,
-        table_name=outputs.table_name,
-    )
+        def announce_telegram(title: str) -> None:
+            nonlocal next_stage
+            _announce(next_stage, title)
+            next_stage += 1
+
+        configure_telegram(
+            settings,
+            outputs,
+            api_factory=api_factory,
+            announce=announce_telegram,
+        )
+    except TelegramAPIError as exc:
+        _raise_post_deployment_error(exc, settings)
+    except (CommandExecutionError, DeploymentError) as exc:
+        _raise_post_deployment_error(exc, settings)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -869,7 +881,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         options = parse_args(argv)
         settings = DeploymentSettings.load()
-        summary = run_deployment(settings, options)
+        run_deployment(settings, options)
     except (DeploymentError, TelegramAPIError) as exc:
         print(f"Deployment failed: {exc}", file=sys.stderr)
         return 1
@@ -878,9 +890,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     print(
-        "Deployment complete: "
-        f"mode={summary.mode.value}, stack={summary.stack_name}, "
-        f"webhook={summary.webhook_url}, table={summary.table_name}"
+        f"Deployment complete: mode={options.mode}, stack={settings.stack_name}"
     )
     return 0
 
