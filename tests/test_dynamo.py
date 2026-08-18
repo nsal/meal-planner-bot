@@ -91,6 +91,160 @@ def test_conversation_state_round_trip_and_revision_guard(
     assert repo.get_conversation_state("user") is None
 
 
+def test_conversation_state_read_can_be_strongly_consistent(
+    repo: DynamoRepository, mocker: Any
+) -> None:
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+        step=ConversationWorkflowStep.AWAITING_DATE,
+        meal_draft=MealLogDraft(),
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    get_item = mocker.patch.object(
+        repo.table,
+        "get_item",
+        return_value={
+            "Item": {
+                "PK": "USER#user",
+                "SK": "CONVERSATION_STATE",
+                **state.model_dump(mode="json"),
+            }
+        },
+    )
+
+    assert repo.get_conversation_state("user") == state
+    assert get_item.call_args.kwargs == {
+        "Key": {"PK": "USER#user", "SK": "CONVERSATION_STATE"}
+    }
+    assert repo.get_conversation_state("user", consistent_read=True) == state
+    assert get_item.call_args.kwargs == {
+        "Key": {"PK": "USER#user", "SK": "CONVERSATION_STATE"},
+        "ConsistentRead": True,
+    }
+
+
+def test_revision_start_marker_is_atomic_and_survives_state_cleanup(
+    repo: DynamoRepository,
+) -> None:
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REVISION,
+        step=ConversationWorkflowStep.GENERATING,
+        amendment="Avoid cauliflower",
+        target_week=date.today(),
+        expected_plan_revision=0,
+        request_id="revision-1",
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+
+    assert repo.start_plan_revision("user", state, source_update_id="42")
+    assert repo.has_plan_revision_update_marker("user", "42")
+    assert repo.delete_conversation_state("user", expected_revision=0)
+    assert repo.get_conversation_state("user") is None
+    assert repo.has_plan_revision_update_marker("user", "42")
+    assert not repo.start_plan_revision("user", state, source_update_id="42")
+
+
+def test_revision_start_rolls_back_marker_when_state_condition_fails(
+    repo: DynamoRepository,
+) -> None:
+    now = datetime.now(timezone.utc)
+    existing = ConversationState(
+        workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+        step=ConversationWorkflowStep.AWAITING_DATE,
+        meal_draft=MealLogDraft(),
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    assert repo.save_conversation_state("user", existing)
+    revision = existing.model_copy(
+        update={
+            "workflow_kind": ConversationWorkflowKind.PLAN_REVISION,
+            "step": ConversationWorkflowStep.GENERATING,
+            "amendment": "Avoid cauliflower",
+            "target_week": date.today(),
+            "expected_plan_revision": 0,
+            "request_id": "revision-1",
+        }
+    )
+
+    assert not repo.start_plan_revision("user", revision, source_update_id="42")
+    assert repo.get_conversation_state("user") == existing
+    assert not repo.has_plan_revision_update_marker("user", "42")
+
+
+def test_revision_replacement_and_state_cleanup_are_atomic(
+    repo: DynamoRepository,
+) -> None:
+    plan = make_plan(revision=3, planning_instructions=["Egg breakfasts"])
+    repo.save_plan("user", plan)
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REVISION,
+        step=ConversationWorkflowStep.GENERATING,
+        amendment="Avoid cauliflower",
+        target_week=plan.week_start,
+        expected_plan_revision=plan.revision,
+        request_id="revision-1",
+        revision=0,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    assert repo.save_conversation_state("user", state)
+    replacement = make_plan(
+        week_start=plan.week_start,
+        revision=4,
+        planning_instructions=["Egg breakfasts", "Avoid cauliflower"],
+    )
+
+    assert repo.replace_draft_and_clear_revision_state(
+        "user",
+        replacement,
+        expected_plan_revision=3,
+        request_id="revision-1",
+        expected_state_revision=0,
+    )
+    assert repo.get_plan("user", plan.week_start) == replacement
+    assert repo.get_conversation_state("user") is None
+
+
+def test_revision_replacement_rejects_stale_plan_or_state(
+    repo: DynamoRepository,
+) -> None:
+    plan = make_plan(revision=1)
+    repo.save_plan("user", plan)
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REVISION,
+        step=ConversationWorkflowStep.GENERATING,
+        amendment="Avoid cauliflower",
+        target_week=plan.week_start,
+        expected_plan_revision=1,
+        request_id="revision-1",
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    assert repo.save_conversation_state("user", state)
+    replacement = make_plan(week_start=plan.week_start, revision=2)
+    assert not repo.replace_draft_and_clear_revision_state(
+        "user",
+        replacement,
+        expected_plan_revision=0,
+        request_id="wrong-request",
+        expected_state_revision=0,
+    )
+    assert repo.get_plan("user", plan.week_start) == plan
+    assert repo.get_conversation_state("user") == state
+
+
 def test_replacements_from_one_snapshot_have_one_winner(
     repo: DynamoRepository,
 ) -> None:

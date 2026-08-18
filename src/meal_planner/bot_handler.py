@@ -39,7 +39,11 @@ from meal_planner.models.schemas import (
     UserProfile,
     WeeklyPlan,
 )
-from meal_planner.planner_handler import FINALIZE_GROCERY, GENERATE_PLAN
+from meal_planner.planner_handler import (
+    FINALIZE_GROCERY,
+    GENERATE_PLAN,
+    REVISE_PLAN,
+)
 from meal_planner.router import (
     RouteResult,
     RouteType,
@@ -48,6 +52,7 @@ from meal_planner.router import (
 )
 from meal_planner.telegram.access import TelegramAccessPolicy
 from meal_planner.telegram.api import TelegramAPI, TelegramAPIError
+from meal_planner.telegram.commands import render_help
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +136,7 @@ class BotHandler:
             return
         handlers = {
             "start": self._cmd_start,
+            "help": self._cmd_help,
             "profile": self._cmd_profile,
             "plan": self._cmd_plan,
             "grocery": self._cmd_grocery,
@@ -145,8 +151,12 @@ class BotHandler:
         else:
             self.telegram_api.send_message(
                 route.chat_id,
-                f"Unknown command: /{route.command}. Type /start for options.",
+                f"Unknown command: /{route.command}. Type /help for options.",
             )
+
+    def _cmd_help(self, chat_id: int | str, user_id: str) -> None:
+        """Send the stateless command reference."""
+        self.telegram_api.send_message(chat_id, render_help())
 
     def _cmd_start(self, chat_id: int | str, user_id: str) -> None:
         profile = self.repo.get_profile(user_id)
@@ -305,7 +315,7 @@ class BotHandler:
         )
 
     def _get_conversation_state(self, user_id: str) -> ConversationState | None:
-        state = self.repo.get_conversation_state(user_id)
+        state = self.repo.get_conversation_state(user_id, consistent_read=True)
         return state if isinstance(state, ConversationState) else None
 
     @staticmethod
@@ -445,6 +455,18 @@ class BotHandler:
                     route.text,
                     state,
                     source_update_id=source_update_id,
+                )
+                return
+            if (
+                state
+                and state.workflow_kind
+                is ConversationWorkflowKind.PLAN_REVISION
+            ):
+                self._handle_plan_revision_state(
+                    route.chat_id,
+                    route.user_id,
+                    route.text,
+                    state,
                 )
                 return
             profile = self.repo.get_profile(route.user_id)
@@ -820,6 +842,13 @@ class BotHandler:
                 return self._confirm_plan(user_id, chat_id)
             if intent is ConversationIntent.EDIT_PLAN:
                 return self._edit_plan(user_id, chat_id, entities)
+            if intent is ConversationIntent.REVISE_PLAN:
+                return self._start_plan_revision(
+                    user_id,
+                    chat_id,
+                    entities,
+                    source_update_id=source_update_id,
+                )
             return MutationResult(True)
         except (ValidationError, ValueError, TypeError) as exc:
             logger.warning("Rejected conversational mutation: %s", exc)
@@ -1058,6 +1087,178 @@ class BotHandler:
             )
         return MutationResult(True, "The meal plan was updated.")
 
+    def _handle_plan_revision_state(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        text: str,
+        state: ConversationState,
+    ) -> None:
+        """Route messages while a whole-draft revision owns the workflow."""
+        if state.step is ConversationWorkflowStep.GENERATING:
+            self.telegram_api.send_message(
+                chat_id,
+                "Your draft revision is still being generated. Please wait "
+                "before confirming or requesting another amendment.",
+            )
+            return
+        if text.strip().casefold() == "retry":
+            self._retry_plan_revision(user_id, chat_id, state)
+            return
+        self.telegram_api.send_message(
+            chat_id,
+            "The draft revision failed, but your original draft is unchanged. "
+            "Reply retry to try again or use /cancel.",
+        )
+
+    def _start_plan_revision(
+        self,
+        user_id: str,
+        chat_id: int | str,
+        entities: dict[str, Any],
+        *,
+        source_update_id: str | None = None,
+    ) -> MutationResult:
+        """Start one asynchronous replacement of the eligible draft."""
+        if (
+            source_update_id is not None
+            and self.repo.has_plan_revision_update_marker(
+                user_id, source_update_id
+            )
+        ):
+            return MutationResult(True, "I'm revising your draft now.")
+        amendment = entities.get("amendment")
+        if not isinstance(amendment, str) or not amendment.strip():
+            return MutationResult(
+                False, "Please describe the desired plan change again."
+            )
+        if len(amendment.strip()) > 500:
+            return MutationResult(
+                False,
+                "Please describe the desired plan change in under 500 "
+                "characters.",
+            )
+        plan = self.repo.get_latest_plan(user_id)
+        if not self._is_eligible_draft(plan):
+            return MutationResult(
+                False, "There is no current draft to revise. Use /plan first."
+            )
+        assert plan is not None
+        if len(plan.planning_instructions) >= 20:
+            return MutationResult(
+                False,
+                "This draft has reached its limit for saved amendments. "
+                "Use /plan to create a fresh draft.",
+            )
+        now = datetime.now(timezone.utc)
+        state = ConversationState(
+            workflow_kind=ConversationWorkflowKind.PLAN_REVISION,
+            step=ConversationWorkflowStep.GENERATING,
+            amendment=amendment.strip(),
+            target_week=plan.week_start,
+            expected_plan_revision=plan.revision,
+            request_id=str(uuid4()),
+            revision=0,
+            created_at=now,
+            updated_at=now,
+            expires_at=int((now + timedelta(hours=24)).timestamp()),
+            last_update_id=source_update_id,
+        )
+        if source_update_id is None:
+            started = self.repo.save_conversation_state(user_id, state)
+            duplicate = False
+        else:
+            started = self.repo.start_plan_revision(
+                user_id, state, source_update_id=source_update_id
+            )
+            duplicate = (
+                not started
+                and self.repo.has_plan_revision_update_marker(
+                    user_id, source_update_id
+                )
+            )
+        if duplicate:
+            return MutationResult(True, "I'm revising your draft now.")
+        if not started:
+            return MutationResult(
+                False,
+                "A draft revision is already in progress. Please wait for "
+                "it to finish.",
+            )
+        if not self._invoke_planner(
+            user_id,
+            chat_id,
+            REVISE_PLAN,
+            week_start=plan.week_start_date,
+            amendment=state.amendment,
+            request_id=state.request_id,
+            state_revision=state.revision,
+            expected_plan_revision=plan.revision,
+        ):
+            retry_state = state.model_copy(
+                update={
+                    "step": ConversationWorkflowStep.RETRY_READY,
+                    "revision": state.revision + 1,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
+            self.repo.mark_conversation_retry_ready(
+                user_id, retry_state, expected_revision=state.revision
+            )
+            return MutationResult(
+                False,
+                "I couldn't start the revision. Your original draft is "
+                "unchanged; reply retry or use /cancel.",
+            )
+        return MutationResult(True, "I'm revising your draft now.")
+
+    def _retry_plan_revision(
+        self, user_id: str, chat_id: int | str, state: ConversationState
+    ) -> None:
+        """Retry a failed revision using its persisted request snapshot."""
+        candidate = state.model_copy(
+            update={
+                "step": ConversationWorkflowStep.GENERATING,
+                "revision": state.revision + 1,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+        if not self.repo.transition_conversation_state(
+            user_id, candidate, expected_revision=state.revision
+        ):
+            self.telegram_api.send_message(
+                chat_id, "That revision changed. Please use /plan again."
+            )
+            return
+        assert candidate.target_week is not None
+        if not self._invoke_planner(
+            user_id,
+            chat_id,
+            REVISE_PLAN,
+            week_start=candidate.target_week.isoformat(),
+            amendment=candidate.amendment,
+            request_id=candidate.request_id,
+            state_revision=candidate.revision,
+            expected_plan_revision=candidate.expected_plan_revision,
+        ):
+            retry_state = candidate.model_copy(
+                update={
+                    "step": ConversationWorkflowStep.RETRY_READY,
+                    "revision": candidate.revision + 1,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
+            self.repo.mark_conversation_retry_ready(
+                user_id, retry_state, expected_revision=candidate.revision
+            )
+            self.telegram_api.send_message(
+                chat_id,
+                "I couldn't start the revision. Your original draft is "
+                "unchanged; reply retry or use /cancel.",
+            )
+            return
+        self.telegram_api.send_message(chat_id, "I'm revising your draft now.")
+
     def _invoke_planner(
         self,
         user_id: str,
@@ -1066,8 +1267,10 @@ class BotHandler:
         *,
         week_start: str,
         preference: str | None = None,
+        amendment: str | None = None,
         request_id: str | None = None,
         state_revision: int | None = None,
+        expected_plan_revision: int | None = None,
     ) -> bool:
         if not self.lambda_client or not self.planner_function_name:
             return False
@@ -1084,6 +1287,15 @@ class BotHandler:
                         "preference": preference,
                         "request_id": request_id,
                         "state_revision": state_revision,
+                    }
+                )
+            elif action == REVISE_PLAN:
+                payload.update(
+                    {
+                        "amendment": amendment,
+                        "request_id": request_id,
+                        "state_revision": state_revision,
+                        "expected_plan_revision": expected_plan_revision,
                     }
                 )
             self.lambda_client.invoke(

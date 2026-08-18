@@ -21,21 +21,29 @@ from meal_planner.llm.parser import (
     parse_grocery_response,
     parse_plan_response_with_feedback,
 )
-from meal_planner.llm.prompts import build_grocery_prompt, build_plan_prompt
+from meal_planner.llm.prompts import (
+    build_grocery_prompt,
+    build_plan_prompt,
+    build_plan_revision_prompt,
+)
 from meal_planner.models.schemas import (
     ConversationState,
+    ConversationWorkflowKind,
     ConversationWorkflowStep,
     GroceryStatus,
     MealOutcome,
     PlanGenerationContext,
+    PlanRevisionContext,
     PlanStatus,
+    WeeklyPlan,
 )
-from meal_planner.telegram.api import TelegramAPI, TelegramAPIError
+from meal_planner.telegram.api import TelegramAPI
 
 logger = logging.getLogger(__name__)
 
 GENERATE_PLAN = "generate_plan"
 FINALIZE_GROCERY = "finalize_grocery"
+REVISE_PLAN = "revise_plan"
 
 
 class PlannerHandler:
@@ -110,7 +118,9 @@ class PlannerHandler:
                 )
                 return
             if request_id and state_revision is not None:
-                current_state = self.repo.get_conversation_state(user_id)
+                current_state = self.repo.get_conversation_state(
+                    user_id, consistent_read=True
+                )
                 if not self._request_matches(
                     current_state, request_id, state_revision
                 ):
@@ -124,6 +134,7 @@ class PlannerHandler:
             )
             plan.grocery_status = GroceryStatus.NOT_REQUESTED
             plan.grocery_list = []
+            plan.planning_instructions = [preference] if preference else []
             for plan_day in plan.days:
                 for meal in plan_day.meals:
                     meal.outcome = MealOutcome.UNREPORTED
@@ -177,7 +188,8 @@ class PlannerHandler:
         prompt: str,
         target_week: date,
         chat_id: int | str,
-    ) -> Any:
+        failure_mode: str = "initial",
+    ) -> WeeklyPlan | None:
         """Use the configured number of provider calls for plan generation."""
         repair_feedback: str | None = None
         for attempt in range(self.max_attempts):
@@ -194,8 +206,9 @@ class PlannerHandler:
                 if is_last_attempt:
                     self._notify_failure(
                         chat_id,
-                        "Plan generation timed out. Your preference was saved; "
-                        "use /plan to retry.",
+                        self._generation_failure_message(
+                            failure_mode, "timed out"
+                        ),
                     )
                     return None
                 continue
@@ -203,24 +216,27 @@ class PlannerHandler:
                 if is_last_attempt:
                     self._notify_failure(
                         chat_id,
-                        "The meal-planning service is temporarily unavailable. "
-                        "Your preference was saved; use /plan to retry.",
+                        self._generation_failure_message(
+                            failure_mode, "temporarily unavailable"
+                        ),
                     )
                     return None
                 continue
             except LLMPermanentError:
                 self._notify_failure(
                     chat_id,
-                    "The meal-planning service rejected the request. Your "
-                    "preference was saved; use /plan to retry.",
+                    self._generation_failure_message(
+                        failure_mode, "rejected the request"
+                    ),
                 )
                 return None
             except LLMResponseFormatError, LLMFailure:
                 if is_last_attempt:
                     self._notify_failure(
                         chat_id,
-                        self._invalid_plan_message() + " Your "
-                        "preference was saved; use /plan to retry.",
+                        self._generation_failure_message(
+                            failure_mode, self._invalid_plan_message()
+                        ),
                     )
                     return None
                 repair_feedback = "return one complete JSON plan object"
@@ -231,14 +247,55 @@ class PlannerHandler:
             if is_last_attempt:
                 self._notify_failure(
                     chat_id,
-                    self._invalid_plan_message() + " Your "
-                    "preference was saved; use /plan to retry.",
+                    self._generation_failure_message(
+                        failure_mode, self._invalid_plan_message()
+                    ),
                 )
                 return None
             repair_feedback = (
                 feedback or "week_start_date must match the request"
             )
         return None
+
+    @staticmethod
+    def _generation_failure_message(mode: str, reason: str) -> str:
+        """Return a user-facing failure message for one planner workflow."""
+        if mode == "revision":
+            if reason == "timed out":
+                return (
+                    "Draft revision timed out. Your original draft is "
+                    "unchanged; reply retry or use /cancel."
+                )
+            if reason == "temporarily unavailable":
+                return (
+                    "Draft revision is temporarily unavailable. Your original "
+                    "draft is unchanged; reply retry or use /cancel."
+                )
+            if reason == "rejected the request":
+                return (
+                    "The revision service rejected the request. Your original "
+                    "draft is unchanged; reply retry or use /cancel."
+                )
+            return (
+                f"{reason} Your original draft is unchanged; reply retry or "
+                "use /cancel."
+            )
+        if reason == "timed out":
+            return (
+                "Plan generation timed out. Your preference was saved; use "
+                "/plan to retry."
+            )
+        if reason == "temporarily unavailable":
+            return (
+                "The meal-planning service is temporarily unavailable. Your "
+                "preference was saved; use /plan to retry."
+            )
+        if reason == "rejected the request":
+            return (
+                "The meal-planning service rejected the request. Your "
+                "preference was saved; use /plan to retry."
+            )
+        return f"{reason} Your preference was saved; use /plan to retry."
 
     def _invalid_plan_message(self) -> str:
         """Return the terminal message for invalid planner output."""
@@ -283,12 +340,21 @@ class PlannerHandler:
         *,
         request_id: str | None,
         state_revision: int | None,
-    ) -> None:
+    ) -> bool | None:
         if not request_id or state_revision is None:
-            return
-        state = self.repo.get_conversation_state(user_id)
+            return None
+        try:
+            state = self.repo.get_conversation_state(
+                user_id, consistent_read=True
+            )
+        except Exception:
+            logger.exception(
+                "Could not read state while recovering planner request %s",
+                request_id,
+            )
+            return None
         if not self._request_matches(state, request_id, state_revision):
-            return
+            return False
         assert state is not None
         retry_state = state.model_copy(
             update={
@@ -297,9 +363,22 @@ class PlannerHandler:
                 "updated_at": datetime.now(timezone.utc),
             }
         )
-        self.repo.mark_conversation_retry_ready(
-            user_id, retry_state, expected_revision=state_revision
-        )
+        try:
+            transitioned = self.repo.mark_conversation_retry_ready(
+                user_id, retry_state, expected_revision=state_revision
+            )
+        except Exception:
+            logger.exception(
+                "Could not retain retry state for planner request %s",
+                request_id,
+            )
+            return None
+        if not transitioned:
+            logger.info(
+                "Planner request %s changed before retry recovery", request_id
+            )
+            return False
+        return True
 
     def finalize_grocery(
         self, user_id: str, chat_id: int | str, week_start: str
@@ -377,11 +456,217 @@ class PlannerHandler:
                 exc,
             )
 
+    def revise_plan(
+        self,
+        user_id: str,
+        chat_id: int | str,
+        context: PlanRevisionContext,
+    ) -> None:
+        """Generate and atomically publish a complete draft replacement."""
+        try:
+            profile = self.repo.get_profile(user_id)
+            plan = self.repo.get_plan(
+                user_id, context.week_start, consistent_read=True
+            )
+            state = self.repo.get_conversation_state(
+                user_id, consistent_read=True
+            )
+            if not self._revision_state_matches(state, context):
+                logger.info(
+                    "Discarded stale plan revision %s", context.request_id
+                )
+                return
+            if not profile:
+                self._resolve_revision_conflict(
+                    user_id,
+                    chat_id,
+                    context,
+                    "I couldn't revise the draft because your profile is "
+                    "missing. Use /plan to create a new draft.",
+                )
+                return
+            if not plan:
+                self._resolve_revision_conflict(
+                    user_id,
+                    chat_id,
+                    context,
+                    "That draft is no longer available. Use /plan to create a "
+                    "new draft.",
+                )
+                return
+            if not self._revision_request_matches(state, context, plan):
+                self._resolve_revision_conflict(
+                    user_id,
+                    chat_id,
+                    context,
+                    "The draft changed while I was revising it, so I "
+                    "discarded the stale result.",
+                )
+                return
+            if (
+                plan.status is not PlanStatus.DRAFT
+                or plan.week_end < date.today()
+            ):
+                self._resolve_revision_conflict(
+                    user_id,
+                    chat_id,
+                    context,
+                    "That draft is no longer eligible for revision. Use /plan "
+                    "to create a new draft.",
+                )
+                return
+            client = self.llm_client or LLMClient()
+            revised = self._generate_with_bounded_repair(
+                client,
+                build_plan_revision_prompt(
+                    profile,
+                    plan,
+                    context.amendment,
+                    week_start=context.week_start.isoformat(),
+                ),
+                context.week_start,
+                chat_id,
+                failure_mode="revision",
+            )
+            if revised is None:
+                self._retain_retry_state(
+                    user_id,
+                    request_id=context.request_id,
+                    state_revision=context.state_revision,
+                )
+                return
+            revised.status = PlanStatus.DRAFT
+            revised.revision = context.expected_plan_revision + 1
+            revised.week_start = context.week_start
+            revised.grocery_status = GroceryStatus.NOT_REQUESTED
+            revised.grocery_list = []
+            revised.planning_instructions = [
+                *plan.planning_instructions,
+                context.amendment,
+            ]
+            for plan_day in revised.days:
+                for meal in plan_day.meals:
+                    meal.outcome = MealOutcome.UNREPORTED
+            published = self.repo.replace_draft_and_clear_revision_state(
+                user_id,
+                revised,
+                expected_plan_revision=context.expected_plan_revision,
+                request_id=context.request_id,
+                expected_state_revision=context.state_revision,
+            )
+            if not published:
+                self._resolve_revision_conflict(
+                    user_id,
+                    chat_id,
+                    context,
+                    "The draft changed while I was revising it, so I "
+                    "discarded the stale result.",
+                )
+                return
+        except Exception as exc:
+            logger.error(
+                "Plan revision failed for user %s week %s: %s",
+                user_id,
+                context.week_start,
+                exc,
+            )
+            recovered = self._retain_retry_state(
+                user_id,
+                request_id=context.request_id,
+                state_revision=context.state_revision,
+            )
+            if recovered is False:
+                logger.info(
+                    "Suppressed failure for planner request %s after "
+                    "ownership loss",
+                    context.request_id,
+                )
+                return
+            self._notify_failure(
+                chat_id,
+                "I couldn't revise the draft. Your original draft is "
+                "unchanged; reply retry or use /cancel.",
+            )
+            return
+        try:
+            self.telegram_api.send_plan(chat_id, revised)
+            self.telegram_api.send_message(
+                chat_id,
+                "Review this revised draft, request more edits, or tell me to "
+                "confirm it.",
+            )
+        except Exception as exc:
+            logger.error(
+                "Revised plan delivery failed for user %s week %s: %s",
+                user_id,
+                context.week_start,
+                exc,
+            )
+
+    @staticmethod
+    def _revision_request_matches(
+        state: ConversationState | None,
+        context: PlanRevisionContext,
+        plan: WeeklyPlan,
+    ) -> bool:
+        """Check the durable state and exact plan snapshot for an event."""
+        return bool(
+            PlannerHandler._revision_state_matches(state, context)
+            and plan.week_start == context.week_start
+            and plan.revision == context.expected_plan_revision
+        )
+
+    def _resolve_revision_conflict(
+        self,
+        user_id: str,
+        chat_id: int | str,
+        context: PlanRevisionContext,
+        message: str,
+    ) -> bool:
+        """Clear and report a stale revision only while it still owns state."""
+        state = self.repo.get_conversation_state(user_id, consistent_read=True)
+        if not self._revision_state_matches(state, context):
+            logger.info(
+                "Suppressed stale revision conflict for request %s",
+                context.request_id,
+            )
+            return False
+        cleared = self.repo.clear_conversation_state_if_matches(
+            user_id,
+            request_id=context.request_id,
+            expected_revision=context.state_revision,
+        )
+        if not cleared:
+            logger.info(
+                "Suppressed stale revision conflict after ownership loss "
+                "for request %s",
+                context.request_id,
+            )
+            return False
+        self._notify_failure(chat_id, message)
+        return True
+
+    @staticmethod
+    def _revision_state_matches(
+        state: ConversationState | None,
+        context: PlanRevisionContext,
+    ) -> bool:
+        """Check only the durable request snapshot for a revision event."""
+        return bool(
+            state
+            and state.workflow_kind is ConversationWorkflowKind.PLAN_REVISION
+            and state.step is ConversationWorkflowStep.GENERATING
+            and state.request_id == context.request_id
+            and state.revision == context.state_revision
+            and state.target_week == context.week_start
+            and state.expected_plan_revision == context.expected_plan_revision
+        )
+
     def _notify_failure(self, chat_id: int | str, message: str) -> None:
         try:
             self.telegram_api.send_message(chat_id, message)
-        except TelegramAPIError:
-            logger.error("Could not deliver planner failure notification")
+        except Exception:
+            logger.exception("Could not deliver planner failure notification")
 
     def handle_event(self, event: dict[str, Any]) -> bool:
         """Dispatch a validated asynchronous planner event."""
@@ -434,6 +719,13 @@ class PlannerHandler:
             except ValueError:
                 return False
             self.finalize_grocery(user_id, chat_id, week_start)
+            return True
+        if action == REVISE_PLAN:
+            try:
+                revision_context = PlanRevisionContext.model_validate(event)
+            except TypeError, ValueError, ValidationError:
+                return False
+            self.revise_plan(user_id, chat_id, revision_context)
             return True
         return False
 

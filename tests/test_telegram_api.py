@@ -13,6 +13,7 @@ from meal_planner.telegram.api import (
     TelegramAPIError,
     split_text,
 )
+from meal_planner.telegram.commands import TelegramCommand
 from tests.factories import make_plan
 
 
@@ -40,6 +41,43 @@ def test_send_message_is_plain_text_and_uses_timeout(
     payload = json.loads(request.data.decode())
     assert payload == {"chat_id": 1, "text": "unsafe *markdown* _text_"}
     assert urlopen.call_args.kwargs["timeout"] == 4.5
+
+
+def test_set_my_commands_posts_canonical_payload_and_uses_timeout(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+    api = TelegramAPI("secret-token", request_timeout=4.5)
+
+    api.set_my_commands()
+
+    request = urlopen.call_args.args[0]
+    assert request.full_url == (
+        "https://api.telegram.org/botsecret-token/setMyCommands"
+    )
+    payload = json.loads(request.data.decode())
+    assert payload["commands"][0] == {
+        "command": "start",
+        "description": "Start onboarding or view what to do next",
+    }
+    assert len(payload["commands"]) == 9
+    assert urlopen.call_args.kwargs["timeout"] == 4.5
+
+
+def test_set_my_commands_validates_before_transport(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch("urllib.request.urlopen")
+
+    with pytest.raises(ValueError):
+        TelegramAPI("token").set_my_commands(
+            (TelegramCommand("valid", "Valid"),) * 2
+        )
+
+    urlopen.assert_not_called()
 
 
 @pytest.mark.parametrize(

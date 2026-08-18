@@ -2,7 +2,7 @@
 
 import base64
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -11,6 +11,7 @@ from meal_planner.bot_handler import BotHandler, lambda_handler
 from meal_planner.db.dynamo import ActivePlanSnapshot
 from meal_planner.models.schemas import (
     ConversationIntent,
+    ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
     GroceryStatus,
@@ -22,6 +23,7 @@ from meal_planner.models.schemas import (
 from meal_planner.router import RouteResult, RouteType
 from meal_planner.telegram.access import TelegramAccessPolicy
 from meal_planner.telegram.api import TelegramAPIError
+from meal_planner.telegram.commands import BOT_COMMANDS, render_help
 from tests.factories import make_plan, make_profile
 
 
@@ -82,6 +84,35 @@ def test_start_requests_family_name_separately_from_member_names(
     assert "family name" in message
     assert "each household member's name" in message
     assert "tell me your name" not in message
+
+
+def test_help_renders_catalogue_without_repository_interaction(
+    handler: BotHandler,
+) -> None:
+    handler.handle_command(_command("help"))
+
+    handler.telegram_api.send_message.assert_called_once_with(1, render_help())
+    handler.repo.assert_not_called()
+
+
+def test_unknown_command_points_to_help(handler: BotHandler) -> None:
+    handler.handle_command(_command("unsupported"))
+
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "Unknown command: /unsupported" in message
+    assert "Type /help for options." in message
+    assert "/start for options" not in message
+
+
+def test_catalogue_commands_reach_their_dispatch_handlers(
+    handler: BotHandler, mocker: Any
+) -> None:
+    for command in BOT_COMMANDS:
+        command_handler = mocker.patch.object(handler, f"_cmd_{command.name}")
+
+        handler.handle_command(_command(command.name))
+
+        command_handler.assert_called_once_with(1, "user")
 
 
 def test_profile_displays_family_name_and_individual_members(
@@ -925,6 +956,119 @@ def test_conversation_replaces_false_success_reply(handler: BotHandler) -> None:
     )
     sent = handler.telegram_api.send_message.call_args.args[1]
     assert sent != "Saved!"
+
+
+def test_draft_revision_starts_one_async_exact_snapshot(
+    handler: BotHandler,
+) -> None:
+    plan = make_plan(week_start=date.today(), revision=4)
+    handler.repo.get_latest_plan.return_value = plan
+
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.REVISE_PLAN,
+        {"amendment": "Avoid cauliflower"},
+        make_profile(),
+    )
+
+    assert result.success
+    assert result.message == "I'm revising your draft now."
+    state = handler.repo.save_conversation_state.call_args.args[1]
+    assert state.workflow_kind is ConversationWorkflowKind.PLAN_REVISION
+    assert state.expected_plan_revision == 4
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload == {
+        "action": "revise_plan",
+        "user_id": "user",
+        "chat_id": 1,
+        "week_start": plan.week_start_date,
+        "amendment": "Avoid cauliflower",
+        "request_id": state.request_id,
+        "state_revision": state.revision,
+        "expected_plan_revision": 4,
+    }
+
+
+def test_draft_revision_passes_normalized_source_update_id_to_repository(
+    handler: BotHandler,
+) -> None:
+    plan = make_plan(week_start=date.today(), revision=4)
+    handler.repo.get_latest_plan.return_value = plan
+    handler.repo.has_plan_revision_update_marker.return_value = False
+    handler.repo.start_plan_revision.return_value = True
+
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.REVISE_PLAN,
+        {"amendment": "Avoid cauliflower"},
+        make_profile(),
+        source_update_id="42",
+    )
+
+    assert result.success
+    state = handler.repo.start_plan_revision.call_args.args[1]
+    assert state.last_update_id == "42"
+    assert handler.repo.start_plan_revision.call_args.kwargs == {
+        "source_update_id": "42"
+    }
+    handler.repo.save_conversation_state.assert_not_called()
+
+
+def test_duplicate_revision_update_does_not_invoke_planner(
+    handler: BotHandler,
+) -> None:
+    handler.repo.has_plan_revision_update_marker.return_value = True
+
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.REVISE_PLAN,
+        {"amendment": "Avoid cauliflower"},
+        make_profile(),
+        source_update_id="42",
+    )
+
+    assert result.success
+    assert result.message == "I'm revising your draft now."
+    handler.repo.get_latest_plan.assert_not_called()
+    handler.repo.start_plan_revision.assert_not_called()
+    handler.lambda_client.invoke.assert_not_called()
+
+
+def test_revision_workflow_blocks_confirmation_and_new_amendments(
+    handler: BotHandler,
+) -> None:
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REVISION,
+        step=ConversationWorkflowStep.GENERATING,
+        amendment="Avoid cauliflower",
+        target_week=date.today(),
+        expected_plan_revision=0,
+        request_id="revision-1",
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    handler.repo.get_conversation_state.return_value = state
+    route = RouteResult(
+        route_type=RouteType.CONVERSATIONAL,
+        chat_id=1,
+        user_id="user",
+        text="confirm it",
+    )
+
+    handler.handle_conversational(route)
+
+    assert (
+        "still being generated"
+        in (handler.telegram_api.send_message.call_args.args[1])
+    )
+    handler.llm_client.chat_sync.assert_not_called()
 
 
 def test_repeated_conversation_update_passes_same_source_id(

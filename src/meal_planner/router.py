@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from meal_planner.models.schemas import MealOutcome, MealType
+from meal_planner.telegram.commands import BOT_COMMANDS
 
 MAX_CALLBACK_DATA_BYTES = 64
 
@@ -34,16 +35,7 @@ class RouteResult(BaseModel):
     raw_update: dict[str, Any] = Field(default_factory=dict)
 
 
-SUPPORTED_COMMANDS = {
-    "start",
-    "profile",
-    "plan",
-    "grocery",
-    "today",
-    "submit_meals",
-    "checkin",
-    "cancel",
-}
+SUPPORTED_COMMANDS = frozenset(command.name for command in BOT_COMMANDS)
 
 
 class CheckinCallback(BaseModel):

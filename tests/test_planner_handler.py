@@ -1,14 +1,44 @@
 """Planner generation and grocery-finalization workflow tests."""
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 
 from meal_planner.llm.client import LLMTransientError
-from meal_planner.models.schemas import GroceryStatus, MealOutcome, PlanStatus
+from meal_planner.models.schemas import (
+    ConversationState,
+    ConversationWorkflowKind,
+    ConversationWorkflowStep,
+    GroceryStatus,
+    MealOutcome,
+    PlanRevisionContext,
+    PlanStatus,
+)
 from meal_planner.planner_handler import PlannerHandler, lambda_handler
 from tests.factories import make_plan, make_plan_payload, make_profile
+
+
+def _revision_state(
+    week: date,
+    *,
+    request_id: str = "revision-1",
+    revision: int = 0,
+    expected_plan_revision: int = 4,
+) -> ConversationState:
+    now = datetime.now(timezone.utc)
+    return ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REVISION,
+        step=ConversationWorkflowStep.GENERATING,
+        amendment="Avoid cauliflower",
+        target_week=week,
+        expected_plan_revision=expected_plan_revision,
+        request_id=request_id,
+        revision=revision,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
 
 
 def test_generate_plan_saves_draft_without_groceries(mocker: Any) -> None:
@@ -40,6 +70,270 @@ def test_generate_plan_saves_draft_without_groceries(mocker: Any) -> None:
         1, "Review this draft, request edits, then tell me to confirm it."
     )
     assert events == ["persist", "send_plan", "send_message"]
+
+
+def test_revise_plan_publishes_normalized_replacement_before_delivery(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date.today()
+    current = make_plan(
+        week_start=week,
+        revision=4,
+        planning_instructions=["Three egg breakfasts"],
+    )
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REVISION,
+        step=ConversationWorkflowStep.GENERATING,
+        amendment="Avoid cauliflower",
+        target_week=week,
+        expected_plan_revision=4,
+        request_id="revision-1",
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = current
+    repo.get_conversation_state.return_value = state
+    repo.replace_draft_and_clear_revision_state.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = make_plan_payload(week)
+    payload["status"] = PlanStatus.CONFIRMED.value
+    payload["revision"] = 99
+    payload["grocery_status"] = GroceryStatus.READY.value
+    payload["grocery_list"] = [{"name": "Produce", "items": ["Apples"]}]
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment="Avoid cauliflower",
+            request_id="revision-1",
+            state_revision=0,
+            expected_plan_revision=4,
+            week_start=week,
+        ),
+    )
+
+    replacement = repo.replace_draft_and_clear_revision_state.call_args.args[1]
+    assert replacement.revision == 5
+    assert replacement.status is PlanStatus.DRAFT
+    assert replacement.grocery_status is GroceryStatus.NOT_REQUESTED
+    assert replacement.grocery_list == []
+    assert replacement.planning_instructions == [
+        "Three egg breakfasts",
+        "Avoid cauliflower",
+    ]
+    assert all(
+        meal.outcome is MealOutcome.UNREPORTED
+        for plan_day in replacement.days
+        for meal in plan_day.meals
+    )
+    repo.replace_draft_and_clear_revision_state.assert_called_once()
+    assert api.send_plan.call_count == 1
+    assert "revised draft" in api.send_message.call_args.args[1]
+
+
+def test_revision_unexpected_failure_retains_matching_retry_state(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(week_start=week, revision=4)
+    repo.get_conversation_state.return_value = state
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.side_effect = RuntimeError("worker failure")
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment=state.amendment or "",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    recovered = repo.mark_conversation_retry_ready.call_args.args[1]
+    assert recovered.step is ConversationWorkflowStep.RETRY_READY
+    assert recovered.revision == state.revision + 1
+    assert repo.mark_conversation_retry_ready.call_args.kwargs == {
+        "expected_revision": state.revision
+    }
+    assert all(
+        call.kwargs == {"consistent_read": True}
+        for call in repo.get_conversation_state.call_args_list
+    )
+    assert "reply retry" in api.send_message.call_args.args[1]
+
+
+def test_revision_recovery_failure_does_not_mask_worker_failure(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(week_start=week, revision=4)
+    repo.get_conversation_state.return_value = state
+    repo.mark_conversation_retry_ready.side_effect = RuntimeError(
+        "write failed"
+    )
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.side_effect = RuntimeError("worker failure")
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment="Avoid cauliflower",
+            request_id="revision-1",
+            state_revision=0,
+            expected_plan_revision=4,
+            week_start=week,
+        ),
+    )
+
+    assert "reply retry" in api.send_message.call_args.args[1]
+
+
+def test_revision_failure_does_not_overwrite_newer_workflow_or_notify(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    newer_state = state.model_copy(
+        update={
+            "step": ConversationWorkflowStep.RETRY_READY,
+            "revision": 1,
+        }
+    )
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(week_start=week, revision=4)
+    repo.get_conversation_state.side_effect = [state, newer_state]
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.side_effect = RuntimeError("late worker failure")
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment="Avoid cauliflower",
+            request_id="revision-1",
+            state_revision=0,
+            expected_plan_revision=4,
+            week_start=week,
+        ),
+    )
+
+    repo.mark_conversation_retry_ready.assert_not_called()
+    api.send_message.assert_not_called()
+
+
+def test_revision_conflict_clears_and_reports_only_current_owner(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(week_start=week, revision=5)
+    repo.get_conversation_state.side_effect = [state, state]
+    repo.clear_conversation_state_if_matches.return_value = True
+    api = mocker.MagicMock()
+
+    PlannerHandler(repo, api).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment="Avoid cauliflower",
+            request_id="revision-1",
+            state_revision=0,
+            expected_plan_revision=4,
+            week_start=week,
+        ),
+    )
+
+    repo.clear_conversation_state_if_matches.assert_called_once_with(
+        "user", request_id="revision-1", expected_revision=0
+    )
+    assert "discarded the stale result" in api.send_message.call_args.args[1]
+
+
+def test_revision_conflict_cleanup_failure_retains_retry_state(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(week_start=week, revision=5)
+    repo.get_conversation_state.return_value = state
+    repo.clear_conversation_state_if_matches.side_effect = RuntimeError(
+        "delete failed"
+    )
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+
+    PlannerHandler(repo, api).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment="Avoid cauliflower",
+            request_id="revision-1",
+            state_revision=0,
+            expected_plan_revision=4,
+            week_start=week,
+        ),
+    )
+
+    retry_state = repo.mark_conversation_retry_ready.call_args.args[1]
+    assert retry_state.step is ConversationWorkflowStep.RETRY_READY
+    assert retry_state.revision == state.revision + 1
+    assert "reply retry" in api.send_message.call_args.args[1]
+
+
+def test_duplicate_revision_worker_suppresses_losing_conflict_message(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(week_start=week, revision=4)
+    repo.get_conversation_state.side_effect = [state, None]
+    repo.replace_draft_and_clear_revision_state.return_value = False
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = make_plan_payload(week)
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment="Avoid cauliflower",
+            request_id="revision-1",
+            state_revision=0,
+            expected_plan_revision=4,
+            week_start=week,
+        ),
+    )
+
+    api.send_message.assert_not_called()
+    api.send_plan.assert_not_called()
 
 
 def test_generate_plan_delivery_failure_keeps_persisted_draft(
