@@ -1,6 +1,7 @@
 """Verify deployed Bot Lambda permission for DynamoDB transactions."""
 
 import argparse
+import re
 import sys
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -12,6 +13,14 @@ from botocore.exceptions import (  # type: ignore[import-untyped]
 )
 
 TRANSACTION_ACTION = "dynamodb:TransactWriteItems"
+MAX_ERROR_MESSAGE_CHARS = 2_000
+_CREDENTIAL_PATTERN = re.compile(
+    r"(?i)\b(?:AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)\b"
+    r"(?:\s*[:=]\s*|\s+)[^\s,;]+"
+    r"|\b(?:AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)\b"
+    r"|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+)
+_URL_USERINFO_PATTERN = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@")
 
 
 class VerificationError(Exception):
@@ -26,6 +35,39 @@ class DeploymentResources:
     role_arn: str
     table_name: str
     table_arn: str
+
+
+def _safe_diagnostic(text: str) -> str:
+    """Redact common credential identifiers and bound AWS diagnostics."""
+    without_url_userinfo = _URL_USERINFO_PATTERN.sub(r"\1[REDACTED]@", text)
+    sanitized = _CREDENTIAL_PATTERN.sub("[REDACTED]", without_url_userinfo)
+    if len(sanitized) <= MAX_ERROR_MESSAGE_CHARS:
+        return sanitized
+    return sanitized[:MAX_ERROR_MESSAGE_CHARS] + "..."
+
+
+def _client_error_diagnostic(exc: ClientError) -> str:
+    """Return useful, safe details for an AWS service error."""
+    error = exc.response.get("Error", {})
+    if isinstance(error, dict):
+        code = error.get("Code", "unknown")
+        message = error.get("Message", "request failed")
+    else:
+        code = "unknown"
+        message = "request failed"
+    safe_code = _safe_diagnostic(str(code))
+    safe_message = _safe_diagnostic(str(message))
+    return (
+        f"AWS API call {exc.operation_name} failed "
+        f"({safe_code}): {safe_message}"
+    )
+
+
+def _botocore_error_diagnostic(exc: BotoCoreError) -> str:
+    """Return a safe type and message for a botocore failure."""
+    return (
+        f"AWS client error ({type(exc).__name__}): {_safe_diagnostic(str(exc))}"
+    )
 
 
 def _required_string(value: object, description: str) -> str:
@@ -167,17 +209,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             cloudformation, lambda_client, dynamodb, args.stack_name
         )
         verify_permission(iam, resources)
-    except BotoCoreError:
-        print(
-            "AWS API call failed during transaction permission verification",
-            file=sys.stderr,
-        )
+    except ClientError as exc:
+        print(_client_error_diagnostic(exc), file=sys.stderr)
         return 1
-    except ClientError:
-        print(
-            "AWS API call failed during transaction permission verification",
-            file=sys.stderr,
-        )
+    except BotoCoreError as exc:
+        print(_botocore_error_diagnostic(exc), file=sys.stderr)
         return 1
     except VerificationError as exc:
         print(f"verification failed: {exc}", file=sys.stderr)

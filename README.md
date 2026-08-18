@@ -85,7 +85,7 @@ Local development reads these variables from the environment or an ignored
 | `PLANNER_LLM_MODEL` | `gpt-5.6-luna` | Planner and grocery LiteLLM model |
 | `PLANNER_LLM_REASONING_EFFORT` | `high` | Planner reasoning effort |
 | `DYNAMODB_TABLE_NAME` | `meal-planner` | DynamoDB table |
-| `AWS_REGION` | `us-east-1` | AWS client region |
+| `AWS_REGION` | `eu-west-1` for deployment | AWS client region |
 | `BOT_FUNCTION_TIMEOUT_SECONDS` | `30` | Bot Lambda deadline |
 | `BOT_TELEGRAM_REQUEST_TIMEOUT_SECONDS` | `5` | Bot Telegram HTTP timeout |
 | `BOT_LLM_REQUEST_TIMEOUT_SECONDS` | `6` | Per-attempt Bot LLM timeout |
@@ -175,12 +175,26 @@ LLM_API_KEY_SECRET_NAME=meal-planner/llm-key
 SYNC_SECRETS=false
 ```
 
-The routine workflow checks prerequisites and confirms the AWS identity, checks
-that all three named Secrets Manager secrets exist, runs `sam validate --lint`
-and `sam build --beta-features`, deploys with a generated refresh token,
-resolves the required stack outputs, registers the canonical Telegram command
-menu, sets and verifies the webhook, and verifies the deployed DynamoDB
-transaction permission:
+The routine workflow prints numbered stage headings as it checks prerequisites,
+authenticates and confirms the AWS identity, checks that all three named
+Secrets Manager secrets exist, runs `sam validate --lint` and
+`sam build --beta-features`, deploys with a generated refresh token, resolves
+the required stack outputs, registers the canonical Telegram command menu,
+sets the webhook, and verifies the webhook:
+
+The routine announcements are, in order:
+
+1. Check deployment prerequisites.
+2. Authenticate with AWS and confirm identity.
+3. Check configured Secrets Manager secrets.
+4. Validate the SAM template.
+5. Build SAM artifacts.
+6. Deploy the SAM stack.
+7. AWS deployment completed.
+8. Resolve CloudFormation stack outputs.
+9. Register Telegram commands.
+10. Set the Telegram webhook.
+11. Verify the Telegram webhook.
 
 ```bash
 uv run python scripts/deploy.py
@@ -203,21 +217,25 @@ secret values in command arguments, logs, errors, or summaries:
 uv run python scripts/deploy.py --sync-secrets
 ```
 
-If deployment succeeds but Telegram configuration or read-only AWS
-verification fails, rerun only the idempotent post-deployment stages after
-correcting the issue:
+The runner stops at the first failed stage. Once `sam deploy` succeeds it
+prints an explicit AWS deployment-completed boundary. If output resolution or
+Telegram configuration then fails, the error says that AWS deployment
+completed and points to the idempotent recovery command below:
 
 ```bash
 uv run python scripts/deploy.py --post-deploy-only
 ```
 
 Recovery mode still performs prerequisite checks, remote login, identity
-confirmation, stack output resolution, command registration, webhook
-verification, and IAM verification. It skips the SAM preflight, SAM building,
-and deployment, and never checks or changes secrets.
+confirmation, stack output resolution, command registration, webhook setup,
+and webhook verification. It announces and skips secret checks, SAM
+validation, SAM building, deployment, and IAM simulation; it never checks or
+changes secrets. The same recovery mode can be used after a Telegram API
+failure without repeating an AWS deployment.
 The stack outputs `WebhookUrl`, `MealPlannerTableName`, `BotFunctionName`, and
 `PlannerFunctionName`; malformed or missing outputs are failures. The direct
-read-only verifier remains available and accepts an explicit profile:
+read-only IAM verifier remains available as a troubleshooting command and
+accepts an explicit profile:
 
 ```bash
 uv run python scripts/verify_transaction_permission.py \
@@ -226,7 +244,10 @@ uv run python scripts/verify_transaction_permission.py \
   --region eu-west-1
 ```
 
-The verifier requires `cloudformation:DescribeStacks`,
+The verifier is not part of routine, guided, or recovery deployment. Use it
+for an initial deployment, an IAM/template change, or suspected authorization
+problem. It requires the caller to have
+`cloudformation:DescribeStacks`,
 `lambda:GetFunctionConfiguration`, `dynamodb:DescribeTable`, and
 `iam:SimulatePrincipalPolicy`. It does not change the role or substitute for
 an end-to-end Telegram test. Secret synchronization and a live deployment are
