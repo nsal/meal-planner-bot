@@ -175,11 +175,12 @@ LLM_API_KEY_SECRET_NAME=meal-planner/llm-key
 SYNC_SECRETS=false
 ```
 
-The routine workflow checks that all three named Secrets Manager secrets exist,
-runs Ruff, mypy, pytest, SAM validation, SAM build, and fresh artifact tests,
-deploys with a generated refresh token, registers the canonical Telegram
-command menu, sets and verifies the webhook, and verifies the deployed
-DynamoDB transaction permission:
+The routine workflow checks prerequisites and confirms the AWS identity, checks
+that all three named Secrets Manager secrets exist, runs `sam validate --lint`
+and `sam build --beta-features`, deploys with a generated refresh token,
+resolves the required stack outputs, registers the canonical Telegram command
+menu, sets and verifies the webhook, and verifies the deployed DynamoDB
+transaction permission:
 
 ```bash
 uv run python scripts/deploy.py
@@ -210,9 +211,10 @@ correcting the issue:
 uv run python scripts/deploy.py --post-deploy-only
 ```
 
-Recovery mode still performs remote login, identity confirmation, stack output
-resolution, command registration, webhook verification, and IAM verification;
-it never checks or changes secrets, runs quality gates, builds, or deploys.
+Recovery mode still performs prerequisite checks, remote login, identity
+confirmation, stack output resolution, command registration, webhook
+verification, and IAM verification. It skips the SAM preflight, SAM building,
+and deployment, and never checks or changes secrets.
 The stack outputs `WebhookUrl`, `MealPlannerTableName`, `BotFunctionName`, and
 `PlannerFunctionName`; malformed or missing outputs are failures. The direct
 read-only verifier remains available and accepts an explicit profile:
