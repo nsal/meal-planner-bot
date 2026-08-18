@@ -618,19 +618,12 @@ def synchronize_secrets(
                 )
 
 
-def run_quality_gates(
+def run_sam_preflight(
     runner: CommandRunner, settings: DeploymentSettings
 ) -> None:
-    """Run local quality checks and fresh SAM artifact checks in order."""
+    """Validate and build the SAM application before deployment."""
     environment = settings.child_environment()
     commands: tuple[tuple[str, tuple[str, ...]], ...] = (
-        (
-            "check Ruff formatting",
-            ("uv", "run", "ruff", "format", "--check", "."),
-        ),
-        ("run Ruff lint", ("uv", "run", "ruff", "check", ".")),
-        ("run mypy", ("uv", "run", "mypy")),
-        ("run pytest", ("uv", "run", "pytest")),
         (
             "validate SAM template",
             tuple(
@@ -647,19 +640,12 @@ def run_quality_gates(
                 )
             ),
         ),
-        (
-            "test fresh SAM artifacts",
-            ("uv", "run", "pytest", "tests/test_template.py"),
-        ),
     )
-    for index, (stage, command) in enumerate(commands):
-        command_environment = dict(environment)
-        if index == len(commands) - 1:
-            command_environment["REQUIRE_SAM_ARTIFACTS"] = "1"
+    for stage, command in commands:
         runner.run(
             command,
             stage=stage,
-            env=command_environment,
+            env=environment,
             sensitive_values=settings.secret_values,
         )
 
@@ -858,7 +844,7 @@ def run_deployment(
         synchronize_secrets(
             command_runner, settings, requested=options.sync_secrets
         )
-        run_quality_gates(command_runner, settings)
+        run_sam_preflight(command_runner, settings)
         deploy_sam(command_runner, settings, guided=options.guided)
         outputs = resolve_stack_outputs(command_runner, settings)
 

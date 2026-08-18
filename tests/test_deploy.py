@@ -31,17 +31,30 @@ def _settings(**overrides: Any) -> deploy.DeploymentSettings:
 class FakeRunner(deploy.CommandRunner):
     """Deterministic command boundary for orchestration tests."""
 
-    def __init__(self, *, missing_secret: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        missing_secret: str | None = None,
+        failed_stage: str | None = None,
+    ) -> None:
         self.commands: list[tuple[str, ...]] = []
         self.environments: list[dict[str, str] | None] = []
         self.interactive: list[bool] = []
         self.missing_secret = missing_secret
+        self.failed_stage = failed_stage
 
     def run(self, args: Any, **kwargs: Any) -> deploy.CommandResult:
         command = tuple(str(item) for item in args)
         self.commands.append(command)
         self.environments.append(kwargs.get("env"))
         self.interactive.append(bool(kwargs.get("interactive", False)))
+        if kwargs.get("stage") == self.failed_stage:
+            raise deploy.CommandExecutionError(
+                command,
+                1,
+                "command failed",
+                stderr="SAM preflight failed",
+            )
         if command[:2] == ("aws", "--version"):
             return deploy.CommandResult(
                 command, 0, "aws-cli/2.32.0 Python/3.14.0", ""
@@ -311,17 +324,58 @@ def test_routine_sam_deploy_resolves_an_artifact_bucket() -> None:
     assert "PlannerLlmReasoningEffort=high" in command
 
 
-def test_quality_gates_enable_sam_beta_features() -> None:
+def test_sam_preflight_runs_exact_sam_only_sequence() -> None:
     runner = FakeRunner()
+    settings = _settings()
 
-    deploy.run_quality_gates(runner, _settings())
+    deploy.run_sam_preflight(runner, settings)
 
-    build_command = next(
-        command
-        for command in runner.commands
-        if command[:5] == ("uvx", "--from", "aws-sam-cli", "sam", "build")
+    assert runner.commands == [
+        (
+            "uvx",
+            "--from",
+            "aws-sam-cli",
+            "sam",
+            "validate",
+            "--lint",
+            "--profile",
+            "meal-planner",
+            "--region",
+            "eu-west-1",
+        ),
+        (
+            "uvx",
+            "--from",
+            "aws-sam-cli",
+            "sam",
+            "build",
+            "--beta-features",
+            "--profile",
+            "meal-planner",
+            "--region",
+            "eu-west-1",
+        ),
+    ]
+    assert all("pytest" not in command for command in runner.commands)
+    assert all(command[0] != "uv" for command in runner.commands)
+    assert runner.environments == [settings.child_environment()] * 2
+
+
+def test_failed_sam_preflight_prevents_deployment() -> None:
+    runner = FakeRunner(failed_stage="build SAM artifacts")
+
+    with pytest.raises(deploy.CommandExecutionError, match="command failed"):
+        deploy.run_deployment(
+            _settings(),
+            deploy.DeploymentOptions(),
+            runner=runner,
+            input_fn=lambda _: "yes",
+            api_factory=FakeTelegram,
+        )
+
+    assert not any(
+        "sam deploy" in " ".join(command) for command in runner.commands
     )
-    assert "--beta-features" in build_command
 
 
 def test_routine_and_post_deploy_workflows_have_expected_boundaries() -> None:
@@ -342,7 +396,39 @@ def test_routine_and_post_deploy_workflows_have_expected_boundaries() -> None:
     command_text = [" ".join(command) for command in runner.commands]
     assert command_text.index(
         "aws login --remote --profile meal-planner --region eu-west-1"
-    ) < command_text.index("uv run ruff format --check .")
+    ) < command_text.index(
+        "uvx --from aws-sam-cli sam validate --lint --profile meal-planner "
+        "--region eu-west-1"
+    )
+    assert command_text.index(
+        "uvx --from aws-sam-cli sam validate --lint --profile meal-planner "
+        "--region eu-west-1"
+    ) < command_text.index(
+        "uvx --from aws-sam-cli sam build --beta-features --profile "
+        "meal-planner --region eu-west-1"
+    )
+    deploy_index = next(
+        index
+        for index, command in enumerate(command_text)
+        if "sam deploy" in command
+    )
+    assert (
+        command_text.index(
+            "uvx --from aws-sam-cli sam validate --lint --profile meal-planner "
+            "--region eu-west-1"
+        )
+        < deploy_index
+    )
+    assert (
+        command_text.index(
+            "uvx --from aws-sam-cli sam build --beta-features --profile "
+            "meal-planner --region eu-west-1"
+        )
+        < deploy_index
+    )
+    assert all("pytest" not in command for command in runner.commands)
+    assert all("ruff" not in command for command in runner.commands)
+    assert all("mypy" not in command for command in runner.commands)
     assert any("sam deploy" in command for command in command_text)
 
     recovery_runner = FakeRunner()
@@ -357,6 +443,8 @@ def test_routine_and_post_deploy_workflows_have_expected_boundaries() -> None:
         " ".join(command) for command in recovery_runner.commands
     )
     assert "sam deploy" not in recovery_text
+    assert "sam validate" not in recovery_text
+    assert "sam build" not in recovery_text
     assert "secretsmanager" not in recovery_text
     assert "ruff" not in recovery_text
     assert "verify_transaction_permission.py" in recovery_text
