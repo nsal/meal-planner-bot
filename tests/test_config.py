@@ -14,8 +14,9 @@ def test_config_loading_valid_env(mock_env: None) -> None:
     assert settings.llm_api_key == "test-api-key"
     assert settings.conversational_llm_model == "gpt-5.6-luna"
     assert settings.conversational_llm_reasoning_effort == "medium"
-    assert settings.planner_llm_model == "gpt-5.6-terra"
-    assert settings.planner_llm_reasoning_effort == "medium"
+    assert settings.planner_llm_model == "gpt-5.6-luna"
+    assert settings.planner_llm_reasoning_effort == "high"
+    assert settings.planner_function_timeout_seconds == 300.0
     assert settings.dynamodb_table_name == "test-meal-planner"
     assert settings.aws_region == "us-east-1"
     assert settings.telegram_allowed_user_ids == frozenset({"1", "2"})
@@ -29,8 +30,8 @@ def test_config_uppercase_properties(mock_env: None) -> None:
     assert settings.LLM_API_KEY == "test-api-key"
     assert settings.CONVERSATIONAL_LLM_MODEL == "gpt-5.6-luna"
     assert settings.CONVERSATIONAL_LLM_REASONING_EFFORT == "medium"
-    assert settings.PLANNER_LLM_MODEL == "gpt-5.6-terra"
-    assert settings.PLANNER_LLM_REASONING_EFFORT == "medium"
+    assert settings.PLANNER_LLM_MODEL == "gpt-5.6-luna"
+    assert settings.PLANNER_LLM_REASONING_EFFORT == "high"
     assert settings.DYNAMODB_TABLE_NAME == "test-meal-planner"
     assert settings.AWS_REGION == "us-east-1"
     assert settings.TELEGRAM_ALLOWED_USER_IDS == frozenset({"1", "2"})
@@ -53,10 +54,42 @@ def test_config_default_values(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.llm_api_key == "key123"
     assert settings.conversational_llm_model == "gpt-5.6-luna"
     assert settings.conversational_llm_reasoning_effort == "medium"
-    assert settings.planner_llm_model == "gpt-5.6-terra"
-    assert settings.planner_llm_reasoning_effort == "medium"
+    assert settings.planner_llm_model == "gpt-5.6-luna"
+    assert settings.planner_llm_reasoning_effort == "high"
+    assert settings.planner_function_timeout_seconds == 300.0
     assert settings.dynamodb_table_name == "meal-planner"
     assert settings.aws_region == "us-east-1"
+
+
+def test_config_allows_explicit_planner_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planner model, effort, and deadline can be explicitly configured."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token123")
+    monkeypatch.setenv("LLM_API_KEY", "key123")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "123")
+    monkeypatch.setenv("PLANNER_LLM_MODEL", "custom-planner")
+    monkeypatch.setenv("PLANNER_LLM_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("PLANNER_FUNCTION_TIMEOUT_SECONDS", "301")
+
+    settings = Settings()
+
+    assert settings.planner_llm_model == "custom-planner"
+    assert settings.planner_llm_reasoning_effort == "xhigh"
+    assert settings.planner_function_timeout_seconds == 301.0
+
+
+def test_config_rejects_planner_deadline_below_external_call_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The planner deadline must contain its configured call budget."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token123")
+    monkeypatch.setenv("LLM_API_KEY", "key123")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "123")
+    monkeypatch.setenv("PLANNER_FUNCTION_TIMEOUT_SECONDS", "134")
+
+    with pytest.raises(ValidationError, match="Planner external-call budget"):
+        Settings()
 
 
 @pytest.mark.parametrize(

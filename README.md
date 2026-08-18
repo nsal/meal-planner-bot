@@ -82,8 +82,8 @@ Local development reads these variables from the environment or an ignored
 | `LLM_API_KEY` | required | Provider credential used by LiteLLM |
 | `CONVERSATIONAL_LLM_MODEL` | `gpt-5.6-luna` | Conversational LiteLLM model |
 | `CONVERSATIONAL_LLM_REASONING_EFFORT` | `medium` | Conversational reasoning effort |
-| `PLANNER_LLM_MODEL` | `gpt-5.6-terra` | Planner and grocery LiteLLM model |
-| `PLANNER_LLM_REASONING_EFFORT` | `medium` | Planner reasoning effort |
+| `PLANNER_LLM_MODEL` | `gpt-5.6-luna` | Planner and grocery LiteLLM model |
+| `PLANNER_LLM_REASONING_EFFORT` | `high` | Planner reasoning effort |
 | `DYNAMODB_TABLE_NAME` | `meal-planner` | DynamoDB table |
 | `AWS_REGION` | `us-east-1` | AWS client region |
 | `BOT_FUNCTION_TIMEOUT_SECONDS` | `30` | Bot Lambda deadline |
@@ -92,7 +92,7 @@ Local development reads these variables from the environment or an ignored
 | `BOT_LLM_MAX_RETRIES` | `2` | Bot transient LLM attempts |
 | `BOT_LLM_INITIAL_BACKOFF_SECONDS` | `1` | Bot initial retry backoff |
 | `BOT_HANDLER_SAFETY_MARGIN_SECONDS` | `4` | Bot non-provider safety margin |
-| `PLANNER_FUNCTION_TIMEOUT_SECONDS` | `180` | Planner Lambda deadline |
+| `PLANNER_FUNCTION_TIMEOUT_SECONDS` | `300` | Planner application deadline |
 | `PLANNER_TELEGRAM_REQUEST_TIMEOUT_SECONDS` | `10` | Planner Telegram HTTP timeout |
 | `PLANNER_LLM_REQUEST_TIMEOUT_SECONDS` | `45` | Per-attempt Planner LLM timeout |
 | `PLANNER_LLM_MAX_RETRIES` | `2` | Planner total provider attempts |
@@ -101,11 +101,15 @@ Local development reads these variables from the environment or an ignored
 
 The settings validator includes every LLM attempt, the maximum bounded retry
 wait (5 seconds per retry), each sequential Telegram allowance, and a handler
-safety margin. Each function's worst-case budget must fit its configured deadline.
-The application retry loop is the sole LLM retry layer; provider adapter retries
-are disabled so the configured attempts and backoff remain within that deadline.
-The Bot budget remains below the 30-second HTTP API integration limit. Lambda
-itself permits up to 900 seconds, but that larger service limit cannot extend
+safety margin. Each function's worst-case budget must fit its configured
+deadline; the Planner now has a five-minute (300-second) application deadline
+while retaining its 45-second request timeout and two provider attempts. Its
+Lambda timeout is 310 seconds, reserving ten seconds for the application to
+return after the planner deadline. The application retry loop is the sole LLM
+retry layer; provider adapter retries are disabled so the configured attempts
+and backoff remain within that deadline. The Bot budget remains below the
+30-second HTTP API integration limit. Lambda itself permits up to 900 seconds,
+but that larger service limit cannot extend
 the synchronous Telegram webhook deadline ([Lambda timeout quota](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html),
 [HTTP API integration quota](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-quotas.html)).
 
@@ -143,131 +147,88 @@ if the bot is later added to a group.
 
 ## AWS deployment
 
-Deploy from the repository root. The deployment creates two ARM64 Lambda
-functions, an HTTP API, and an on-demand DynamoDB table. The deploying
-principal needs permission to use CloudFormation, Lambda, API Gateway,
-DynamoDB, IAM, S3, and Secrets Manager.
+Deploy from the repository root with the single typed orchestrator. It creates
+two Python 3.14 ARM64 Lambda functions, an HTTP API, and an on-demand
+DynamoDB table. The deploying principal needs CloudFormation, Lambda, API
+Gateway, DynamoDB, IAM, S3, and Secrets Manager access.
 
-Select the account and region explicitly before creating resources. The
-commands below use `us-east-1`; replace it with your target region when
-needed:
+The orchestrator is intentionally pinned to the `meal-planner` AWS profile and
+`eu-west-1` region. AWS CLI 2.32.0 or newer is required because authentication
+uses `aws login --remote`; the CLI owns the interactive authorization URL and
+code exchange. After login, the resolved STS identity is printed and must be
+confirmed before any deployment or secret mutation.
 
-```bash
-export AWS_REGION=us-east-1
-export STACK_NAME=meal-planner-dev
-aws sts get-caller-identity
+Create an ignored `.env` with the required non-example fields below. Never
+commit this file or its values:
+
+```dotenv
+AWS_PROFILE=meal-planner
+AWS_REGION=eu-west-1
+STACK_NAME=meal-planner-dev
+TELEGRAM_BOT_TOKEN=replace-with-token
+TELEGRAM_WEBHOOK_SECRET=replace-with-webhook-secret
+LLM_API_KEY=replace-with-llm-key
+TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
+TELEGRAM_BOT_TOKEN_SECRET_NAME=meal-planner/bot-token
+TELEGRAM_WEBHOOK_SECRET_NAME=meal-planner/webhook-secret
+LLM_API_KEY_SECRET_NAME=meal-planner/llm-key
+SYNC_SECRETS=false
 ```
 
-Create three Secrets Manager secrets whose `SecretString` is the raw value,
-not a JSON object. Secret names are deployment parameters, so you may use
-different names if required by your account:
+The routine workflow checks that all three named Secrets Manager secrets exist,
+runs Ruff, mypy, pytest, SAM validation, SAM build, and fresh artifact tests,
+deploys with a generated refresh token, registers the canonical Telegram
+command menu, sets and verifies the webhook, and verifies the deployed
+DynamoDB transaction permission:
 
 ```bash
-aws secretsmanager create-secret --name meal-planner/bot-token \
-  --secret-string "$TELEGRAM_BOT_TOKEN"
-aws secretsmanager create-secret --name meal-planner/webhook-secret \
-  --secret-string "$TELEGRAM_WEBHOOK_SECRET"
-aws secretsmanager create-secret --name meal-planner/llm-key \
-  --secret-string "$LLM_API_KEY"
+uv run python scripts/deploy.py
 ```
 
-Validate the template, build the locked `uv` dependencies, and run the
-template tests against the fresh SAM artifact:
+Use `--guided` for the first SAM deployment. SAM retains its interactive
+terminal behavior in this mode; routine deployments are non-interactive and
+accept an empty changeset:
 
 ```bash
-uvx --from aws-sam-cli sam validate --lint --region "$AWS_REGION"
-uvx --from aws-sam-cli sam build --beta-features
-REQUIRE_SAM_ARTIFACTS=1 uv run pytest tests/test_template.py
+uv run python scripts/deploy.py --guided
 ```
 
-For the first deployment, use guided mode. Accept the generated S3 bucket,
-save the answers to `samconfig.toml`, and confirm the IAM capability prompt:
+Secret synchronization is a deliberate external mutation and requires both
+`SYNC_SECRETS=true` in `.env` and the command-line `--sync-secrets` flag. The
+orchestrator creates missing secrets or updates existing ones, but never puts
+secret values in command arguments, logs, errors, or summaries:
 
 ```bash
-uvx --from aws-sam-cli sam deploy --guided \
-  --stack-name "$STACK_NAME" \
-  --region "$AWS_REGION" \
-  --capabilities CAPABILITY_IAM \
-  --parameter-overrides \
-  TelegramBotTokenSecretName=meal-planner/bot-token \
-  TelegramWebhookSecretName=meal-planner/webhook-secret \
-  LlmApiKeySecretName=meal-planner/llm-key \
-  TelegramAllowedUserIds=123456789,987654321 \
-  SecretRefreshToken="$(date +%s)"
+uv run python scripts/deploy.py --sync-secrets
 ```
 
-For later deployments, rerun validation and build, then deploy the same stack
-without prompts. Keep the secret names unchanged unless you are deliberately
-switching credentials:
+If deployment succeeds but Telegram configuration or read-only AWS
+verification fails, rerun only the idempotent post-deployment stages after
+correcting the issue:
 
 ```bash
-uvx --from aws-sam-cli sam validate --lint --region "$AWS_REGION"
-uvx --from aws-sam-cli sam build --beta-features
-uvx --from aws-sam-cli sam deploy \
-  --stack-name "$STACK_NAME" \
-  --region "$AWS_REGION" \
-  --capabilities CAPABILITY_IAM \
-  --no-confirm-changeset \
-  --no-fail-on-empty-changeset \
-  --parameter-overrides \
-  TelegramBotTokenSecretName=meal-planner/bot-token \
-  TelegramWebhookSecretName=meal-planner/webhook-secret \
-  LlmApiKeySecretName=meal-planner/llm-key \
-  TelegramAllowedUserIds=123456789,987654321 \
-  SecretRefreshToken="$(date +%s)"
+uv run python scripts/deploy.py --post-deploy-only
 ```
 
-After deployment, register the native Telegram command menu. The helper reads
-`TELEGRAM_BOT_TOKEN` from the environment and does not change the webhook:
-
-```bash
-uv run python scripts/configure_telegram_commands.py
-```
-
-Run the helper again after changing the command catalogue or rotating the bot
-token; a webhook update is not required. Then read the generated URL and
-register it with Telegram. The `secret_token` must exactly match the webhook
-secret in Secrets Manager:
-
-```bash
-export WEBHOOK_URL="$(aws cloudformation describe-stacks \
-  --stack-name "$STACK_NAME" \
-  --region "$AWS_REGION" \
-  --query 'Stacks[0].Outputs[?OutputKey==`WebhookUrl`].OutputValue' \
-  --output text)"
-curl --fail-with-body \
-  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
-  --data-urlencode "url=${WEBHOOK_URL}" \
-  --data-urlencode "secret_token=${TELEGRAM_WEBHOOK_SECRET}"
-curl --fail-with-body \
-  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
-```
-
-The stack also outputs the DynamoDB table and both Lambda function names:
-
-```bash
-aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-  --region "$AWS_REGION" --query 'Stacks[0].Outputs' --output table
-```
-
-Before a smoke test, verify the deployed Bot execution role has the
-transaction permission required by meal logging, plan confirmation, and meal
-outcome callbacks. The verifier is read-only and requires the calling
-principal to have `cloudformation:DescribeStacks`,
-`lambda:GetFunctionConfiguration`, `dynamodb:DescribeTable`, and
-`iam:SimulatePrincipalPolicy` for the selected region and stack. It does not
-change the role or substitute for an end-to-end Telegram test:
+Recovery mode still performs remote login, identity confirmation, stack output
+resolution, command registration, webhook verification, and IAM verification;
+it never checks or changes secrets, runs quality gates, builds, or deploys.
+The stack outputs `WebhookUrl`, `MealPlannerTableName`, `BotFunctionName`, and
+`PlannerFunctionName`; malformed or missing outputs are failures. The direct
+read-only verifier remains available and accepts an explicit profile:
 
 ```bash
 uv run python scripts/verify_transaction_permission.py \
-  --stack-name "$STACK_NAME" \
-  --region "$AWS_REGION"
+  --stack-name meal-planner-dev \
+  --profile meal-planner \
+  --region eu-west-1
 ```
 
-Success prints an explicit allow for `dynamodb:TransactWriteItems` on the
-stack's exact table ARN. Missing outputs, malformed responses, denied or
-implicit-deny decisions, and AWS API errors are failures; stop and correct the
-deployment before continuing. The command does not print credentials.
+The verifier requires `cloudformation:DescribeStacks`,
+`lambda:GetFunctionConfiguration`, `dynamodb:DescribeTable`, and
+`iam:SimulatePrincipalPolicy`. It does not change the role or substitute for
+an end-to-end Telegram test. Secret synchronization and a live deployment are
+external mutations; inspect target names and the confirmed AWS identity first.
 
 This project is greenfield: source-backed meal writes have always created the
 date-indexed meal and its `MEAL_UPDATE#<telegram_update_id>` marker together.

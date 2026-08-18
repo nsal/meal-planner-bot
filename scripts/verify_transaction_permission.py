@@ -133,6 +133,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--stack-name", required=True)
     parser.add_argument("--region", required=True)
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="AWS profile (the deployment orchestrator uses meal-planner)",
+    )
     return parser
 
 
@@ -140,10 +145,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the read-only deployment verification command."""
     args = _parser().parse_args(argv)
     try:
-        cloudformation = boto3.client("cloudformation", region_name=args.region)
-        lambda_client = boto3.client("lambda", region_name=args.region)
-        dynamodb = boto3.client("dynamodb", region_name=args.region)
-        iam = boto3.client("iam", region_name=args.region)
+        if args.profile is None:
+            # Keep the standalone helper backwards compatible.  The release
+            # orchestrator always supplies an explicit profile and therefore
+            # takes the profile-aware path below.
+            cloudformation = boto3.client(
+                "cloudformation", region_name=args.region
+            )
+            lambda_client = boto3.client("lambda", region_name=args.region)
+            dynamodb = boto3.client("dynamodb", region_name=args.region)
+            iam = boto3.client("iam", region_name=args.region)
+        else:
+            session = boto3.Session(
+                profile_name=args.profile, region_name=args.region
+            )
+            cloudformation = session.client("cloudformation")
+            lambda_client = session.client("lambda")
+            dynamodb = session.client("dynamodb")
+            iam = session.client("iam")
         resources = resolve_resources(
             cloudformation, lambda_client, dynamodb, args.stack_name
         )

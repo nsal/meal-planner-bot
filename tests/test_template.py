@@ -341,6 +341,13 @@ def test_lambda_build_configuration() -> None:
     function_globals = template["Globals"]["Function"]
     assert function_globals["Runtime"] == "python3.14"
     assert function_globals["Architectures"] == ["arm64"]
+    parameters = template["Parameters"]
+    assert parameters["ConversationalLlmModel"]["Default"] == ("gpt-5.6-luna")
+    assert parameters["ConversationalLlmReasoningEffort"]["Default"] == (
+        "medium"
+    )
+    assert parameters["PlannerLlmModel"]["Default"] == "gpt-5.6-luna"
+    assert parameters["PlannerLlmReasoningEffort"]["Default"] == "high"
     variables = function_globals["Environment"]["Variables"]
     assert "TELEGRAM_REQUEST_TIMEOUT_SECONDS" not in variables
     assert "LLM_REQUEST_TIMEOUT_SECONDS" not in variables
@@ -354,8 +361,17 @@ def test_lambda_build_configuration() -> None:
     planner_variables = resources["PlannerFunction"]["Properties"][
         "Environment"
     ]["Variables"]
-    assert planner_variables["PLANNER_FUNCTION_TIMEOUT_SECONDS"] == "180"
+    planner_properties = resources["PlannerFunction"]["Properties"]
+    assert planner_properties["Timeout"] == 310
+    assert planner_properties["MemorySize"] == 512
+    assert planner_variables["PLANNER_FUNCTION_TIMEOUT_SECONDS"] == "300"
+    assert planner_variables["PLANNER_TELEGRAM_REQUEST_TIMEOUT_SECONDS"] == (
+        "10"
+    )
+    assert planner_variables["PLANNER_LLM_REQUEST_TIMEOUT_SECONDS"] == "45"
     assert planner_variables["PLANNER_LLM_MAX_RETRIES"] == "2"
+    assert planner_variables["PLANNER_LLM_INITIAL_BACKOFF_SECONDS"] == "1"
+    assert planner_variables["PLANNER_HANDLER_SAFETY_MARGIN_SECONDS"] == "20"
     for function_variables in (bot_variables, planner_variables):
         assert function_variables["SECRET_REFRESH_TOKEN"] == {
             "Ref": "SecretRefreshToken"

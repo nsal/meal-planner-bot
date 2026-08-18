@@ -1,7 +1,11 @@
 """Asynchronous Lambda workflows for plans and grocery finalization."""
 
 import logging
+import signal
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from types import FrameType
 from typing import Any, Optional
 
 import boto3  # type: ignore[import-untyped]
@@ -44,6 +48,29 @@ logger = logging.getLogger(__name__)
 GENERATE_PLAN = "generate_plan"
 FINALIZE_GROCERY = "finalize_grocery"
 REVISE_PLAN = "revise_plan"
+
+
+class PlannerDeadlineExceeded(BaseException):
+    """Raised when a planner invocation exceeds its application deadline."""
+
+
+@contextmanager
+def planner_deadline(timeout_seconds: float) -> Iterator[None]:
+    """Interrupt planner execution when its application deadline is reached."""
+    if timeout_seconds <= 0:
+        raise ValueError("Planner deadline must be positive")
+
+    def raise_deadline(_signum: int, _frame: FrameType | None) -> None:
+        raise PlannerDeadlineExceeded
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, raise_deadline)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 class PlannerHandler:
@@ -753,7 +780,15 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         llm_client,
         max_attempts=settings.planner_llm_max_retries,
     )
-    if not planner.handle_event(event):
-        logger.error("Invalid planner event")
-        return {"statusCode": 400, "body": "invalid event"}
+    try:
+        with planner_deadline(settings.planner_function_timeout_seconds):
+            if not planner.handle_event(event):
+                logger.error("Invalid planner event")
+                return {"statusCode": 400, "body": "invalid event"}
+    except PlannerDeadlineExceeded:
+        logger.error(
+            "Planner application deadline of %s seconds exceeded",
+            settings.planner_function_timeout_seconds,
+        )
+        return {"statusCode": 504, "body": "planner deadline exceeded"}
     return {"statusCode": 200, "body": "ok"}

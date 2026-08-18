@@ -75,10 +75,10 @@ class _SharedSettings(BaseSettings):
         default="medium", alias="CONVERSATIONAL_LLM_REASONING_EFFORT"
     )
     planner_llm_model: str = Field(
-        default="gpt-5.6-terra", alias="PLANNER_LLM_MODEL"
+        default="gpt-5.6-luna", alias="PLANNER_LLM_MODEL"
     )
     planner_llm_reasoning_effort: str = Field(
-        default="medium", alias="PLANNER_LLM_REASONING_EFFORT"
+        default="high", alias="PLANNER_LLM_REASONING_EFFORT"
     )
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
     dynamodb_table_name: str = Field(
@@ -92,7 +92,7 @@ class _SharedSettings(BaseSettings):
         alias="BOT_FUNCTION_TIMEOUT_SECONDS",
     )
     planner_function_timeout_seconds: float = Field(
-        default=180.0,
+        default=300.0,
         gt=0,
         le=900,
         alias="PLANNER_FUNCTION_TIMEOUT_SECONDS",

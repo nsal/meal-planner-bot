@@ -36,11 +36,11 @@ Parameters:
     Description: Reasoning effort for conversational replies
   PlannerLlmModel:
     Type: String
-    Default: gpt-5.6-terra
+    Default: gpt-5.6-luna
     Description: LiteLLM model identifier for plans and groceries
   PlannerLlmReasoningEffort:
     Type: String
-    Default: medium
+    Default: high
     AllowedValues: [none, minimal, low, medium, high, xhigh, max]
     Description: Reasoning effort for plans and groceries
   SecretRefreshToken:
@@ -139,11 +139,11 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-planner
       CodeUri: ./
       Handler: meal_planner.planner_handler.lambda_handler
-      Timeout: 180
+      Timeout: 310
       MemorySize: 512
       Environment:
         Variables:
-          PLANNER_FUNCTION_TIMEOUT_SECONDS: '180'
+          PLANNER_FUNCTION_TIMEOUT_SECONDS: '300'
           PLANNER_TELEGRAM_REQUEST_TIMEOUT_SECONDS: '10'
           PLANNER_LLM_REQUEST_TIMEOUT_SECONDS: '45'
           PLANNER_LLM_MAX_RETRIES: '2'
