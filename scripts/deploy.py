@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import stat
 import subprocess
 import sys
@@ -43,6 +44,7 @@ LLM_REASONING_EFFORTS = (
     "max",
 )
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MAX_COMMAND_DIAGNOSTIC_CHARS = 8_000
 
 
 class DeploymentError(RuntimeError):
@@ -295,6 +297,32 @@ def _redact(text: str, sensitive_values: Sequence[str]) -> str:
     return redacted
 
 
+def _bounded_diagnostic(text: str) -> str:
+    """Keep the useful end of verbose command output."""
+    if len(text) <= MAX_COMMAND_DIAGNOSTIC_CHARS:
+        return text
+    omitted = len(text) - MAX_COMMAND_DIAGNOSTIC_CHARS
+    return (
+        f"[... {omitted} earlier characters omitted ...]\n"
+        f"{text[-MAX_COMMAND_DIAGNOSTIC_CHARS:]}"
+    )
+
+
+def _command_diagnostics(
+    stdout: str,
+    stderr: str,
+    sensitive_values: Sequence[str],
+) -> str:
+    """Return bounded, redacted output sections for a failed command."""
+    sections: list[str] = []
+    for label, output in (("stdout", stdout), ("stderr", stderr)):
+        if not output.strip():
+            continue
+        redacted = _redact(output, sensitive_values)
+        sections.append(f"{label}:\n{_bounded_diagnostic(redacted).rstrip()}")
+    return "\n".join(sections)
+
+
 class CommandRunner:
     """Run commands without shell interpolation and with safe failures."""
 
@@ -305,6 +333,7 @@ class CommandRunner:
         self,
         args: Sequence[str],
         *,
+        stage: str = "external command",
         env: dict[str, str] | None = None,
         interactive: bool = False,
         input_text: str | None = None,
@@ -312,6 +341,7 @@ class CommandRunner:
     ) -> CommandResult:
         """Run one command and raise a sanitized error on failure."""
         command = tuple(str(argument) for argument in args)
+        command_text = _redact(shlex.join(command), sensitive_values)
         try:
             completed = subprocess.run(
                 list(command),
@@ -325,18 +355,24 @@ class CommandRunner:
         except (OSError, ValueError) as exc:
             message = _redact(str(exc), sensitive_values)
             raise CommandExecutionError(
-                command, None, f"could not execute {command[0]}: {message}"
+                command,
+                None,
+                f"{stage} could not execute {command[0]}: {message}",
             ) from None
 
         stdout = completed.stdout or ""
         stderr = completed.stderr or ""
         if completed.returncode != 0:
             safe_stderr = _redact(stderr, sensitive_values)
-            detail = f" ({safe_stderr.strip()})" if safe_stderr.strip() else ""
+            diagnostics = _command_diagnostics(stdout, stderr, sensitive_values)
+            detail = f"\n{diagnostics}" if diagnostics else ""
             raise CommandExecutionError(
                 command,
                 completed.returncode,
-                f"command failed with exit code {completed.returncode}{detail}",
+                (
+                    f"{stage} failed: {command_text} exited with code "
+                    f"{completed.returncode}{detail}"
+                ),
                 stderr=safe_stderr,
             )
         return CommandResult(command, completed.returncode, stdout, stderr)
@@ -399,7 +435,9 @@ def check_prerequisites(
     """Require supported AWS CLI, uv, and uvx executables."""
     try:
         aws = runner.run(
-            ["aws", "--version"], sensitive_values=settings.secret_values
+            ["aws", "--version"],
+            stage="check AWS CLI version",
+            sensitive_values=settings.secret_values,
         )
         version = _parse_aws_version(aws.stdout or aws.stderr)
         if version is None or version < AWS_CLI_MINIMUM:
@@ -407,9 +445,15 @@ def check_prerequisites(
             raise DeploymentError(
                 f"AWS CLI 2.32.0 or newer is required (minimum {minimum})"
             )
-        runner.run(["uv", "--version"], sensitive_values=settings.secret_values)
         runner.run(
-            ["uvx", "--version"], sensitive_values=settings.secret_values
+            ["uv", "--version"],
+            stage="check uv version",
+            sensitive_values=settings.secret_values,
+        )
+        runner.run(
+            ["uvx", "--version"],
+            stage="check uvx version",
+            sensitive_values=settings.secret_values,
         )
     except CommandExecutionError as exc:
         raise DeploymentError(
@@ -455,12 +499,14 @@ def authenticate_and_confirm(
     """Perform remote login, show the identity, and require confirmation."""
     runner.run(
         _aws_command(settings, "login", "--remote"),
+        stage="authenticate with AWS",
         env=settings.child_environment(),
         interactive=True,
         sensitive_values=settings.secret_values,
     )
     result = runner.run(
         _aws_command(settings, "sts", "get-caller-identity", output_json=True),
+        stage="resolve AWS identity",
         env=settings.child_environment(),
         sensitive_values=settings.secret_values,
     )
@@ -524,6 +570,7 @@ def synchronize_secrets(
                     "--secret-id",
                     name,
                 ),
+                stage=f"check secret {name}",
                 env=settings.child_environment(),
                 sensitive_values=settings.secret_values,
             )
@@ -547,6 +594,7 @@ def synchronize_secrets(
                         "--secret-string",
                         f"file://{secret_path}",
                     ),
+                    stage=f"create secret {name}",
                     env=settings.child_environment(),
                     sensitive_values=settings.secret_values,
                 )
@@ -564,6 +612,7 @@ def synchronize_secrets(
                         "--secret-string",
                         f"file://{secret_path}",
                     ),
+                    stage=f"update secret {name}",
                     env=settings.child_environment(),
                     sensitive_values=settings.secret_values,
                 )
@@ -574,23 +623,42 @@ def run_quality_gates(
 ) -> None:
     """Run local quality checks and fresh SAM artifact checks in order."""
     environment = settings.child_environment()
-    commands: tuple[tuple[str, ...], ...] = (
-        ("uv", "run", "ruff", "format", "--check", "."),
-        ("uv", "run", "ruff", "check", "."),
-        ("uv", "run", "mypy"),
-        ("uv", "run", "pytest"),
-        tuple(
-            _aws_sam_command(settings, "validate", "--lint", output_json=False)
+    commands: tuple[tuple[str, tuple[str, ...]], ...] = (
+        (
+            "check Ruff formatting",
+            ("uv", "run", "ruff", "format", "--check", "."),
         ),
-        tuple(_aws_sam_command(settings, "build", output_json=False)),
-        ("uv", "run", "pytest", "tests/test_template.py"),
+        ("run Ruff lint", ("uv", "run", "ruff", "check", ".")),
+        ("run mypy", ("uv", "run", "mypy")),
+        ("run pytest", ("uv", "run", "pytest")),
+        (
+            "validate SAM template",
+            tuple(
+                _aws_sam_command(
+                    settings, "validate", "--lint", output_json=False
+                )
+            ),
+        ),
+        (
+            "build SAM artifacts",
+            tuple(
+                _aws_sam_command(
+                    settings, "build", "--beta-features", output_json=False
+                )
+            ),
+        ),
+        (
+            "test fresh SAM artifacts",
+            ("uv", "run", "pytest", "tests/test_template.py"),
+        ),
     )
-    for index, command in enumerate(commands):
+    for index, (stage, command) in enumerate(commands):
         command_environment = dict(environment)
         if index == len(commands) - 1:
             command_environment["REQUIRE_SAM_ARTIFACTS"] = "1"
         runner.run(
             command,
+            stage=stage,
             env=command_environment,
             sensitive_values=settings.secret_values,
         )
@@ -651,6 +719,7 @@ def deploy_sam(
     )
     runner.run(
         command,
+        stage="deploy SAM stack",
         env=settings.child_environment(),
         interactive=guided,
         sensitive_values=settings.secret_values,
@@ -692,6 +761,7 @@ def resolve_stack_outputs(
             settings.stack_name,
             output_json=True,
         ),
+        stage="resolve CloudFormation stack outputs",
         env=settings.child_environment(),
         sensitive_values=settings.secret_values,
     )
@@ -753,6 +823,7 @@ def verify_transaction_permission(
             "--region",
             AWS_REGION,
         ),
+        stage="verify DynamoDB transaction permission",
         env=settings.child_environment(),
         sensitive_values=settings.secret_values,
     )

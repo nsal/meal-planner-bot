@@ -219,19 +219,47 @@ def test_command_runner_redacts_secret_failures(
     mocker.patch(
         "subprocess.run",
         return_value=subprocess.CompletedProcess(
-            ["tool"], 1, "", "failed with bot-secret and llm-secret"
+            ["tool"],
+            1,
+            "SAM requires --beta-features for bot-secret",
+            "failed with llm-secret",
         ),
     )
 
     with pytest.raises(deploy.CommandExecutionError) as error:
         deploy.CommandRunner().run(
             ["tool", "--safe-argument"],
+            stage="build SAM artifacts",
             input_text="bot-secret",
             sensitive_values=("bot-secret", "llm-secret"),
         )
 
-    assert "bot-secret" not in str(error.value)
-    assert "llm-secret" not in str(error.value)
+    message = str(error.value)
+    assert "build SAM artifacts failed" in message
+    assert "stdout:" in message
+    assert "--beta-features" in message
+    assert "bot-secret" not in message
+    assert "llm-secret" not in message
+
+
+def test_command_runner_bounds_verbose_diagnostics(
+    mocker: MockerFixture,
+) -> None:
+    output = "x" * (deploy.MAX_COMMAND_DIAGNOSTIC_CHARS * 2)
+    mocker.patch(
+        "subprocess.run",
+        return_value=subprocess.CompletedProcess(["tool"], 1, output, ""),
+    )
+
+    with pytest.raises(deploy.CommandExecutionError) as error:
+        deploy.CommandRunner().run(["tool"], stage="verbose failure")
+
+    message = str(error.value)
+    assert (
+        f"{deploy.MAX_COMMAND_DIAGNOSTIC_CHARS} earlier characters omitted"
+        in message
+    )
+    assert len(message) < len(output)
 
 
 def test_secret_sync_is_double_opt_in_and_uses_no_secret_arguments() -> None:
@@ -281,6 +309,19 @@ def test_routine_sam_deploy_resolves_an_artifact_bucket() -> None:
     assert "--no-fail-on-empty-changeset" in command
     assert "PlannerLlmModel=gpt-5.6-luna" in command
     assert "PlannerLlmReasoningEffort=high" in command
+
+
+def test_quality_gates_enable_sam_beta_features() -> None:
+    runner = FakeRunner()
+
+    deploy.run_quality_gates(runner, _settings())
+
+    build_command = next(
+        command
+        for command in runner.commands
+        if command[:5] == ("uvx", "--from", "aws-sam-cli", "sam", "build")
+    )
+    assert "--beta-features" in build_command
 
 
 def test_routine_and_post_deploy_workflows_have_expected_boundaries() -> None:
