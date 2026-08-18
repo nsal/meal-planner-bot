@@ -217,8 +217,17 @@ uvx --from aws-sam-cli sam deploy \
   SecretRefreshToken="$(date +%s)"
 ```
 
-After deployment, read the generated URL and register it with Telegram. The
-`secret_token` must exactly match the webhook secret in Secrets Manager:
+After deployment, register the native Telegram command menu. The helper reads
+`TELEGRAM_BOT_TOKEN` from the environment and does not change the webhook:
+
+```bash
+uv run python scripts/configure_telegram_commands.py
+```
+
+Run the helper again after changing the command catalogue or rotating the bot
+token; a webhook update is not required. Then read the generated URL and
+register it with Telegram. The `secret_token` must exactly match the webhook
+secret in Secrets Manager:
 
 ```bash
 export WEBHOOK_URL="$(aws cloudformation describe-stacks \
@@ -317,6 +326,18 @@ aws cloudformation delete-stack --stack-name "$STACK_NAME" \
 ```
 
 ## User workflow
+
+The Telegram command menu and `/help` show the same command reference:
+
+- `/start` — Start onboarding or view what to do next.
+- `/help` — Show the available commands.
+- `/profile` — View the household profile.
+- `/plan` — Create or retry a weekly meal plan.
+- `/grocery` — View the active grocery list.
+- `/today` — View today's planned meals.
+- `/submit_meals` — Log meals eaten in the past week.
+- `/checkin` — Record today's planned meal outcomes.
+- `/cancel` — Cancel an unfinished workflow.
 
 - `/start` begins onboarding. Supply the family name separately from the
   household size, every household member's name and calorie target, allergies,

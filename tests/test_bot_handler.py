@@ -23,6 +23,7 @@ from meal_planner.models.schemas import (
 from meal_planner.router import RouteResult, RouteType
 from meal_planner.telegram.access import TelegramAccessPolicy
 from meal_planner.telegram.api import TelegramAPIError
+from meal_planner.telegram.commands import BOT_COMMANDS, render_help
 from tests.factories import make_plan, make_profile
 
 
@@ -83,6 +84,35 @@ def test_start_requests_family_name_separately_from_member_names(
     assert "family name" in message
     assert "each household member's name" in message
     assert "tell me your name" not in message
+
+
+def test_help_renders_catalogue_without_repository_interaction(
+    handler: BotHandler,
+) -> None:
+    handler.handle_command(_command("help"))
+
+    handler.telegram_api.send_message.assert_called_once_with(1, render_help())
+    handler.repo.assert_not_called()
+
+
+def test_unknown_command_points_to_help(handler: BotHandler) -> None:
+    handler.handle_command(_command("unsupported"))
+
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "Unknown command: /unsupported" in message
+    assert "Type /help for options." in message
+    assert "/start for options" not in message
+
+
+def test_catalogue_commands_reach_their_dispatch_handlers(
+    handler: BotHandler, mocker: Any
+) -> None:
+    for command in BOT_COMMANDS:
+        command_handler = mocker.patch.object(handler, f"_cmd_{command.name}")
+
+        handler.handle_command(_command(command.name))
+
+        command_handler.assert_called_once_with(1, "user")
 
 
 def test_profile_displays_family_name_and_individual_members(

@@ -4,6 +4,7 @@ import json
 import logging
 import urllib.error
 import urllib.request
+from collections.abc import Sequence
 from typing import Any
 
 from meal_planner.models.schemas import (
@@ -11,6 +12,11 @@ from meal_planner.models.schemas import (
     MealOutcome,
     PlannedMeal,
     WeeklyPlan,
+)
+from meal_planner.telegram.commands import (
+    BOT_COMMANDS,
+    TelegramCommand,
+    validate_commands,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,6 +117,21 @@ class TelegramAPI:
                 payload["reply_markup"] = reply_markup
             results.append(self._post("sendMessage", payload))
         return results
+
+    def set_my_commands(
+        self,
+        commands: Sequence[TelegramCommand] = BOT_COMMANDS,
+    ) -> dict[str, Any]:
+        """Register the supplied command menu with Telegram."""
+        validated_commands = validate_commands(commands)
+        return self._post(
+            "setMyCommands",
+            {
+                "commands": [
+                    command.to_payload() for command in validated_commands
+                ]
+            },
+        )
 
     def answer_callback_query(
         self, callback_query_id: str, text: str | None = None

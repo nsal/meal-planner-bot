@@ -52,6 +52,7 @@ from meal_planner.router import (
 )
 from meal_planner.telegram.access import TelegramAccessPolicy
 from meal_planner.telegram.api import TelegramAPI, TelegramAPIError
+from meal_planner.telegram.commands import render_help
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,7 @@ class BotHandler:
             return
         handlers = {
             "start": self._cmd_start,
+            "help": self._cmd_help,
             "profile": self._cmd_profile,
             "plan": self._cmd_plan,
             "grocery": self._cmd_grocery,
@@ -149,8 +151,12 @@ class BotHandler:
         else:
             self.telegram_api.send_message(
                 route.chat_id,
-                f"Unknown command: /{route.command}. Type /start for options.",
+                f"Unknown command: /{route.command}. Type /help for options.",
             )
+
+    def _cmd_help(self, chat_id: int | str, user_id: str) -> None:
+        """Send the stateless command reference."""
+        self.telegram_api.send_message(chat_id, render_help())
 
     def _cmd_start(self, chat_id: int | str, user_id: str) -> None:
         profile = self.repo.get_profile(user_id)
