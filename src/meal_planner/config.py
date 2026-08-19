@@ -116,16 +116,25 @@ class _SharedSettings(BaseSettings):
         alias="BOT_LLM_REQUEST_TIMEOUT_SECONDS",
     )
     planner_llm_request_timeout_seconds: float = Field(
-        default=45.0,
+        default=240.0,
         gt=0,
-        le=60,
+        le=240,
         alias="PLANNER_LLM_REQUEST_TIMEOUT_SECONDS",
     )
     bot_llm_max_retries: int = Field(
         default=2, ge=1, le=5, alias="BOT_LLM_MAX_RETRIES"
     )
     planner_llm_max_retries: int = Field(
-        default=2, ge=1, le=2, alias="PLANNER_LLM_MAX_RETRIES"
+        default=1, ge=1, le=2, alias="PLANNER_LLM_MAX_RETRIES"
+    )
+    planner_grocery_llm_request_timeout_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        le=125,
+        alias="PLANNER_GROCERY_LLM_REQUEST_TIMEOUT_SECONDS",
+    )
+    planner_grocery_llm_max_retries: int = Field(
+        default=2, ge=1, le=2, alias="PLANNER_GROCERY_LLM_MAX_RETRIES"
     )
     bot_llm_initial_backoff_seconds: float = Field(
         default=1.0,
@@ -164,7 +173,7 @@ class _SharedSettings(BaseSettings):
             ),
             handler_safety_margin_seconds=self.bot_handler_safety_margin_seconds,
         )
-        planner_budget = external_call_budget_seconds(
+        planner_generation_budget = external_call_budget_seconds(
             llm_attempts=self.planner_llm_max_retries,
             llm_request_timeout_seconds=(
                 self.planner_llm_request_timeout_seconds
@@ -180,11 +189,28 @@ class _SharedSettings(BaseSettings):
             ),
             telegram_request_count=2,
         )
+        planner_grocery_budget = external_call_budget_seconds(
+            llm_attempts=self.planner_grocery_llm_max_retries,
+            llm_request_timeout_seconds=(
+                self.planner_grocery_llm_request_timeout_seconds
+            ),
+            llm_initial_backoff_seconds=(
+                self.planner_llm_initial_backoff_seconds
+            ),
+            telegram_allowance_seconds=(
+                self.planner_telegram_request_timeout_seconds
+            ),
+            handler_safety_margin_seconds=(
+                self.planner_handler_safety_margin_seconds
+            ),
+        )
         if bot_budget > self.bot_function_timeout_seconds:
             raise ValueError(
                 "Bot external-call budget exceeds its function timeout"
             )
-        if planner_budget > self.planner_function_timeout_seconds:
+        if max(planner_generation_budget, planner_grocery_budget) > (
+            self.planner_function_timeout_seconds
+        ):
             raise ValueError(
                 "Planner external-call budget exceeds its function timeout"
             )

@@ -176,6 +176,19 @@ async def test_chat_json_rejects_malformed_json(
     assert completion.call_args.kwargs["max_retries"] == 0
 
 
+@pytest.mark.asyncio
+async def test_strict_json_forwards_configured_timeout(
+    client: LLMClient, mocker: MockerFixture
+) -> None:
+    completion = mocker.patch(
+        "litellm.acompletion", return_value=_response('{"value": 1}')
+    )
+
+    assert await client.chat_json_strict("system", "user") == {"value": 1}
+    assert completion.call_args.kwargs["timeout"] == 7.0
+    assert completion.call_args.kwargs["max_retries"] == 0
+
+
 def test_sync_wrappers_return_text_and_json(
     client: LLMClient, mocker: MockerFixture
 ) -> None:

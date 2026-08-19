@@ -1,12 +1,13 @@
 """Planner generation and grocery-finalization workflow tests."""
 
+import logging
 import signal
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 
-from meal_planner.llm.client import LLMTransientError
+from meal_planner.llm.client import LLMTimeoutError, LLMTransientError
 from meal_planner.models.schemas import (
     ConversationState,
     ConversationWorkflowKind,
@@ -39,6 +40,25 @@ def _revision_state(
         amendment="Avoid cauliflower",
         target_week=week,
         expected_plan_revision=expected_plan_revision,
+        request_id=request_id,
+        revision=revision,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+
+
+def _plan_request_state(
+    week: date,
+    *,
+    request_id: str = "plan-1",
+    revision: int = 0,
+) -> ConversationState:
+    now = datetime.now(timezone.utc)
+    return ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+        step=ConversationWorkflowStep.GENERATING,
+        preference="low sodium",
         request_id=request_id,
         revision=revision,
         created_at=now,
@@ -610,6 +630,43 @@ def test_planner_attempt_limit_one_stops_after_transient_failure(
     assert "temporarily unavailable" in api.send_message.call_args.args[1]
 
 
+def test_planner_timeout_makes_one_call_and_retains_retry_state(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    state = _plan_request_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.get_conversation_state.return_value = state
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.side_effect = LLMTimeoutError(
+        "preference=low sodium prompt content"
+    )
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        preference="low sodium",
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    assert llm.chat_json_sync.call_count == 1
+    retry_state = repo.mark_conversation_retry_ready.call_args.args[1]
+    assert retry_state.step is ConversationWorkflowStep.RETRY_READY
+    assert retry_state.revision == state.revision + 1
+    repo.mark_conversation_retry_ready.assert_called_once_with(
+        "user", retry_state, expected_revision=state.revision
+    )
+    assert "/plan to retry" in api.send_message.call_args.args[1]
+
+
 def test_planner_attempt_limit_one_does_not_repair_invalid_output(
     mocker: Any,
 ) -> None:
@@ -630,7 +687,7 @@ def test_planner_attempt_limit_one_does_not_repair_invalid_output(
     assert "invalid meal plan" in api.send_message.call_args.args[1]
 
 
-def test_planner_attempt_limit_two_keeps_one_repair_attempt(
+def test_planner_default_attempt_limit_does_not_repair_invalid_output(
     mocker: Any,
 ) -> None:
     repo = mocker.MagicMock()
@@ -644,13 +701,84 @@ def test_planner_attempt_limit_two_keeps_one_repair_attempt(
     llm = mocker.MagicMock()
     llm.chat_json_sync.side_effect = [{}, make_plan_payload(week)]
 
-    PlannerHandler(repo, api, llm, max_attempts=2).generate_plan(
-        "user", 1, week_start=week
+    PlannerHandler(repo, api, llm).generate_plan("user", 1, week_start=week)
+
+    assert llm.chat_json_sync.call_count == 1
+    repo.save_generated_draft.assert_not_called()
+    assert "invalid meal plan" in api.send_message.call_args.args[1]
+
+
+def test_planner_failure_log_contains_only_operational_context(
+    mocker: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.model = "gpt-5.6-luna"
+    llm.chat_json_sync.side_effect = LLMTimeoutError(
+        "system prompt, preference, plan, credential, chat 42, user 7"
+    )
+    mocker.patch(
+        "meal_planner.planner_handler.time.monotonic",
+        side_effect=[10.0, 12.345],
     )
 
-    assert llm.chat_json_sync.call_count == 2
-    assert (
-        "Repair the previous response" in llm.chat_json_sync.call_args.args[1]
+    with caplog.at_level(
+        logging.WARNING, logger="meal_planner.planner_handler"
+    ):
+        PlannerHandler(repo, api, llm).generate_plan(
+            "user-7",
+            42,
+            week_start=date(2026, 8, 10),
+            preference="secret preference",
+        )
+
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "meal_planner.planner_handler"
+        and record.message.startswith("Planner LLM attempt failed")
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.attempt == 1
+    assert record.elapsed_ms == pytest.approx(2345.0)
+    assert record.model == "gpt-5.6-luna"
+    assert record.category == "timeout"
+    assert "system prompt" not in caplog.text
+    assert "secret preference" not in caplog.text
+    assert "chat 42" not in caplog.text
+    assert "user 7" not in caplog.text
+
+
+def test_planner_success_does_not_emit_failure_log(
+    mocker: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.save_generated_draft.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.model = "gpt-5.6-luna"
+    llm.chat_json_sync.return_value = make_plan_payload(date(2026, 8, 10))
+
+    with caplog.at_level(
+        logging.WARNING, logger="meal_planner.planner_handler"
+    ):
+        PlannerHandler(repo, api, llm).generate_plan(
+            "user", 1, week_start=date(2026, 8, 10)
+        )
+
+    assert not any(
+        record.message.startswith("Planner LLM attempt failed")
+        for record in caplog.records
     )
 
 
@@ -725,6 +853,29 @@ def test_finalize_grocery_success(mocker: Any) -> None:
     repo.complete_grocery.assert_called_once()
     assert repo.complete_grocery.call_args.args[2] == plan.revision
     assert repo.complete_grocery.call_args.args[3][0].name == "Produce"
+
+
+def test_finalize_grocery_uses_dedicated_llm_client(mocker: Any) -> None:
+    repo = mocker.MagicMock()
+    plan = make_plan(
+        status=PlanStatus.CONFIRMED, grocery_status=GroceryStatus.PENDING
+    )
+    repo.get_plan.return_value = plan
+    repo.get_profile.return_value = make_profile()
+    repo.complete_grocery.return_value = True
+    api = mocker.MagicMock()
+    plan_llm = mocker.MagicMock()
+    grocery_llm = mocker.MagicMock()
+    grocery_llm.chat_json_sync.return_value = {
+        "sections": [{"name": "Produce", "items": ["Apples"]}]
+    }
+
+    PlannerHandler(
+        repo, api, plan_llm, grocery_llm_client=grocery_llm
+    ).finalize_grocery("user", 1, plan.week_start_date)
+
+    plan_llm.chat_json_sync.assert_not_called()
+    grocery_llm.chat_json_sync.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -830,9 +981,35 @@ def test_lambda_handler_dispatches_and_rejects_invalid_event(
         lambda_handler({"user_id": "user", "chat_id": 1}, None)["statusCode"]
         == 200
     )
-    assert planner_class.call_args.kwargs["max_attempts"] == 2
+    assert planner_class.call_args.kwargs["max_attempts"] == 1
     planner_class.return_value.handle_event.return_value = False
     assert lambda_handler({}, None)["statusCode"] == 400
+
+
+def test_lambda_handler_configures_independent_grocery_client(
+    mocker: Any, mock_env: None
+) -> None:
+    mocker.patch("boto3.resource")
+    client_class = mocker.patch("meal_planner.planner_handler.LLMClient")
+    plan_client = mocker.MagicMock()
+    grocery_client = mocker.MagicMock()
+    client_class.side_effect = [plan_client, grocery_client]
+    planner_class = mocker.patch("meal_planner.planner_handler.PlannerHandler")
+    planner_class.return_value.handle_event.return_value = True
+
+    assert (
+        lambda_handler({"user_id": "user", "chat_id": 1}, None)["statusCode"]
+        == 200
+    )
+
+    assert client_class.call_args_list[0].kwargs["max_retries"] == 1
+    assert client_class.call_args_list[0].kwargs["request_timeout"] == 240.0
+    assert client_class.call_args_list[1].kwargs["max_retries"] == 2
+    assert client_class.call_args_list[1].kwargs["request_timeout"] == 120.0
+    assert planner_class.call_args.args[2] is plan_client
+    assert (
+        planner_class.call_args.kwargs["grocery_llm_client"] is grocery_client
+    )
 
 
 def test_planner_deadline_raises_when_the_alarm_fires(mocker: Any) -> None:

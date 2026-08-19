@@ -2,6 +2,7 @@
 
 import logging
 import signal
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
@@ -81,13 +82,16 @@ class PlannerHandler:
         repo: DynamoRepository,
         telegram_api: TelegramAPI,
         llm_client: Optional[LLMClient] = None,
-        max_attempts: int = 2,
+        max_attempts: int = 1,
+        *,
+        grocery_llm_client: Optional[LLMClient] = None,
     ) -> None:
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
         self.repo = repo
         self.telegram_api = telegram_api
         self.llm_client = llm_client
+        self.grocery_llm_client = grocery_llm_client
         self.max_attempts = max_attempts
 
     def generate_plan(
@@ -227,37 +231,44 @@ class PlannerHandler:
                     "\nRepair the previous response using these validation "
                     f"errors: {repair_feedback}"
                 )
+            started_at = time.monotonic()
             try:
                 raw = self._strict_json_call(client, prompt, user_message)
-            except LLMTimeoutError:
-                if is_last_attempt:
-                    self._notify_failure(
-                        chat_id,
-                        self._generation_failure_message(
-                            failure_mode, "timed out"
-                        ),
-                    )
-                    return None
-                continue
-            except LLMTransientError:
-                if is_last_attempt:
-                    self._notify_failure(
-                        chat_id,
-                        self._generation_failure_message(
-                            failure_mode, "temporarily unavailable"
-                        ),
-                    )
-                    return None
-                continue
-            except LLMPermanentError:
-                self._notify_failure(
-                    chat_id,
-                    self._generation_failure_message(
-                        failure_mode, "rejected the request"
-                    ),
+            except LLMFailure as exc:
+                self._log_llm_failure(
+                    client,
+                    attempt=attempt + 1,
+                    started_at=started_at,
+                    failure=exc,
                 )
-                return None
-            except LLMResponseFormatError, LLMFailure:
+                if isinstance(exc, LLMTimeoutError):
+                    if is_last_attempt:
+                        self._notify_failure(
+                            chat_id,
+                            self._generation_failure_message(
+                                failure_mode, "timed out"
+                            ),
+                        )
+                        return None
+                    continue
+                if isinstance(exc, LLMTransientError):
+                    if is_last_attempt:
+                        self._notify_failure(
+                            chat_id,
+                            self._generation_failure_message(
+                                failure_mode, "temporarily unavailable"
+                            ),
+                        )
+                        return None
+                    continue
+                if isinstance(exc, LLMPermanentError):
+                    self._notify_failure(
+                        chat_id,
+                        self._generation_failure_message(
+                            failure_mode, "rejected the request"
+                        ),
+                    )
+                    return None
                 if is_last_attempt:
                     self._notify_failure(
                         chat_id,
@@ -283,6 +294,41 @@ class PlannerHandler:
                 feedback or "week_start_date must match the request"
             )
         return None
+
+    @staticmethod
+    def _log_llm_failure(
+        client: LLMClient,
+        *,
+        attempt: int,
+        started_at: float,
+        failure: LLMFailure,
+    ) -> None:
+        """Log safe operational context for one failed Planner request."""
+        elapsed_ms = max((time.monotonic() - started_at) * 1000.0, 0.0)
+        if isinstance(failure, LLMTimeoutError):
+            category = "timeout"
+        elif isinstance(failure, LLMTransientError):
+            category = "transient"
+        elif isinstance(failure, LLMPermanentError):
+            category = "permanent"
+        elif isinstance(failure, LLMResponseFormatError):
+            category = "response_format"
+        else:
+            category = "failure"
+        logger.warning(
+            "Planner LLM attempt failed attempt=%d elapsed_ms=%.1f model=%s "
+            "category=%s",
+            attempt,
+            elapsed_ms,
+            client.model,
+            category,
+            extra={
+                "attempt": attempt,
+                "elapsed_ms": elapsed_ms,
+                "model": client.model,
+                "category": category,
+            },
+        )
 
     @staticmethod
     def _generation_failure_message(mode: str, reason: str) -> str:
@@ -433,7 +479,7 @@ class PlannerHandler:
             profile = self.repo.get_profile(user_id)
             if not profile:
                 raise ValueError("profile missing")
-            client = self.llm_client or LLMClient()
+            client = self.grocery_llm_client or self.llm_client or LLMClient()
             sections = parse_grocery_response(
                 client.chat_json_sync(
                     build_grocery_prompt(plan, profile.people_count),
@@ -766,7 +812,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         settings.telegram_bot_token,
         request_timeout=settings.planner_telegram_request_timeout_seconds,
     )
-    llm_client = LLMClient(
+    plan_llm_client = LLMClient(
         model=settings.planner_llm_model,
         api_key=settings.llm_api_key,
         reasoning_effort=settings.planner_llm_reasoning_effort,
@@ -774,10 +820,19 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         initial_backoff=settings.planner_llm_initial_backoff_seconds,
         request_timeout=settings.planner_llm_request_timeout_seconds,
     )
+    grocery_llm_client = LLMClient(
+        model=settings.planner_llm_model,
+        api_key=settings.llm_api_key,
+        reasoning_effort=settings.planner_llm_reasoning_effort,
+        max_retries=settings.planner_grocery_llm_max_retries,
+        initial_backoff=settings.planner_llm_initial_backoff_seconds,
+        request_timeout=settings.planner_grocery_llm_request_timeout_seconds,
+    )
     planner = PlannerHandler(
         repo,
         telegram_api,
-        llm_client,
+        plan_llm_client,
+        grocery_llm_client=grocery_llm_client,
         max_attempts=settings.planner_llm_max_retries,
     )
     try:

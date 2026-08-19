@@ -368,14 +368,36 @@ def test_lambda_build_configuration() -> None:
     assert planner_variables["PLANNER_TELEGRAM_REQUEST_TIMEOUT_SECONDS"] == (
         "10"
     )
-    assert planner_variables["PLANNER_LLM_REQUEST_TIMEOUT_SECONDS"] == "45"
-    assert planner_variables["PLANNER_LLM_MAX_RETRIES"] == "2"
+    assert planner_variables["PLANNER_LLM_REQUEST_TIMEOUT_SECONDS"] == "240"
+    assert planner_variables["PLANNER_LLM_MAX_RETRIES"] == "1"
     assert planner_variables["PLANNER_LLM_INITIAL_BACKOFF_SECONDS"] == "1"
+    assert (
+        planner_variables["PLANNER_GROCERY_LLM_REQUEST_TIMEOUT_SECONDS"]
+        == "120"
+    )
+    assert planner_variables["PLANNER_GROCERY_LLM_MAX_RETRIES"] == "2"
     assert planner_variables["PLANNER_HANDLER_SAFETY_MARGIN_SECONDS"] == "20"
     for function_variables in (bot_variables, planner_variables):
         assert function_variables["SECRET_REFRESH_TOKEN"] == {
             "Ref": "SecretRefreshToken"
         }
+
+
+def test_readme_documents_single_attempt_planner_diagnostics() -> None:
+    """Operational documentation matches the deployed Planner policy."""
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "`PLANNER_LLM_REQUEST_TIMEOUT_SECONDS` | `240`" in readme
+    assert "`PLANNER_LLM_MAX_RETRIES` | `1`" in readme
+    assert "`PLANNER_GROCERY_LLM_REQUEST_TIMEOUT_SECONDS` | `120`" in readme
+    assert "`PLANNER_GROCERY_LLM_MAX_RETRIES` | `2`" in readme
+    assert "one 240-second whole-plan provider attempt" in readme
+    assert "Grocery generation retains two" in readme
+    assert "`attempt`, `elapsed_ms`, `model`, and a" in readme
+    assert "These diagnostics do not include prompts" in readme
+    assert "credentials, raw events, chat IDs, or user IDs." in readme
+    assert "at most two whole-week provider requests" not in readme
+    assert "second request" not in readme
 
 
 def test_bot_transaction_permission_is_explicit_and_table_scoped() -> None:
