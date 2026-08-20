@@ -169,10 +169,15 @@ class LLMClient:
                         return str(getattr(msg, "content", ""))
                 return ""
             except Exception as exc:
+                transient = self._is_transient(exc)
+                category = "transient" if transient else "permanent"
                 logger.warning(
-                    "LLM request attempt %d failed: %s", attempt + 1, exc
+                    "LLM request attempt %d of %d failed category=%s",
+                    attempt + 1,
+                    self.max_retries,
+                    category,
                 )
-                if not self._is_transient(exc):
+                if not transient:
                     logger.error("LLM request failed permanently")
                     return None
                 if attempt >= self.max_retries - 1:

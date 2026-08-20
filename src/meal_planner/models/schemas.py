@@ -14,6 +14,8 @@ from pydantic import (
     model_validator,
 )
 
+from meal_planner.normalization import normalize_food
+
 ShortText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
@@ -32,9 +34,27 @@ PlanInstruction = Annotated[
     StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
 ]
 PlanningInstruction = PlanInstruction
+MAX_PLAN_REQUIREMENTS = 20
 RequestId = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
+]
+RequirementId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    ),
+]
+PreferenceFood = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
+]
+RepairFeedback = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=800),
 ]
 
 _GENERIC_NO_VALUE_PHRASES = frozenset(
@@ -96,6 +116,36 @@ class MealType(str, Enum):
     SNACK = "snack"
 
 
+class PreferenceRequirement(BaseModel):
+    """One bounded, exact-count preference for a weekly meal plan."""
+
+    id: RequirementId
+    source_text: PlanPreference
+    foods_any_of: list[PreferenceFood] = Field(min_length=1, max_length=20)
+    meal_type: MealType | None = None
+    exact_count: int = Field(ge=1, le=28)
+
+    @field_validator("foods_any_of")
+    @classmethod
+    def reject_duplicate_foods(cls, value: list[str]) -> list[str]:
+        """Reject alternatives that identify the same normalized food."""
+        normalized = [normalize_food(food) for food in value]
+        if any(not food_tokens for food_tokens in normalized):
+            raise ValueError(
+                "foods_any_of entries must contain matchable food tokens"
+            )
+        if len(set(normalized)) != len(value):
+            raise ValueError("foods_any_of must not contain duplicates")
+        return value
+
+    @model_validator(mode="after")
+    def validate_count_for_scope(self) -> "PreferenceRequirement":
+        """Keep exact counts within the seven-day selected meal scope."""
+        if self.meal_type is not None and self.exact_count > 7:
+            raise ValueError("exact_count must fit the selected meal scope")
+        return self
+
+
 class ConversationWorkflowKind(str, Enum):
     """Kinds of durable, multi-turn conversation workflows."""
 
@@ -131,6 +181,9 @@ class ConversationState(BaseModel):
     step: ConversationWorkflowStep
     meal_draft: MealLogDraft | None = None
     preference: PlanPreference | None = None
+    requirements: list[PreferenceRequirement] = Field(
+        default_factory=list, max_length=20
+    )
     amendment: PlanInstruction | None = None
     target_week: date | None = Field(
         default=None,
@@ -181,6 +234,7 @@ class ConversationState(BaseModel):
                 raise ValueError("meal workflows require a meal draft step")
             if (
                 self.preference is not None
+                or self.requirements
                 or self.request_id is not None
                 or self.amendment is not None
                 or self.target_week is not None
@@ -198,12 +252,9 @@ class ConversationState(BaseModel):
                 or self.expected_plan_revision is not None
             ):
                 raise ValueError("plan requests cannot contain revision fields")
-            if (
-                self.step is ConversationWorkflowStep.AWAITING_PREFERENCE
-                and self.preference is not None
-            ):
+            if self.preference is None and self.requirements:
                 raise ValueError(
-                    "awaiting-preference state cannot contain a preference"
+                    "plan requirements require a request preference"
                 )
         else:
             if self.step not in {
@@ -211,7 +262,11 @@ class ConversationState(BaseModel):
                 ConversationWorkflowStep.RETRY_READY,
             }:
                 raise ValueError("revision workflows require a generation step")
-            if self.meal_draft is not None or self.preference is not None:
+            if (
+                self.meal_draft is not None
+                or self.preference is not None
+                or self.requirements
+            ):
                 raise ValueError(
                     "revision workflows cannot contain other fields"
                 )
@@ -261,8 +316,14 @@ class PlanGenerationContext(BaseModel):
     """Validated request-specific context carried to the planner Lambda."""
 
     preference: PlanPreference | None = None
+    requirements: list[PreferenceRequirement] = Field(
+        default_factory=list, max_length=MAX_PLAN_REQUIREMENTS
+    )
+    attempt: int = Field(default=1, ge=1, le=2)
+    repair_feedback: RepairFeedback | None = None
     request_id: RequestId | None = None
     state_revision: int | None = Field(default=None, ge=0)
+    repair_id: RequestId | None = None
 
     @model_validator(mode="after")
     def validate_request_pair(self) -> "PlanGenerationContext":
@@ -271,6 +332,28 @@ class PlanGenerationContext(BaseModel):
             raise ValueError(
                 "request_id and state_revision must be supplied together"
             )
+        tracked_request = (
+            self.request_id is not None and self.state_revision is not None
+        )
+        if self.repair_id is not None and tracked_request:
+            raise ValueError("repair ID is only valid for untracked generation")
+        if self.preference is None and self.requirements:
+            raise ValueError("plan requirements require a request preference")
+        if self.repair_feedback is not None and self.attempt != 2:
+            raise ValueError(
+                "repair feedback requires the second generation attempt"
+            )
+        if self.attempt == 2 and self.repair_feedback is None:
+            raise ValueError(
+                "repair feedback is required for the second generation attempt"
+            )
+        if self.attempt == 2 and not tracked_request and self.repair_id is None:
+            raise ValueError(
+                "repair ID is required for an untracked second attempt"
+            )
+        requirement_ids = [requirement.id for requirement in self.requirements]
+        if len(requirement_ids) != len(set(requirement_ids)):
+            raise ValueError("plan requirements must have unique IDs")
         return self
 
 

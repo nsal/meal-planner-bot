@@ -34,6 +34,28 @@ the locked `uv` environment.
   generation. `no preference` and `anything` remove the extra constraint; the
   saved family profile is never changed. A failed request retains the
   preference so `/plan` can retry it.
+- Request-specific preferences support exact-count rules in natural language:
+  name one food or alternatives, give a positive count, and optionally name a
+  meal type. For example, `one breakfast with pancakes or crepes`, `eggs
+  exactly three times for breakfast`, and `one salmon or trout dinner` are
+  supported; omitting the meal type counts across eligible meals. Counts must
+  fit the seven-day plan. The conversational LLM turns these clauses into
+  typed rules and asks a focused clarification question when a clause is
+  ambiguous, unsupported, conflicting, or incomplete. The original wording
+  stays attached to the same `/plan` workflow while the next reply is
+  interpreted with it.
+- The application validates exact counts and evidence after generation. It
+  matches whole words or phrases in meal names and ingredient item names,
+  ignoring case, punctuation, whitespace, and conservative singular/plural
+  differences. Alternative foods share one count, and each distinct day and
+  meal type counts at most once; culinary knowledge alone is not evidence.
+  Accepted plans show a compact `Preferences satisfied` summary. The first
+  invalid plan is never saved or displayed: the Planner makes one automatic
+  repair in a fresh asynchronous invocation. A second invalid result is
+  terminal, retains the preference, and can be retried manually with `/plan`.
+  For an in-progress request, publication and release of that request happen
+  together, so a cancelled or replaced request cannot save or display a stale
+  result.
 - After a draft is displayed, describe whole-plan changes in natural language
   to start an asynchronous revision. The bot replaces the complete draft for
   the same week, preserves earlier plan-specific instructions, and leaves the
@@ -106,8 +128,9 @@ wait (5 seconds per retry), each sequential Telegram allowance, and a handler
 safety margin. Each function's worst-case budget must fit its configured
 deadline; the Planner now has a five-minute (300-second) application deadline
 while using one 240-second whole-plan provider attempt. The configured Planner
-budget is 280 seconds: 240 seconds for LiteLLM, two sequential 10-second
-Telegram allowances, and a 20-second safety margin. Its Lambda timeout is 310
+budget is 290 seconds: 240 seconds for LiteLLM, three sequential 10-second
+Telegram allowances for the plan, bounded summary, and review follow-up, and a
+20-second safety margin. Its Lambda timeout is 310
 seconds, reserving ten seconds for the application to return after the
 300-second Planner application deadline. Grocery generation retains two
 120-second provider attempts; including its maximum five-second retry wait,
@@ -125,10 +148,21 @@ use the function-specific settings above.
 
 Never commit `.env` or secret values.
 
-Planner generation makes one whole-week provider request. A timeout failure is
-reported separately from invalid structured output, and neither failure
-persists a partial plan. A failed initial generation retains the saved
-preference so the user can retry with `/plan`.
+Planner generation makes one whole-week provider request per invocation. An
+invalid first result can trigger one bounded repair in a fresh asynchronous
+Planner invocation; each invocation still makes only one provider request. A
+timeout failure is reported separately from invalid structured output, and
+neither failure persists a partial plan. A failed or terminally invalid
+generation retains the saved preference so the user can retry with `/plan`.
+
+Preference interpretation is LLM-assisted: the conversational model maps the
+user's natural-language clauses to supported food alternatives, counts, and
+meal scopes, or requests clarification. Application code is authoritative for
+the measurable parts. It validates the generated plan's structure, exact
+counts, and evidence from generated meal names and ingredient items before
+anything is persisted or displayed. The Planner model receives the interpreted
+rules as generation guidance, but its response is not trusted as proof of
+compliance.
 
 Planner LLM failures produce one sanitized CloudWatch warning per failed typed
 provider attempt. The record includes `attempt`, `elapsed_ms`, `model`, and a
@@ -348,9 +382,16 @@ The Telegram command menu and `/help` show the same command reference:
   and `no restrictions` are stored as empty categories. They count as answers,
   while omitted fields remain missing until supplied.
 - `/plan` asks for a one-time request preference before asynchronously
-  generating a complete seven-day draft. The draft is persisted before
-  Telegram delivery; failed generation retains the preference for `/plan` to
-  retry.
+  generating a complete seven-day draft. Use exact-count natural-language
+  clauses such as `three egg breakfasts` or `one dinner with salmon or trout`.
+  If the request cannot be interpreted completely, the bot asks one focused
+  clarification and keeps the raw preference in the same workflow; your next
+  reply is combined with it. The draft is persisted before Telegram delivery
+  only after application validation. An invalid first result receives one
+  automatic repair in a separate Planner invocation. If that repair also
+  fails, no draft is saved, the preference is retained, and `/plan` is the
+  manual retry. Cancelling or replacing an in-progress request prevents its
+  older asynchronous result from being published.
 - Ask conversationally to edit an existing meal; missing days or meal types
   are rejected rather than silently created.
 - Tell the bot to confirm the draft. Confirmation starts grocery generation.

@@ -5,6 +5,9 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 from pydantic import ValidationError
 
+from meal_planner.models import (
+    PreferenceRequirement as ExportedPreferenceRequirement,
+)
 from meal_planner.models.schemas import (
     ConversationIntent,
     ConversationState,
@@ -19,13 +22,254 @@ from meal_planner.models.schemas import (
     MealLogEntry,
     MealOutcome,
     PlanDay,
+    PlanGenerationContext,
     PlannedMeal,
     PlanRevisionContext,
     PlanStatus,
+    PreferenceRequirement,
     ProfileUpdateEntities,
     UserProfile,
     WeeklyPlan,
 )
+
+
+def test_preference_requirement_valid_exact_count_and_optional_scope() -> None:
+    """Accept bounded exact-count rules with or without meal scopes."""
+    scoped = PreferenceRequirement(
+        id="r1",
+        source_text="crepes or pancakes on a breakfast once",
+        foods_any_of=["crepes", "pancakes"],
+        meal_type="breakfast",
+        exact_count=1,
+    )
+    unscoped = PreferenceRequirement(
+        id="r2",
+        source_text="salmon twice",
+        foods_any_of=["salmon"],
+        exact_count=2,
+    )
+
+    assert isinstance(scoped, ExportedPreferenceRequirement)
+    assert scoped.meal_type.value == "breakfast"
+    assert unscoped.meal_type is None
+    assert unscoped.exact_count == 2
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"foods_any_of": []},
+        {"foods_any_of": ["Salmon", " salmon "]},
+        {"foods_any_of": ["egg", "eggs"]},
+        {"foods_any_of": ["cookie", "cookies"]},
+        {"foods_any_of": ["brownie", "brownies"]},
+        {"foods_any_of": ["smoothie", "smoothies"]},
+        {"foods_any_of": ["pie", "pies"]},
+        {"foods_any_of": ["berry", "berries"]},
+        {"foods_any_of": ["red-pepper", "red pepper"]},
+        {"foods_any_of": ["ｅｇｇ", "egg"]},
+        {"foods_any_of": ["red  pepper", "red pepper"]},
+        {"foods_any_of": ["---"]},
+        {"foods_any_of": ["!!! ???"]},
+        {"foods_any_of": ["$$$"]},
+        {"foods_any_of": ["🍕🍔"]},
+        {"foods_any_of": ["eggs", "---"]},
+        {"foods_any_of": ["rice", "!!!"]},
+        {"id": ""},
+        {"id": "bad id"},
+        {"id": "x" * 65},
+        {"source_text": "x" * 501},
+        {"foods_any_of": ["x" * 101]},
+        {"foods_any_of": ["food"] * 21},
+        {"exact_count": 0},
+        {"exact_count": 29},
+        {"meal_type": "brunch"},
+    ],
+)
+def test_preference_requirement_rejects_invalid_values(
+    values: dict[str, object],
+) -> None:
+    """Reject empty, duplicated, malformed, and oversized rule values."""
+    defaults: dict[str, object] = {
+        "id": "r1",
+        "source_text": "salmon twice",
+        "foods_any_of": ["salmon"],
+        "exact_count": 2,
+    }
+
+    with pytest.raises(ValidationError):
+        PreferenceRequirement(**{**defaults, **values})
+
+
+@pytest.mark.parametrize(
+    "foods_any_of",
+    [
+        ["red-pepper"],
+        ["vitamin B-12"],
+        ["meal 2"],
+        ["123/456"],
+    ],
+)
+def test_preference_requirement_accepts_punctuation_separated_food_tokens(
+    foods_any_of: list[str],
+) -> None:
+    """Accept alternatives that retain letters or digits after normalization."""
+    requirement = PreferenceRequirement(
+        id="r1",
+        source_text="a measurable preference",
+        foods_any_of=foods_any_of,
+        exact_count=1,
+    )
+
+    assert requirement.foods_any_of == foods_any_of
+
+
+@pytest.mark.parametrize(
+    ("meal_type", "exact_count"),
+    [("breakfast", 8), ("lunch", 8), ("dinner", 8), ("snack", 8)],
+)
+def test_preference_requirement_rejects_count_beyond_scoped_week(
+    meal_type: str, exact_count: int
+) -> None:
+    """A scoped rule cannot match more than once per day."""
+    with pytest.raises(ValidationError, match="selected meal scope"):
+        PreferenceRequirement(
+            id="r1",
+            source_text="food",
+            foods_any_of=["food"],
+            meal_type=meal_type,
+            exact_count=exact_count,
+        )
+
+
+def test_plan_generation_context_carries_bounded_preference_metadata() -> None:
+    """Generation events carry rules and at most one repair attempt."""
+    context = PlanGenerationContext(
+        preference="eggs three times for breakfast",
+        requirements=[
+            PreferenceRequirement(
+                id="r1",
+                source_text="eggs three times for breakfast",
+                foods_any_of=["eggs"],
+                meal_type="breakfast",
+                exact_count=3,
+            )
+        ],
+        attempt=2,
+        repair_feedback="breakfast rule r1 matched 2; expected exactly 3",
+        repair_id="repair-123",
+    )
+
+    assert context.requirements[0].id == "r1"
+    assert context.attempt == 2
+    assert context.repair_feedback is not None
+    assert context.repair_id == "repair-123"
+
+
+def test_tracked_attempt_two_may_omit_repair_id() -> None:
+    """Tracked retries use request ownership instead of a repair marker."""
+    context = PlanGenerationContext(
+        attempt=2,
+        repair_feedback="retry feedback",
+        request_id="request-1",
+        state_revision=3,
+    )
+
+    assert context.repair_id is None
+
+
+def test_untracked_attempt_two_requires_repair_id() -> None:
+    """Untracked retries require a durable replay token."""
+    with pytest.raises(ValidationError, match="repair ID"):
+        PlanGenerationContext(attempt=2, repair_feedback="retry feedback")
+
+
+def test_untracked_attempt_one_carries_repair_id_into_redelivery() -> None:
+    """An initial untracked event establishes its stable repair token."""
+    context = PlanGenerationContext(attempt=1, repair_id="repair-123")
+
+    assert context.repair_id == "repair-123"
+
+
+@pytest.mark.parametrize("repair_id", ["   ", "x" * 101])
+def test_plan_generation_context_rejects_unbounded_repair_id(
+    repair_id: str,
+) -> None:
+    """Repair tokens use the bounded request-id wire contract."""
+    with pytest.raises(ValidationError):
+        PlanGenerationContext(
+            attempt=2,
+            repair_feedback="retry feedback",
+            repair_id=repair_id,
+        )
+
+
+def test_plan_generation_context_allows_attempt_one_without_feedback() -> None:
+    """The initial generation attempt has no repair feedback."""
+    context = PlanGenerationContext(attempt=1)
+
+    assert context.attempt == 1
+    assert context.repair_feedback is None
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"attempt": 0},
+        {"attempt": 3},
+        {"repair_feedback": "feedback"},
+        {"repair_feedback": "x" * 801},
+        {"attempt": 2},
+        {"attempt": 2, "repair_feedback": None},
+        {"attempt": 2, "repair_feedback": "   "},
+        {
+            "requirements": [
+                {
+                    "id": "bad id",
+                    "source_text": "eggs once",
+                    "foods_any_of": ["eggs"],
+                    "exact_count": 1,
+                }
+            ]
+        },
+    ],
+)
+def test_plan_generation_context_rejects_invalid_nested_metadata(
+    values: dict[str, object],
+) -> None:
+    """Reject invalid attempts, feedback, and nested rule metadata."""
+    with pytest.raises(ValidationError):
+        PlanGenerationContext(**values)
+
+
+def test_preference_requirement_keeps_legacy_plan_and_conversation_models() -> (
+    None
+):
+    """Adding the requirement contract does not change old model payloads."""
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+        step=ConversationWorkflowStep.GENERATING,
+        preference="vegetarian",
+        request_id="request-1",
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    plan = WeeklyPlan(
+        week_start_date="2026-08-10",
+        days=[PlanDay(day=day) for day in range(1, 8)],
+    )
+
+    restored_state = ConversationState.model_validate_json(
+        state.model_dump_json()
+    )
+    restored_plan = WeeklyPlan.model_validate_json(plan.model_dump_json())
+
+    assert restored_state.preference == "vegetarian"
+    assert restored_state.request_id == "request-1"
+    assert restored_plan.week_start_date == "2026-08-10"
+    assert len(restored_plan.days) == 7
 
 
 def test_conversation_state_validates_workflow_shape_and_expiry() -> None:
@@ -51,6 +295,24 @@ def test_conversation_state_validates_workflow_shape_and_expiry() -> None:
             updated_at=now,
             expires_at=now + timedelta(hours=24),
         )
+
+
+def test_plan_preference_can_be_retained_while_awaiting_clarification() -> None:
+    """Pending clarification keeps the raw preference in the same workflow."""
+    now = datetime.now(timezone.utc)
+
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+        step=ConversationWorkflowStep.AWAITING_PREFERENCE,
+        preference="eggs three times, make it healthy",
+        request_id="request-clarification",
+        revision=1,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+
+    assert state.preference == "eggs three times, make it healthy"
 
 
 def test_family_member_valid() -> None:

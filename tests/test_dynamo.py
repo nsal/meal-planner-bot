@@ -1,6 +1,8 @@
 """DynamoDB repository integration tests."""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
+from threading import Barrier
 from typing import Any, Generator
 
 import boto3
@@ -8,7 +10,10 @@ import pytest
 from botocore.exceptions import ClientError
 from moto import mock_aws
 
-from meal_planner.db.dynamo import DynamoRepository
+from meal_planner.db.dynamo import (
+    DynamoRepository,
+    RepairPublicationOutcome,
+)
 from meal_planner.models.schemas import (
     ConversationState,
     ConversationWorkflowKind,
@@ -880,6 +885,288 @@ def test_generated_draft_rejects_stale_edit_and_duplicate_worker(
     assert not repo.save_generated_draft(
         "user", replacement, expected_revision=None
     )
+
+
+def test_tracked_generated_draft_publishes_and_clears_state_atomically(
+    repo: DynamoRepository,
+) -> None:
+    week = date(2026, 8, 10)
+    draft = make_plan(week_start=week)
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+        step=ConversationWorkflowStep.GENERATING,
+        preference="balanced",
+        request_id="request-1",
+        revision=4,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    assert repo.save_conversation_state("user", state)
+
+    assert repo.save_generated_draft_and_clear_conversation_state(
+        "user",
+        draft,
+        expected_revision=None,
+        request_id="request-1",
+        expected_state_revision=4,
+    )
+
+    assert repo.get_plan("user", week) == draft
+    assert repo.get_conversation_state("user") is None
+
+
+def test_tracked_generated_draft_rejects_plan_revision_conflict(
+    repo: DynamoRepository,
+) -> None:
+    week = date(2026, 8, 10)
+    current = make_plan(week_start=week, revision=1)
+    repo.save_plan("user", current)
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+        step=ConversationWorkflowStep.GENERATING,
+        request_id="request-1",
+        revision=0,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    assert repo.save_conversation_state("user", state)
+    replacement = make_plan(week_start=week, revision=2)
+
+    assert not repo.save_generated_draft_and_clear_conversation_state(
+        "user",
+        replacement,
+        expected_revision=0,
+        request_id="request-1",
+        expected_state_revision=0,
+    )
+
+    assert repo.get_plan("user", week) == current
+    assert repo.get_conversation_state("user") == state
+
+
+def test_tracked_generated_draft_rejects_state_ownership_conflict(
+    repo: DynamoRepository,
+) -> None:
+    week = date(2026, 8, 10)
+    current = make_plan(week_start=week, revision=1)
+    repo.save_plan("user", current)
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+        step=ConversationWorkflowStep.GENERATING,
+        request_id="new-owner",
+        revision=1,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    assert repo.save_conversation_state("user", state)
+    replacement = make_plan(week_start=week, revision=2)
+
+    assert not repo.save_generated_draft_and_clear_conversation_state(
+        "user",
+        replacement,
+        expected_revision=1,
+        request_id="old-owner",
+        expected_state_revision=0,
+    )
+
+    assert repo.get_plan("user", week) == current
+    assert repo.get_conversation_state("user") == state
+
+
+def test_tracked_generated_draft_reraises_nonconditional_transaction_error(
+    mocker: Any,
+) -> None:
+    table = mocker.MagicMock()
+    table.name = "test-meal-planner"
+    error = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException"}},
+        "TransactWriteItems",
+    )
+    table.meta.client.transact_write_items.side_effect = error
+    repo = DynamoRepository(table)
+
+    with pytest.raises(ClientError) as raised:
+        repo.save_generated_draft_and_clear_conversation_state(
+            "user",
+            make_plan(),
+            expected_revision=None,
+            request_id="request-1",
+            expected_state_revision=0,
+        )
+
+    assert raised.value is error
+
+
+def test_repaired_draft_publishes_with_atomic_repair_marker(
+    repo: DynamoRepository,
+) -> None:
+    """An untracked repair writes its draft and marker in one transaction."""
+    draft = make_plan(week_start=date(2026, 8, 10))
+
+    outcome = repo.save_repaired_draft_once(
+        "user", draft, expected_revision=None, repair_id="repair-123"
+    )
+
+    assert outcome is RepairPublicationOutcome.PUBLISHED
+    assert repo.get_plan("user", draft.week_start) == draft
+    marker = repo.table.get_item(
+        Key={"PK": "USER#user", "SK": "PLAN_REPAIR#repair-123"}
+    )["Item"]
+    assert marker == {
+        "PK": "USER#user",
+        "SK": "PLAN_REPAIR#repair-123",
+    }
+
+
+def test_repaired_draft_replay_is_duplicate_and_silent_at_repository_boundary(
+    repo: DynamoRepository,
+) -> None:
+    """A second transaction with one token cannot replace the first draft."""
+    first = make_plan(week_start=date(2026, 8, 10))
+    second = make_plan(week_start=first.week_start, revision=0)
+    second.days[0].meals[0].name = "Different worker"
+
+    assert (
+        repo.save_repaired_draft_once(
+            "user", first, expected_revision=None, repair_id="repair-123"
+        )
+        is RepairPublicationOutcome.PUBLISHED
+    )
+    assert (
+        repo.save_repaired_draft_once(
+            "user", second, expected_revision=None, repair_id="repair-123"
+        )
+        is RepairPublicationOutcome.DUPLICATE
+    )
+    assert repo.get_plan("user", first.week_start) == first
+
+
+def test_repaired_draft_plan_revision_conflict_does_not_leave_marker(
+    repo: DynamoRepository,
+) -> None:
+    """A stale plan condition rolls back the marker put."""
+    current = make_plan(week_start=date(2026, 8, 10), revision=1)
+    replacement = make_plan(week_start=current.week_start, revision=2)
+    repo.save_plan("user", current)
+
+    outcome = repo.save_repaired_draft_once(
+        "user", replacement, expected_revision=0, repair_id="repair-123"
+    )
+
+    assert outcome is RepairPublicationOutcome.STALE
+    assert repo.get_plan("user", current.week_start) == current
+    assert not repo.table.get_item(
+        Key={"PK": "USER#user", "SK": "PLAN_REPAIR#repair-123"}
+    ).get("Item")
+
+
+def test_repaired_draft_marker_conflict_does_not_write_plan(
+    repo: DynamoRepository,
+) -> None:
+    """An existing marker rolls back a new-plan write."""
+    repo.table.put_item(
+        Item={"PK": "USER#user", "SK": "PLAN_REPAIR#repair-123"}
+    )
+    draft = make_plan(week_start=date(2026, 8, 10))
+
+    outcome = repo.save_repaired_draft_once(
+        "user", draft, expected_revision=None, repair_id="repair-123"
+    )
+
+    assert outcome is RepairPublicationOutcome.DUPLICATE
+    assert repo.get_plan("user", draft.week_start) is None
+
+
+@pytest.mark.parametrize(
+    ("reasons", "expected"),
+    [
+        (
+            [{"Code": "None"}, {"Code": "ConditionalCheckFailed"}],
+            RepairPublicationOutcome.DUPLICATE,
+        ),
+        (
+            [{"Code": "ConditionalCheckFailed"}, {"Code": "None"}],
+            RepairPublicationOutcome.STALE,
+        ),
+    ],
+)
+def test_repaired_draft_classifies_exact_cancellation_reasons(
+    mocker: Any,
+    reasons: list[dict[str, str]],
+    expected: RepairPublicationOutcome,
+) -> None:
+    """Only the documented plan/marker condition failures are classified."""
+    table = mocker.MagicMock()
+    table.name = "test-meal-planner"
+    table.meta.client.transact_write_items.side_effect = ClientError(
+        {
+            "Error": {"Code": "TransactionCanceledException"},
+            "CancellationReasons": reasons,
+        },
+        "TransactWriteItems",
+    )
+
+    outcome = DynamoRepository(table).save_repaired_draft_once(
+        "user", make_plan(), expected_revision=None, repair_id="repair-123"
+    )
+
+    assert outcome is expected
+
+
+def test_repaired_draft_reraises_unexpected_transaction_failure(
+    mocker: Any,
+) -> None:
+    """Nonconditional transaction failures stay visible to Planner handling."""
+    table = mocker.MagicMock()
+    table.name = "test-meal-planner"
+    error = ClientError(
+        {
+            "Error": {
+                "Code": "TransactionCanceledException",
+            },
+            "CancellationReasons": [
+                {"Code": "None"},
+                {"Code": "TransactionConflict"},
+            ],
+        },
+        "TransactWriteItems",
+    )
+    table.meta.client.transact_write_items.side_effect = error
+
+    with pytest.raises(ClientError) as raised:
+        DynamoRepository(table).save_repaired_draft_once(
+            "user", make_plan(), expected_revision=None, repair_id="repair-123"
+        )
+
+    assert raised.value is error
+
+
+def test_repaired_draft_concurrent_replays_publish_once(
+    repo: DynamoRepository,
+) -> None:
+    """Concurrent workers sharing a token produce one durable publication."""
+    barrier = Barrier(2)
+    drafts = [make_plan(week_start=date(2026, 8, 10)) for _ in range(2)]
+
+    def publish(draft: Any) -> RepairPublicationOutcome:
+        barrier.wait()
+        return repo.save_repaired_draft_once(
+            "user", draft, expected_revision=None, repair_id="repair-123"
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(publish, drafts))
+
+    assert sorted(outcome.value for outcome in outcomes) == [
+        "duplicate",
+        "published",
+    ]
 
 
 def test_generated_draft_reraises_nonconditional_dynamodb_errors(

@@ -8,6 +8,7 @@ from meal_planner.models.schemas import (
     ConversationState,
     MealLogEntry,
     MealOutcome,
+    PreferenceRequirement,
     ProfileUpdateEntities,
     UserProfile,
     WeeklyPlan,
@@ -188,6 +189,8 @@ def build_plan_prompt(
     previous_plan: Optional[WeeklyPlan] = None,
     week_start: str = "2026-08-10",
     preference: str | None = None,
+    requirements: list[PreferenceRequirement] | None = None,
+    repair_feedback: str | None = None,
 ) -> str:
     """Build 7-day meal plan generation prompt."""
     profile_text = "General profile (2000 kcal/day target, 1 person)."
@@ -240,6 +243,32 @@ def build_plan_prompt(
             f"Swapped: {', '.join(swapped_meals) or 'None'}"
         )
 
+    requirement_text = "No interpreted measurable requirements."
+    if requirements:
+        requirement_lines = []
+        for requirement in requirements:
+            scope = (
+                requirement.meal_type.value
+                if requirement.meal_type
+                else "any meal"
+            )
+            requirement_lines.append(
+                f"- {requirement.id}: source_text: "
+                f"{requirement.source_text}; "
+                f"foods_any_of: {', '.join(requirement.foods_any_of)}; "
+                f"meal_type: {scope}; "
+                f"exact_count: {requirement.exact_count}"
+            )
+        requirement_text = "\n".join(requirement_lines)
+    repair_text = ""
+    if repair_feedback:
+        repair_text = (
+            "=== BOUNDED REPAIR FEEDBACK ===\n"
+            f"{repair_feedback.strip()[:800]}\n\n"
+            "Correct the feedback while preserving all permanent profile "
+            "constraints and the exact rules above.\n\n"
+        )
+
     return (
         "You are an expert nutritionist and meal planner.\n"
         "Generate a 7-day meal plan based on the profile below.\n\n"
@@ -252,6 +281,17 @@ def build_plan_prompt(
         "Use this request preference when compatible with the permanent "
         "profile constraints below. Allergies, restrictions, calorie "
         "targets, and safety requirements always take precedence.\n\n"
+        "=== INTERPRETED PREFERENCE RULES (EXACT COMPLIANCE) ===\n"
+        f"{requirement_text}\n"
+        "Treat each exact_count as an exact weekly count. Do not omit, "
+        "weaken, or reinterpret any listed rule. Permanent profile "
+        "constraints remain higher priority.\n\n"
+        "=== GENERATED PLAN CONTRACT ===\n"
+        "Include exactly one breakfast, one lunch, and one dinner on each "
+        "of the 7 days. Snack is optional, and do not add other meal "
+        "types. Every present meal must include at least one non-empty "
+        "ingredient item and positive est_calories.\n\n"
+        f"{repair_text}"
         f"Recent Meal History (avoid repeating):\n{history_text}\n\n"
         f"Previous Plan Feedback:\n{prev_plan_text}\n\n"
         "=== OUTPUT JSON SCHEMA ===\n"
@@ -276,6 +316,52 @@ def build_plan_prompt(
         "    }\n"
         "  ]\n"
         "}\n"
+    )
+
+
+def build_preference_interpretation_prompt(preference: str) -> str:
+    """Build a prompt for interpreting measurable plan preferences."""
+    return (
+        "You interpret a user's request-specific meal-plan preference into "
+        "safe, measurable weekly rules. Do not generate a meal plan.\n\n"
+        "=== USER PREFERENCE ===\n"
+        f"{preference.strip()}\n\n"
+        "=== INTERPRETATION RULES ===\n"
+        "Return one requirement for each meaningful, supported clause. "
+        "Every meaningful clause must be represented by a requirement or "
+        "listed in unparsed_text; never silently discard a clause.\n"
+        "Each requirement must express a positive exact weekly count. "
+        "Combine alternative foods that satisfy one rule together in "
+        "foods_any_of; "
+        "alternatives count as one union, not separate requirements.\n"
+        "Use meal_type only when the user names breakfast, lunch, dinner, "
+        "or snack. Omit the scope with null when the rule applies to any "
+        "meal.\n"
+        "Use source_text for the user's bounded clause. Do not invent a "
+        "count, food, scope, or interpretation that the user did not give.\n"
+        "If wording is ambiguous, conflicting, impossible to count, or "
+        "unsupported subjective wording, return a focused clarification. "
+        "Unsupported or subjective requests such as 'make it healthy and "
+        "fun' must not be guessed. A clarification is required whenever "
+        "any clause remains unresolved.\n\n"
+        "=== OUTPUT JSON SCHEMA ===\n"
+        "Return only one JSON object with all three keys:\n"
+        "{\n"
+        '  "requirements": [\n'
+        "    {\n"
+        '      "id": "r1",\n'
+        '      "source_text": "eggs three times for breakfast",\n'
+        '      "foods_any_of": ["eggs"],\n'
+        '      "meal_type": "breakfast",\n'
+        '      "exact_count": 3\n'
+        "    }\n"
+        "  ],\n"
+        '  "clarification": null,\n'
+        '  "unparsed_text": []\n'
+        "}\n"
+        "Set clarification to one focused question when the request is "
+        "ambiguous or conflicting. Put every unresolved clause in "
+        "unparsed_text, even when a clarification question is also given."
     )
 
 

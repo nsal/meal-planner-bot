@@ -383,6 +383,42 @@ def test_lambda_build_configuration() -> None:
         }
 
 
+def test_planner_can_invoke_only_its_own_function_for_repair() -> None:
+    """Repair permission is narrow and does not reference the resource ARN."""
+    template = _load_template()
+    planner = template["Resources"]["PlannerFunction"]
+    policies = planner["Properties"]["Policies"]
+    statements = [
+        statement
+        for policy in policies
+        if isinstance(policy, dict) and "Statement" in policy
+        for statement in policy["Statement"]
+    ]
+
+    repair_statements = [
+        statement
+        for statement in statements
+        if statement.get("Action") == "lambda:InvokeFunction"
+    ]
+    assert repair_statements == [
+        {
+            "Effect": "Allow",
+            "Action": "lambda:InvokeFunction",
+            "Resource": {
+                "Fn::Sub": (
+                    "arn:${AWS::Partition}:lambda:${AWS::Region}:"
+                    "${AWS::AccountId}:function:${AWS::StackName}-planner"
+                )
+            },
+        }
+    ]
+    assert "GetAtt" not in str(repair_statements[0]["Resource"])
+    assert planner["Properties"]["Timeout"] == 310
+    assert planner["Properties"]["MemorySize"] == 512
+    variables = planner["Properties"]["Environment"]["Variables"]
+    assert variables["PLANNER_LLM_MAX_RETRIES"] == "1"
+
+
 def test_readme_documents_single_attempt_planner_diagnostics() -> None:
     """Operational documentation matches the deployed Planner policy."""
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
@@ -392,6 +428,13 @@ def test_readme_documents_single_attempt_planner_diagnostics() -> None:
     assert "`PLANNER_GROCERY_LLM_REQUEST_TIMEOUT_SECONDS` | `120`" in readme
     assert "`PLANNER_GROCERY_LLM_MAX_RETRIES` | `2`" in readme
     assert "one 240-second whole-plan provider attempt" in readme
+    normalized_readme = " ".join(readme.split())
+    assert "one automatic repair in a fresh asynchronous" in normalized_readme
+    assert "Preference interpretation is LLM-assisted" in normalized_readme
+    assert (
+        "Application code is authoritative for the measurable parts"
+        in normalized_readme
+    )
     assert "Grocery generation retains two" in readme
     assert "`attempt`, `elapsed_ms`, `model`, and a" in readme
     assert "These diagnostics do not include prompts" in readme
@@ -400,41 +443,30 @@ def test_readme_documents_single_attempt_planner_diagnostics() -> None:
     assert "second request" not in readme
 
 
-def test_bot_transaction_permission_is_explicit_and_table_scoped() -> None:
-    """Only BotFunction can transact against the application table."""
+def test_transaction_permission_is_explicit_and_table_scoped() -> None:
+    """Both functions can transact only against the application table."""
     template = _load_template()
     resources = template["Resources"]
 
-    bot_policies = resources["BotFunction"]["Properties"]["Policies"]
-    transaction_statements = [
-        statement
-        for policy in bot_policies
-        if isinstance(policy, dict)
-        for statement in policy.get("Statement", [])
-        if isinstance(statement, dict)
-        and statement.get("Action") == "dynamodb:TransactWriteItems"
-    ]
-    assert transaction_statements == [
-        {
-            "Effect": "Allow",
-            "Action": "dynamodb:TransactWriteItems",
-            "Resource": {"Fn::GetAtt": "MealPlannerTable.Arn"},
-        }
-    ]
-    assert all(
-        statement["Resource"] != "*" for statement in transaction_statements
-    )
-
-    planner_policies = resources["PlannerFunction"]["Properties"]["Policies"]
-    assert not any(
-        isinstance(policy, dict)
-        and any(
-            isinstance(statement, dict)
-            and statement.get("Action") == "dynamodb:TransactWriteItems"
+    expected_statement = {
+        "Effect": "Allow",
+        "Action": "dynamodb:TransactWriteItems",
+        "Resource": {"Fn::GetAtt": "MealPlannerTable.Arn"},
+    }
+    for function_name in ("BotFunction", "PlannerFunction"):
+        policies = resources[function_name]["Properties"]["Policies"]
+        transaction_statements = [
+            statement
+            for policy in policies
+            if isinstance(policy, dict)
             for statement in policy.get("Statement", [])
+            if isinstance(statement, dict)
+            and statement.get("Action") == "dynamodb:TransactWriteItems"
+        ]
+        assert transaction_statements == [expected_statement]
+        assert all(
+            statement["Resource"] != "*" for statement in transaction_statements
         )
-        for policy in planner_policies
-    )
 
 
 @pytest.mark.parametrize(

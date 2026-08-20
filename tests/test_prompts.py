@@ -7,6 +7,7 @@ from meal_planner.llm.prompts import (
     build_grocery_prompt,
     build_plan_prompt,
     build_plan_revision_prompt,
+    build_preference_interpretation_prompt,
 )
 from meal_planner.models.schemas import (
     ConversationState,
@@ -19,6 +20,7 @@ from meal_planner.models.schemas import (
     MealOutcome,
     PlanDay,
     PlannedMeal,
+    PreferenceRequirement,
     ProfileUpdateEntities,
     UserProfile,
     WeeklyPlan,
@@ -158,6 +160,30 @@ def test_build_plan_prompt_empty() -> None:
     assert "OUTPUT JSON SCHEMA" in prompt
 
 
+def test_build_plan_prompt_states_complete_generated_plan_contract() -> None:
+    """Initial generation prompts state all validator-aligned invariants."""
+    prompt = build_plan_prompt()
+
+    assert "exactly one breakfast, one lunch, and one dinner" in prompt
+    assert "each of the 7 days" in prompt
+    assert "Snack is optional" in prompt
+    assert "at least one non-empty ingredient item" in prompt
+    assert "positive est_calories" in prompt
+
+
+def test_repair_plan_prompt_states_same_complete_generated_plan_contract() -> (
+    None
+):
+    """Repair prompts retain the complete generation contract."""
+    prompt = build_plan_prompt(repair_feedback="fix the missing meal")
+
+    assert "exactly one breakfast, one lunch, and one dinner" in prompt
+    assert "each of the 7 days" in prompt
+    assert "Snack is optional" in prompt
+    assert "at least one non-empty ingredient item" in prompt
+    assert "positive est_calories" in prompt
+
+
 def test_build_plan_prompt_with_context() -> None:
     """Test build_plan_prompt with full profile, history, and previous plan."""
     member = FamilyMember(name="Bob", calorie_target=2200)
@@ -229,6 +255,115 @@ def test_plan_prompt_renders_preference_and_constraints() -> None:
     assert "Indian and pasta" in prompt
     assert "Allergies: peanuts" in prompt
     assert "always take precedence" in prompt
+
+
+def test_plan_prompt_renders_raw_preference_and_every_exact_rule() -> None:
+    """The planner sees raw wording and the application interpretation."""
+    prompt = build_plan_prompt(
+        profile=UserProfile(name="Alice", allergies=["peanuts"]),
+        preference="crepes or pancakes once at breakfast, eggs three times",
+        requirements=[
+            PreferenceRequirement(
+                id="r1",
+                source_text="crepes or pancakes once at breakfast",
+                foods_any_of=["crepes", "pancakes"],
+                meal_type="breakfast",
+                exact_count=1,
+            ),
+            PreferenceRequirement(
+                id="r2",
+                source_text="eggs three times",
+                foods_any_of=["eggs"],
+                exact_count=3,
+            ),
+        ],
+    )
+
+    assert "crepes or pancakes once at breakfast, eggs three times" in prompt
+    assert "r1" in prompt
+    assert "crepes or pancakes once at breakfast" in prompt
+    assert "foods_any_of: crepes, pancakes" in prompt
+    assert "meal_type: breakfast" in prompt
+    assert "exact_count: 1" in prompt
+    assert "r2" in prompt
+    assert "foods_any_of: eggs" in prompt
+    assert "meal_type: any meal" in prompt
+    assert "exact_count: 3" in prompt
+    assert "Allergies: peanuts" in prompt
+    assert "always take precedence" in prompt
+
+
+def test_plan_prompt_renders_bounded_repair_feedback() -> None:
+    """Repair prompts add bounded feedback without changing the schema."""
+    prompt = build_plan_prompt(
+        preference="eggs three times",
+        requirements=[
+            PreferenceRequirement(
+                id="r1",
+                source_text="eggs three times",
+                foods_any_of=["eggs"],
+                exact_count=3,
+            )
+        ],
+        repair_feedback="r1 matched 2 meals; expected exactly 3",
+    )
+
+    assert "BOUNDED REPAIR FEEDBACK" in prompt
+    assert "r1 matched 2 meals; expected exactly 3" in prompt
+    assert "OUTPUT JSON SCHEMA" in prompt
+    assert '"week_start_date"' in prompt
+
+
+def test_plan_revision_prompt_does_not_receive_generation_rules() -> None:
+    """Plan revisions retain their existing amendment-only contract."""
+    profile = UserProfile(name="Alex")
+    plan = WeeklyPlan(
+        week_start="2026-08-10",
+        planning_instructions=["Keep it vegetarian"],
+        days=[PlanDay(day=value) for value in range(1, 8)],
+    )
+
+    prompt = build_plan_revision_prompt(profile, plan, "Avoid mushrooms")
+
+    assert "Keep it vegetarian" in prompt
+    assert "Avoid mushrooms" in prompt
+    assert "INTERPRETED PREFERENCE RULES" not in prompt
+
+
+def test_preference_interpretation_prompt_defines_measurable_contract() -> None:
+    prompt = build_preference_interpretation_prompt(
+        "Have crepes or pancakes once at breakfast, eggs three times, "
+        "and salmon for dinner once."
+    )
+
+    assert "Have crepes or pancakes once at breakfast" in prompt
+    assert "foods_any_of" in prompt
+    assert "exact_count" in prompt
+    assert "meal_type" in prompt
+    assert "Combine alternative foods" in prompt
+    assert "Every meaningful clause" in prompt
+    assert "unparsed_text" in prompt
+
+
+def test_preference_interpretation_prompt_requires_clarification() -> None:
+    prompt = build_preference_interpretation_prompt("Make it healthy and fun")
+
+    assert "ambiguous" in prompt
+    assert "conflicting" in prompt
+    assert "unsupported" in prompt
+    assert "subjective" in prompt
+    assert "clarification" in prompt
+    assert "silently discard" in prompt
+
+
+def test_preference_interpretation_does_not_change_conversational_intent() -> (
+    None
+):
+    prompt = build_conversational_prompt()
+
+    assert "append a JSON block" in prompt
+    assert "foods_any_of" not in prompt
+    assert "unparsed_text" not in prompt
 
 
 def test_conversational_prompt_contracts_draft_revision() -> None:

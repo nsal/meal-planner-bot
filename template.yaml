@@ -155,6 +155,15 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref MealPlannerTable
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:TransactWriteItems
+              Resource: !GetAtt MealPlannerTable.Arn
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !Sub
+                arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-planner
 
 Outputs:
   WebhookUrl:
