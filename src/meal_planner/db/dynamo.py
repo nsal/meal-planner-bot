@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from enum import Enum
 from typing import Any, Optional
 
 from boto3.dynamodb.conditions import Key  # type: ignore[import-untyped]
@@ -30,6 +31,14 @@ class ActivePlanSnapshot:
 
     plan: WeeklyPlan
     active_epoch: int | None
+
+
+class RepairPublicationOutcome(str, Enum):
+    """Result of attempting an untracked repair publication."""
+
+    PUBLISHED = "published"
+    STALE = "stale"
+    DUPLICATE = "duplicate"
 
 
 class DynamoRepository:
@@ -518,6 +527,14 @@ class DynamoRepository:
             and second.get("Code") == "ConditionalCheckFailed"
         )
 
+    @staticmethod
+    def _repair_marker_key(user_id: str, repair_id: str) -> dict[str, str]:
+        """Return the durable marker key for one untracked repair."""
+        return {
+            "PK": f"USER#{user_id}",
+            "SK": f"PLAN_REPAIR#{repair_id}",
+        }
+
     def save_generated_draft(
         self,
         user_id: str,
@@ -562,6 +579,155 @@ class DynamoRepository:
                 return False
             raise
         return True
+
+    def save_generated_draft_and_clear_conversation_state(
+        self,
+        user_id: str,
+        plan: WeeklyPlan,
+        *,
+        expected_revision: int | None,
+        request_id: str,
+        expected_state_revision: int,
+    ) -> bool:
+        """Publish a tracked draft and release its request atomically."""
+        plan_item = {
+            "PK": f"USER#{user_id}",
+            "SK": f"PLAN#{plan.week_start_date}",
+            **plan.model_dump(by_alias=True, mode="json"),
+        }
+        if expected_revision is None:
+            plan_condition = "attribute_not_exists(#pk)"
+            plan_names = {"#pk": "PK"}
+            plan_values: dict[str, Any] = {}
+        else:
+            plan_condition = (
+                "#status = :draft AND #revision = :expected_revision"
+            )
+            plan_names = {
+                "#status": "status",
+                "#revision": "revision",
+            }
+            plan_values = {
+                ":draft": PlanStatus.DRAFT.value,
+                ":expected_revision": expected_revision,
+            }
+        plan_put: dict[str, Any] = {
+            "TableName": self.table.name,
+            "Item": plan_item,
+            "ConditionExpression": plan_condition,
+            "ExpressionAttributeNames": plan_names,
+        }
+        if plan_values:
+            plan_put["ExpressionAttributeValues"] = plan_values
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {"Put": plan_put},
+                    {
+                        "Delete": {
+                            "TableName": self.table.name,
+                            "Key": self._conversation_key(user_id),
+                            "ConditionExpression": (
+                                "#request_id = :request_id AND "
+                                "#revision = :expected_state_revision"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#request_id": "request_id",
+                                "#revision": "revision",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":request_id": request_id,
+                                ":expected_state_revision": (
+                                    expected_state_revision
+                                ),
+                            },
+                        }
+                    },
+                ]
+            )
+        except ClientError as exc:
+            if self._is_transaction_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def save_repaired_draft_once(
+        self,
+        user_id: str,
+        plan: WeeklyPlan,
+        *,
+        expected_revision: int | None,
+        repair_id: str,
+    ) -> RepairPublicationOutcome:
+        """Atomically publish one untracked repair and its replay marker."""
+        if expected_revision is None:
+            plan_condition = "attribute_not_exists(#pk)"
+            plan_names = {"#pk": "PK"}
+            plan_values: dict[str, Any] = {}
+        else:
+            plan_condition = (
+                "#status = :draft AND #revision = :expected_revision"
+            )
+            plan_names = {
+                "#status": "status",
+                "#revision": "revision",
+            }
+            plan_values = {
+                ":draft": PlanStatus.DRAFT.value,
+                ":expected_revision": expected_revision,
+            }
+        plan_put: dict[str, Any] = {
+            "TableName": self.table.name,
+            "Item": {
+                "PK": f"USER#{user_id}",
+                "SK": f"PLAN#{plan.week_start_date}",
+                **plan.model_dump(by_alias=True, mode="json"),
+            },
+            "ConditionExpression": plan_condition,
+            "ExpressionAttributeNames": plan_names,
+        }
+        if plan_values:
+            plan_put["ExpressionAttributeValues"] = plan_values
+        marker_put = {
+            "TableName": self.table.name,
+            "Item": self._repair_marker_key(user_id, repair_id),
+            "ConditionExpression": "attribute_not_exists(PK)",
+        }
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[{"Put": plan_put}, {"Put": marker_put}]
+            )
+        except ClientError as exc:
+            outcome = self._repair_publication_outcome(exc)
+            if outcome is None:
+                raise
+            return outcome
+        return RepairPublicationOutcome.PUBLISHED
+
+    @staticmethod
+    def _repair_publication_outcome(
+        exc: ClientError,
+    ) -> RepairPublicationOutcome | None:
+        """Classify only exact plan/marker conditional cancellations."""
+        error = exc.response.get("Error", {})
+        code = error.get("Code") if isinstance(error, dict) else None
+        if code != "TransactionCanceledException":
+            return None
+        reasons = exc.response.get("CancellationReasons")
+        if not isinstance(reasons, list) or len(reasons) != 2:
+            return None
+        first = reasons[0] if isinstance(reasons[0], dict) else {}
+        second = reasons[1] if isinstance(reasons[1], dict) else {}
+        first_code = first.get("Code")
+        second_code = second.get("Code")
+        if second_code == "ConditionalCheckFailed" and first_code in {
+            "None",
+            "ConditionalCheckFailed",
+        }:
+            return RepairPublicationOutcome.DUPLICATE
+        if first_code == "ConditionalCheckFailed" and second_code == "None":
+            return RepairPublicationOutcome.STALE
+        return None
 
     def replace_draft_and_clear_revision_state(
         self,

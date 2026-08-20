@@ -20,8 +20,14 @@ from meal_planner.config import (
 )
 from meal_planner.db.dynamo import DynamoRepository
 from meal_planner.llm.client import LLMClient
-from meal_planner.llm.parser import parse_conversational_response
-from meal_planner.llm.prompts import build_conversational_prompt
+from meal_planner.llm.parser import (
+    parse_conversational_response,
+    parse_preference_interpretation,
+)
+from meal_planner.llm.prompts import (
+    build_conversational_prompt,
+    build_preference_interpretation_prompt,
+)
 from meal_planner.models.schemas import (
     ConversationIntent,
     ConversationState,
@@ -35,6 +41,7 @@ from meal_planner.models.schemas import (
     MealType,
     PlannedMeal,
     PlanStatus,
+    PreferenceRequirement,
     ProfileUpdateEntities,
     UserProfile,
     WeeklyPlan,
@@ -681,16 +688,23 @@ class BotHandler:
         *,
         source_update_id: str | None,
     ) -> None:
+        if source_update_id and state.last_update_id == source_update_id:
+            if state.step is ConversationWorkflowStep.AWAITING_PREFERENCE:
+                self.telegram_api.send_message(
+                    chat_id,
+                    "Please continue with your preference or try again.",
+                )
+                return
+            elif state.step is ConversationWorkflowStep.GENERATING:
+                self.telegram_api.send_message(
+                    chat_id, "Working on your weekly meal plan."
+                )
+                return
         if state.step is not ConversationWorkflowStep.AWAITING_PREFERENCE:
             self.telegram_api.send_message(
                 chat_id,
                 "Plan generation is already in progress. Use /plan to retry "
                 "if it fails.",
-            )
-            return
-        if source_update_id and state.last_update_id == source_update_id:
-            self.telegram_api.send_message(
-                chat_id, "Working on your weekly meal plan."
             )
             return
         normalized = text.strip().casefold().rstrip(".!?,;:")
@@ -706,12 +720,64 @@ class BotHandler:
             }
             else text.strip()
         )
+
+        if preference is None:
+            interpretation: tuple[list[PreferenceRequirement], str | None] = (
+                [],
+                None,
+            )
+        else:
+            combined_preference = (
+                f"{state.preference}; {preference}"
+                if state.preference
+                else preference
+            )
+            if state.preference and len(combined_preference) > 500:
+                self.telegram_api.send_message(
+                    chat_id,
+                    "Your answer was not appended because the combined "
+                    "preference exceeds 500 characters. Use /plan to reset, "
+                    "then provide one complete preference of 500 characters "
+                    "or fewer.",
+                )
+                return
+            preference = combined_preference
+            if len(preference) > 500:
+                self.telegram_api.send_message(
+                    chat_id,
+                    "That preference is too long. Please keep it to 500 "
+                    "characters or fewer.",
+                )
+                return
+            try:
+                client = self.llm_client or LLMClient()
+                interpretation = parse_preference_interpretation(
+                    client.chat_sync(
+                        build_preference_interpretation_prompt(preference),
+                        preference,
+                    )
+                )
+            except Exception:
+                logger.error("Plan preference interpretation failed")
+                interpretation = (
+                    [],
+                    "I couldn't interpret that preference yet. Please try "
+                    "again or rephrase it.",
+                )
+
+        requirements, clarification = interpretation
+        next_step = (
+            ConversationWorkflowStep.AWAITING_PREFERENCE
+            if clarification
+            else ConversationWorkflowStep.GENERATING
+        )
         try:
             candidate = ConversationState.model_validate(
                 {
                     **state.model_dump(),
-                    "step": ConversationWorkflowStep.GENERATING,
+                    "step": next_step,
                     "preference": preference,
+                    "requirements": requirements,
                     "revision": state.revision + 1,
                     "updated_at": datetime.now(timezone.utc),
                     "last_update_id": source_update_id,
@@ -731,12 +797,16 @@ class BotHandler:
                 chat_id, "That plan request changed. Please use /plan again."
             )
             return
+        if clarification:
+            self.telegram_api.send_message(chat_id, clarification)
+            return
         invoked = self._invoke_planner(
             user_id,
             chat_id,
             GENERATE_PLAN,
             week_start=date.today().isoformat(),
             preference=preference,
+            requirements=requirements,
             request_id=candidate.request_id,
             state_revision=candidate.revision,
         )
@@ -784,6 +854,7 @@ class BotHandler:
             GENERATE_PLAN,
             week_start=date.today().isoformat(),
             preference=candidate.preference,
+            requirements=candidate.requirements,
             request_id=candidate.request_id,
             state_revision=candidate.revision,
         ):
@@ -1267,6 +1338,9 @@ class BotHandler:
         *,
         week_start: str,
         preference: str | None = None,
+        requirements: list[PreferenceRequirement] | None = None,
+        attempt: int = 1,
+        repair_feedback: str | None = None,
         amendment: str | None = None,
         request_id: str | None = None,
         state_revision: int | None = None,
@@ -1285,6 +1359,12 @@ class BotHandler:
                 payload.update(
                     {
                         "preference": preference,
+                        "requirements": [
+                            requirement.model_dump(mode="json")
+                            for requirement in (requirements or [])
+                        ],
+                        "attempt": attempt,
+                        "repair_feedback": repair_feedback,
                         "request_id": request_id,
                         "state_revision": state_revision,
                     }

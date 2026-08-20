@@ -18,11 +18,12 @@ from meal_planner.models.schemas import (
     MealLogDraft,
     MealOutcome,
     PlanStatus,
+    PreferenceRequirement,
     ProfileUpdateEntities,
 )
 from meal_planner.router import RouteResult, RouteType
 from meal_planner.telegram.access import TelegramAccessPolicy
-from meal_planner.telegram.api import TelegramAPIError
+from meal_planner.telegram.api import TelegramAPIError, split_text
 from meal_planner.telegram.commands import BOT_COMMANDS, render_help
 from tests.factories import make_plan, make_profile
 
@@ -289,6 +290,21 @@ def test_plan_preference_is_invoked_once_with_request_context(
     handler: BotHandler,
 ) -> None:
     """The preference reply creates one planner event with stable context."""
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [
+                {
+                    "id": "r1",
+                    "source_text": "Indian and pasta",
+                    "foods_any_of": ["Indian", "pasta"],
+                    "meal_type": None,
+                    "exact_count": 1,
+                }
+            ],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
     handler.repo.get_profile.return_value = make_profile()
     handler.repo.get_conversation_state.return_value = None
     handler.handle_command(_command("plan"))
@@ -307,8 +323,803 @@ def test_plan_preference_is_invoked_once_with_request_context(
         handler.lambda_client.invoke.call_args.kwargs["Payload"]
     )
     assert payload["preference"] == "Indian and pasta"
+    assert payload["requirements"] == [
+        {
+            "id": "r1",
+            "source_text": "Indian and pasta",
+            "foods_any_of": ["Indian", "pasta"],
+            "meal_type": None,
+            "exact_count": 1,
+        }
+    ]
     assert payload["request_id"] == state.request_id
     assert payload["state_revision"] == 1
+    assert payload["attempt"] == 1
+    assert payload["repair_feedback"] is None
+
+
+def test_plan_preference_persists_interpreted_requirements_for_retry(
+    handler: BotHandler,
+) -> None:
+    """Requirements survive state transitions and enter the planner event."""
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [
+                {
+                    "id": "r1",
+                    "source_text": "eggs three times",
+                    "foods_any_of": ["eggs"],
+                    "meal_type": None,
+                    "exact_count": 3,
+                }
+            ],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="eggs three times",
+            raw_update={"update_id": 109},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.requirements[0].id == "r1"
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["requirements"][0]["exact_count"] == 3
+
+
+def test_no_preference_plan_dispatches_without_interpretation_rules(
+    handler: BotHandler,
+) -> None:
+    """No-preference requests retain the legacy planner path."""
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="no preference",
+            raw_update={"update_id": 110},
+        )
+    )
+
+    handler.llm_client.chat_sync.assert_not_called()
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["preference"] is None
+    assert payload["requirements"] == []
+
+
+def test_plan_retry_reuses_requirements_without_reinterpretation(
+    handler: BotHandler,
+) -> None:
+    """Manual retries carry saved rules and skip the interpreter."""
+    requirement = PreferenceRequirement(
+        id="r1",
+        source_text="eggs three times",
+        foods_any_of=["eggs"],
+        exact_count=3,
+    )
+    state = handler._new_plan_state().model_copy(
+        update={
+            "step": ConversationWorkflowStep.RETRY_READY,
+            "preference": "eggs three times",
+            "requirements": [requirement],
+            "revision": 4,
+        }
+    )
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_command(_command("plan"))
+
+    handler.llm_client.chat_sync.assert_not_called()
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["requirements"][0]["id"] == "r1"
+
+
+def test_plan_preference_complete_interpretation_precedes_generation(
+    handler: BotHandler,
+) -> None:
+    """A complete interpretation transitions and invokes the planner once."""
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [
+                {
+                    "id": "r1",
+                    "source_text": "eggs three times for breakfast",
+                    "foods_any_of": ["eggs"],
+                    "meal_type": "breakfast",
+                    "exact_count": 3,
+                }
+            ],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="eggs three times for breakfast",
+            raw_update={"update_id": 101},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.GENERATING
+    assert saved.preference == "eggs three times for breakfast"
+    assert handler.lambda_client.invoke.call_count == 1
+    handler.llm_client.chat_sync.assert_called_once()
+
+
+@pytest.mark.parametrize("requirement_count", [20, 21])
+def test_plan_preference_requirement_count_boundary(
+    handler: BotHandler,
+    requirement_count: int,
+) -> None:
+    """The Bot durably handles the parser's exact requirement boundary."""
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [
+                {
+                    "id": f"requirement-{index}",
+                    "source_text": f"food {index} once",
+                    "foods_any_of": [f"food-{index}"],
+                    "meal_type": None,
+                    "exact_count": 1,
+                }
+                for index in range(requirement_count)
+            ],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="many food rules",
+            raw_update={"update_id": 115 + requirement_count},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.request_id == state.request_id
+    assert saved.preference == "many food rules"
+    if requirement_count == 20:
+        assert saved.step is ConversationWorkflowStep.GENERATING
+        assert len(saved.requirements) == 20
+        handler.lambda_client.invoke.assert_called_once()
+        assert handler.telegram_api.send_message.call_args.args[1] == (
+            "Working on your weekly meal plan."
+        )
+    else:
+        assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+        assert saved.requirements == []
+        assert saved.last_update_id == str(115 + requirement_count)
+        handler.lambda_client.invoke.assert_not_called()
+        message = handler.telegram_api.send_message.call_args.args[1]
+        assert "combine" in message.lower()
+        assert "prioritize" in message.lower()
+        assert "500" not in message
+
+
+def test_plan_preference_saves_focused_clarification_without_generation(
+    handler: BotHandler,
+) -> None:
+    """An ambiguous request remains recoverable and does not invoke Lambda."""
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [],
+            "clarification": "How many times should healthy meals occur?",
+            "unparsed_text": ["make it healthy"],
+        }
+    )
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="make it healthy",
+            raw_update={"update_id": 102},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert saved.preference == "make it healthy"
+    assert saved.revision == 1
+    assert saved.last_update_id == "102"
+    handler.lambda_client.invoke.assert_not_called()
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "How many times" in message
+
+
+def test_oversized_interpretation_stays_bounded_before_telegram(
+    handler: BotHandler,
+) -> None:
+    """Oversized provider clarification remains one recoverable message."""
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [],
+            "clarification": "x" * 501,
+            "unparsed_text": [],
+        }
+    )
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="make it healthy",
+            raw_update={"update_id": 114},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert saved.preference == "make it healthy"
+    handler.lambda_client.invoke.assert_not_called()
+    handler.telegram_api.send_message.assert_called_once()
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert len(message) <= 500
+    assert len(split_text(message)) == 1
+    assert "rephrase" in message.lower()
+
+
+def test_vacuous_preference_interpretation_stays_awaiting_preference(
+    handler: BotHandler,
+) -> None:
+    """An empty successful interpretation cannot dispatch a planner."""
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="make it healthy",
+            raw_update={"update_id": 111},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert saved.preference == "make it healthy"
+    assert saved.requirements == []
+    handler.lambda_client.invoke.assert_not_called()
+    assert (
+        handler.telegram_api.send_message.call_args.args[1]
+        == "Please provide a measurable meal preference."
+    )
+
+
+def test_conflicting_preference_interpretation_stays_awaiting_preference(
+    handler: BotHandler,
+) -> None:
+    """Directly conflicting rules cannot dispatch a planner."""
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [
+                {
+                    "id": "r1",
+                    "source_text": "eggs once for dinner",
+                    "foods_any_of": ["eggs"],
+                    "meal_type": "dinner",
+                    "exact_count": 1,
+                },
+                {
+                    "id": "r2",
+                    "source_text": "egg twice for dinner",
+                    "foods_any_of": ["egg"],
+                    "meal_type": "dinner",
+                    "exact_count": 2,
+                },
+            ],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="eggs for dinner",
+            raw_update={"update_id": 112},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert saved.requirements == []
+    handler.lambda_client.invoke.assert_not_called()
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "conflict" in message.lower()
+
+
+def test_plan_preference_combines_clarification_reply_before_interpreting(
+    handler: BotHandler,
+) -> None:
+    """A clarification answer is interpreted with the saved raw wording."""
+    handler.llm_client.chat_sync.side_effect = [
+        json.dumps(
+            {
+                "requirements": [],
+                "clarification": "How many times?",
+                "unparsed_text": ["eggs"],
+            }
+        ),
+        json.dumps(
+            {
+                "requirements": [
+                    {
+                        "id": "r1",
+                        "source_text": "eggs three times",
+                        "foods_any_of": ["eggs"],
+                        "meal_type": None,
+                        "exact_count": 3,
+                    }
+                ],
+                "clarification": None,
+                "unparsed_text": [],
+            }
+        ),
+    ]
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    first_route = RouteResult(
+        route_type=RouteType.CONVERSATIONAL,
+        chat_id=1,
+        user_id="user",
+        text="eggs",
+        raw_update={"update_id": 103},
+    )
+    handler.handle_conversational(first_route)
+    clarification_state = (
+        handler.repo.transition_conversation_state.call_args.args[1]
+    )
+    handler.repo.get_conversation_state.return_value = clarification_state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="three times",
+            raw_update={"update_id": 104},
+        )
+    )
+
+    prompt, combined = handler.llm_client.chat_sync.call_args_list[1].args
+    assert "eggs" in prompt
+    assert combined == "eggs; three times"
+    final_state = handler.repo.transition_conversation_state.call_args.args[1]
+    assert final_state.step is ConversationWorkflowStep.GENERATING
+    assert final_state.preference == "eggs; three times"
+    assert handler.lambda_client.invoke.call_count == 1
+
+
+@pytest.mark.parametrize("initial_length", [498, 499, 500])
+def test_clarification_overflow_rejects_answer_without_side_effects(
+    handler: BotHandler, initial_length: int
+) -> None:
+    """A clarification answer cannot overflow the saved preference cap."""
+    handler.llm_client.chat_sync.side_effect = [
+        json.dumps(
+            {
+                "requirements": [],
+                "clarification": "How many times?",
+                "unparsed_text": ["request"],
+            }
+        ),
+        json.dumps(
+            {
+                "requirements": [
+                    {
+                        "id": "r1",
+                        "source_text": "eggs once",
+                        "foods_any_of": ["eggs"],
+                        "meal_type": None,
+                        "exact_count": 1,
+                    }
+                ],
+                "clarification": None,
+                "unparsed_text": [],
+            }
+        ),
+    ]
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="x" * initial_length,
+            raw_update={"update_id": 2000 + initial_length},
+        )
+    )
+    saved_state = handler.repo.transition_conversation_state.call_args.args[1]
+    handler.repo.get_conversation_state.return_value = saved_state
+    handler.repo.transition_conversation_state.reset_mock()
+    handler.telegram_api.send_message.reset_mock()
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="y",
+            raw_update={"update_id": 3000 + initial_length},
+        )
+    )
+
+    assert handler.llm_client.chat_sync.call_count == 1
+    handler.lambda_client.invoke.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
+    assert saved_state.preference == "x" * initial_length
+    assert saved_state.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert len(message) <= 500
+    assert len(split_text(message)) == 1
+    assert "not appended" in message.lower()
+    assert "/plan" in message
+    assert "complete preference" in message.lower()
+    assert "500" in message
+
+
+def test_clarification_overflow_can_reset_with_plan_command(
+    handler: BotHandler,
+) -> None:
+    """The explicit /plan path replaces an overflowed pending request."""
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [],
+            "clarification": "How many times?",
+            "unparsed_text": ["request"],
+        }
+    )
+    initial_state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = initial_state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="x" * 500,
+            raw_update={"update_id": 4000},
+        )
+    )
+    pending_state = handler.repo.transition_conversation_state.call_args.args[1]
+    handler.repo.get_conversation_state.return_value = pending_state
+    handler.repo.save_conversation_state.return_value = True
+    handler.repo.save_conversation_state.reset_mock()
+
+    handler.handle_command(_command("plan"))
+
+    replacement = handler.repo.save_conversation_state.call_args.args[1]
+    assert replacement.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert replacement.preference is None
+    assert replacement.request_id != pending_state.request_id
+    assert (
+        handler.repo.save_conversation_state.call_args.kwargs[
+            "expected_revision"
+        ]
+        == pending_state.revision
+    )
+    assert "/plan" not in handler.telegram_api.send_message.call_args.args[1]
+
+
+def test_exactly_500_character_combined_preference_is_interpreted(
+    handler: BotHandler,
+) -> None:
+    """A combined preference at the cap still follows the normal path."""
+    handler.llm_client.chat_sync.side_effect = [
+        json.dumps(
+            {
+                "requirements": [],
+                "clarification": "How many times?",
+                "unparsed_text": ["request"],
+            }
+        ),
+        json.dumps(
+            {
+                "requirements": [
+                    {
+                        "id": "r1",
+                        "source_text": "eggs once",
+                        "foods_any_of": ["eggs"],
+                        "meal_type": None,
+                        "exact_count": 1,
+                    }
+                ],
+                "clarification": None,
+                "unparsed_text": [],
+            }
+        ),
+    ]
+    initial_state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = initial_state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="x" * 497,
+            raw_update={"update_id": 5000},
+        )
+    )
+    pending_state = handler.repo.transition_conversation_state.call_args.args[1]
+    handler.repo.get_conversation_state.return_value = pending_state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="y",
+            raw_update={"update_id": 5001},
+        )
+    )
+
+    assert handler.llm_client.chat_sync.call_count == 2
+    assert handler.llm_client.chat_sync.call_args.args[1] == ("x" * 497 + "; y")
+    final_state = handler.repo.transition_conversation_state.call_args.args[1]
+    assert final_state.preference == "x" * 497 + "; y"
+    assert final_state.step is ConversationWorkflowStep.GENERATING
+    handler.lambda_client.invoke.assert_called_once()
+
+
+def test_plan_preference_interpreter_failure_keeps_retryable_state(
+    handler: BotHandler,
+) -> None:
+    """Interpreter transport failures retain wording without planner work."""
+    handler.llm_client.chat_sync.side_effect = RuntimeError("provider down")
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="eggs three times",
+            raw_update={"update_id": 105},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert saved.preference == "eggs three times"
+    handler.lambda_client.invoke.assert_not_called()
+    assert "try again" in handler.telegram_api.send_message.call_args.args[1]
+
+
+def test_duplicate_plan_preference_update_does_not_reinterpret(
+    handler: BotHandler,
+) -> None:
+    """A redelivered update is idempotent while clarification is pending."""
+    state = handler._new_plan_state().model_copy(
+        update={
+            "step": ConversationWorkflowStep.AWAITING_PREFERENCE,
+            "preference": "eggs",
+            "revision": 1,
+            "last_update_id": "106",
+        }
+    )
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="eggs",
+            raw_update={"update_id": 106},
+        )
+    )
+
+    handler.llm_client.chat_sync.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
+    handler.lambda_client.invoke.assert_not_called()
+    assert (
+        handler.telegram_api.send_message.call_args.args[1]
+        == "Please continue with your preference or try again."
+    )
+
+
+def test_duplicate_interpreter_failure_update_prompts_for_retry(
+    handler: BotHandler,
+) -> None:
+    """A duplicate after interpreter failure does not claim generation."""
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+    handler.llm_client.chat_sync.side_effect = RuntimeError("provider down")
+    route = RouteResult(
+        route_type=RouteType.CONVERSATIONAL,
+        chat_id=1,
+        user_id="user",
+        text="eggs three times",
+        raw_update={"update_id": 105},
+    )
+
+    handler.handle_conversational(route)
+    retryable_state = handler.repo.transition_conversation_state.call_args.args[
+        1
+    ]
+    handler.repo.get_conversation_state.return_value = retryable_state
+    handler.handle_conversational(route)
+
+    assert handler.llm_client.chat_sync.call_count == 1
+    assert handler.repo.transition_conversation_state.call_count == 1
+    handler.lambda_client.invoke.assert_not_called()
+    assert (
+        handler.telegram_api.send_message.call_args.args[1]
+        == "Please continue with your preference or try again."
+    )
+
+
+def test_duplicate_generating_plan_update_keeps_working_reply(
+    handler: BotHandler,
+) -> None:
+    """A duplicate for generation in progress retains its working reply."""
+    state = handler._new_plan_state().model_copy(
+        update={
+            "step": ConversationWorkflowStep.GENERATING,
+            "revision": 1,
+            "last_update_id": "113",
+        }
+    )
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="eggs three times",
+            raw_update={"update_id": 113},
+        )
+    )
+
+    handler.llm_client.chat_sync.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
+    handler.lambda_client.invoke.assert_not_called()
+    assert (
+        handler.telegram_api.send_message.call_args.args[1]
+        == "Working on your weekly meal plan."
+    )
+
+
+def test_plan_preference_race_does_not_invoke_after_state_conflict(
+    handler: BotHandler,
+) -> None:
+    """A lost conditional update cannot dispatch a stale planner request."""
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [],
+            "clarification": "How many?",
+            "unparsed_text": ["eggs"],
+        }
+    )
+    handler.repo.transition_conversation_state.return_value = False
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="eggs",
+            raw_update={"update_id": 107},
+        )
+    )
+
+    handler.lambda_client.invoke.assert_not_called()
+    assert "changed" in handler.telegram_api.send_message.call_args.args[1]
+
+
+@pytest.mark.parametrize("length", [499, 500, 501])
+def test_plan_preference_length_boundary(
+    handler: BotHandler, length: int
+) -> None:
+    """Preferences accept 500 characters and reject the next character."""
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [],
+            "clarification": "Please provide a measurable count.",
+            "unparsed_text": ["request"],
+        }
+    )
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="x" * length,
+            raw_update={"update_id": str(108 + length)},
+        )
+    )
+
+    if length <= 500:
+        handler.llm_client.chat_sync.assert_called_once()
+        assert handler.repo.transition_conversation_state.call_count == 1
+    else:
+        handler.llm_client.chat_sync.assert_not_called()
+        handler.repo.transition_conversation_state.assert_not_called()
+        assert "too long" in handler.telegram_api.send_message.call_args.args[1]
+
+
+def test_plan_retry_preserves_preference_without_reinterpreting(
+    handler: BotHandler,
+) -> None:
+    """Manual retry reuses saved wording and does not call the interpreter."""
+    state = handler._new_plan_state().model_copy(
+        update={
+            "step": ConversationWorkflowStep.RETRY_READY,
+            "preference": "eggs three times",
+            "revision": 4,
+        }
+    )
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_command(_command("plan"))
+
+    handler.llm_client.chat_sync.assert_not_called()
+    handler.lambda_client.invoke.assert_called_once()
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["preference"] == "eggs three times"
 
 
 def test_profile_onboarding_accumulates_then_saves(handler: BotHandler) -> None:

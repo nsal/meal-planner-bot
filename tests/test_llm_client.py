@@ -1,5 +1,6 @@
 """Bounded LiteLLM client tests."""
 
+import logging
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -162,6 +163,55 @@ async def test_permanent_failure_is_not_retried(
     )
     assert await client.chat("system", "user") == FALLBACK_MESSAGE
     completion.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_attempts", "expected_category"),
+    [(429, 3, "transient"), (400, 1, "permanent")],
+)
+def test_chat_sync_retry_logs_never_include_provider_exception_text(
+    client: LLMClient,
+    mocker: MockerFixture,
+    caplog: pytest.LogCaptureFixture,
+    status_code: int,
+    expected_attempts: int,
+    expected_category: str,
+) -> None:
+    """Retry records contain only bounded application-owned metadata."""
+    error = ProviderError(status_code)
+    error.args = (
+        "preference=PRIVATE_LOW_SODIUM\nrequest body contains private data",
+    )
+    completion = mocker.patch("litellm.acompletion", side_effect=error)
+    mocker.patch("asyncio.sleep")
+
+    with caplog.at_level(logging.WARNING, logger="meal_planner.llm.client"):
+        result = client.chat_sync("system", "user")
+
+    assert result == FALLBACK_MESSAGE
+    assert completion.call_count == expected_attempts
+    assert "PRIVATE_LOW_SODIUM" not in caplog.text
+    assert "request body contains private data" not in caplog.text
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "meal_planner.llm.client"
+    ]
+    assert records
+    assert all(
+        "PRIVATE_LOW_SODIUM" not in record.getMessage() for record in records
+    )
+    assert all(
+        "request body contains private data" not in repr(record.__dict__)
+        for record in records
+    )
+    warning = next(
+        record for record in records if record.levelno == logging.WARNING
+    )
+    assert warning.getMessage() == (
+        f"LLM request attempt 1 of {client.max_retries} failed "
+        f"category={expected_category}"
+    )
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,8 @@ from pydantic_settings import (
 )
 
 MAX_PROVIDER_RETRY_DELAY_SECONDS = 5.0
+DEFAULT_PLANNER_REPAIR_CONNECT_TIMEOUT_SECONDS = 3.0
+DEFAULT_PLANNER_REPAIR_READ_TIMEOUT_SECONDS = 10.0
 
 
 class BotConfigurationError(RuntimeError):
@@ -109,6 +111,18 @@ class _SharedSettings(BaseSettings):
         le=20,
         alias="PLANNER_TELEGRAM_REQUEST_TIMEOUT_SECONDS",
     )
+    planner_repair_connect_timeout_seconds: float = Field(
+        default=DEFAULT_PLANNER_REPAIR_CONNECT_TIMEOUT_SECONDS,
+        gt=0,
+        le=10,
+        alias="PLANNER_REPAIR_CONNECT_TIMEOUT_SECONDS",
+    )
+    planner_repair_read_timeout_seconds: float = Field(
+        default=DEFAULT_PLANNER_REPAIR_READ_TIMEOUT_SECONDS,
+        gt=0,
+        le=30,
+        alias="PLANNER_REPAIR_READ_TIMEOUT_SECONDS",
+    )
     bot_llm_request_timeout_seconds: float = Field(
         default=6.0,
         gt=0,
@@ -173,7 +187,7 @@ class _SharedSettings(BaseSettings):
             ),
             handler_safety_margin_seconds=self.bot_handler_safety_margin_seconds,
         )
-        planner_generation_budget = external_call_budget_seconds(
+        planner_provider_budget = external_call_budget_seconds(
             llm_attempts=self.planner_llm_max_retries,
             llm_request_timeout_seconds=(
                 self.planner_llm_request_timeout_seconds
@@ -187,7 +201,16 @@ class _SharedSettings(BaseSettings):
             handler_safety_margin_seconds=(
                 self.planner_handler_safety_margin_seconds
             ),
-            telegram_request_count=2,
+            telegram_request_count=0,
+        )
+        planner_success_tail = 3 * self.planner_telegram_request_timeout_seconds
+        planner_repair_tail = (
+            self.planner_repair_connect_timeout_seconds
+            + self.planner_repair_read_timeout_seconds
+            + self.planner_telegram_request_timeout_seconds
+        )
+        planner_generation_budget = planner_provider_budget + max(
+            planner_success_tail, planner_repair_tail
         )
         planner_grocery_budget = external_call_budget_seconds(
             llm_attempts=self.planner_grocery_llm_max_retries,
