@@ -54,10 +54,16 @@ class DynamoRepository:
             key: value for key, value in item.items() if key not in {"PK", "SK"}
         }
 
-    def get_profile(self, user_id: str) -> Optional[UserProfile]:
-        response = self.table.get_item(
-            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}
-        )
+    def get_profile(
+        self, user_id: str, *, consistent_read: bool = False
+    ) -> Optional[UserProfile]:
+        """Return the user's canonical profile, if it exists."""
+        get_kwargs: dict[str, Any] = {
+            "Key": {"PK": f"USER#{user_id}", "SK": "PROFILE"}
+        }
+        if consistent_read:
+            get_kwargs["ConsistentRead"] = True
+        response = self.table.get_item(**get_kwargs)
         item = response.get("Item")
         return UserProfile.model_validate(self._data(item)) if item else None
 

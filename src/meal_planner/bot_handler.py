@@ -812,7 +812,7 @@ class BotHandler:
         if category is None or operation is None:
             return "That profile edit is invalid. Please use /profile again."
 
-        profile = self.repo.get_profile(user_id)
+        profile = self.repo.get_profile(user_id, consistent_read=True)
         if profile is None:
             return "No complete profile found. Use /start to begin."
 

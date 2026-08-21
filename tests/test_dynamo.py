@@ -71,6 +71,60 @@ def test_profile_and_onboarding_draft_round_trip(
     assert repo.get_profile_draft("user") is None
 
 
+def test_profile_read_consistency_is_opt_in(mocker: Any) -> None:
+    """Profile reads add ConsistentRead only when explicitly requested."""
+    table = mocker.MagicMock()
+    profile = make_profile()
+    table.get_item.return_value = {
+        "Item": {
+            "PK": "USER#user",
+            "SK": "PROFILE",
+            **profile.model_dump(mode="json"),
+        }
+    }
+    repo = DynamoRepository(table)
+
+    assert repo.get_profile("user") == profile
+    assert table.get_item.call_args.kwargs == {
+        "Key": {"PK": "USER#user", "SK": "PROFILE"}
+    }
+
+    assert repo.get_profile("user", consistent_read=True) == profile
+    assert table.get_item.call_args.kwargs == {
+        "Key": {"PK": "USER#user", "SK": "PROFILE"},
+        "ConsistentRead": True,
+    }
+
+
+def test_profile_read_consistency_selects_current_table_response(
+    mocker: Any,
+) -> None:
+    """A simulated strong read returns current data instead of stale data."""
+    table = mocker.MagicMock()
+    stale_profile = make_profile().model_copy(update={"name": "Stale"})
+    current_profile = make_profile().model_copy(update={"name": "Current"})
+
+    def get_item(**kwargs: Any) -> dict[str, Any]:
+        profile = (
+            current_profile
+            if kwargs.get("ConsistentRead") is True
+            else stale_profile
+        )
+        return {
+            "Item": {
+                "PK": "USER#user",
+                "SK": "PROFILE",
+                **profile.model_dump(mode="json"),
+            }
+        }
+
+    table.get_item.side_effect = get_item
+    repo = DynamoRepository(table)
+
+    assert repo.get_profile("user") == stale_profile
+    assert repo.get_profile("user", consistent_read=True) == current_profile
+
+
 def _profile_edit_state(
     *,
     revision: int = 3,

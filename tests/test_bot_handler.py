@@ -2,6 +2,7 @@
 
 import base64
 import json
+from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Generator
 
@@ -983,6 +984,26 @@ def test_profile_amendment_does_not_use_profile_revision_cas(
     handler.repo.transition_conversation_state.assert_not_called()
 
 
+def test_profile_amendment_requests_consistent_profile_read(
+    handler: BotHandler,
+) -> None:
+    """Profile amendments derive replacements from a consistent read."""
+    state = _profile_input_state(
+        handler,
+        ProfileEditCategory.DIETARY_CONSTRAINTS,
+        ProfileEditOperation.ADD,
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.save_profile_and_transition_state.return_value = True
+
+    handler.handle_conversational(_profile_text("dairy"))
+
+    handler.repo.get_profile.assert_called_once_with(
+        "user", consistent_read=True
+    )
+
+
 def test_profile_amendment_conflict_does_not_claim_profile_changed(
     handler: BotHandler,
 ) -> None:
@@ -1029,6 +1050,84 @@ def test_profile_amendment_unexpected_save_failure_is_not_partial_success(
     handler.telegram_api.send_profile_category.assert_not_called()
     handler.repo.save_profile.assert_not_called()
     handler.repo.transition_conversation_state.assert_not_called()
+
+
+def test_sequential_profile_amendments_preserve_prior_changes(
+    real_profile_handler: tuple[BotHandler, DynamoRepository],
+    mocker: Any,
+) -> None:
+    """A strongly consistent amendment read preserves the prior amendment."""
+    handler, repo = real_profile_handler
+    initial_profile = make_profile()
+    repo.save_profile("user", initial_profile)
+    initial_item = deepcopy(
+        repo.table.get_item(Key={"PK": "USER#user", "SK": "PROFILE"})["Item"]
+    )
+    transaction = mocker.spy(repo.table.meta.client, "transact_write_items")
+    amendment_transaction = mocker.spy(
+        repo, "save_profile_and_transition_state"
+    )
+
+    handler.handle_command(_command("profile"))
+    handler.handle_callback(
+        _profile_callback("profile:category:dietary_constraints")
+    )
+    handler.handle_callback(
+        _profile_callback("profile:operation:dietary_constraints:add")
+    )
+    handler.handle_conversational(_profile_text("peanuts"))
+
+    after_amendment_a = repo.get_profile("user", consistent_read=True)
+    assert after_amendment_a is not None
+    assert after_amendment_a.dietary_constraints == ["peanuts"]
+    state_after_amendment_a = repo.get_conversation_state(
+        "user", consistent_read=True
+    )
+    assert state_after_amendment_a is not None
+    assert state_after_amendment_a.step is ConversationWorkflowStep.PROFILE_MENU
+
+    handler.handle_callback(_profile_callback("profile:category:goals"))
+    handler.handle_callback(_profile_callback("profile:operation:goals:add"))
+
+    profile_reads: list[dict[str, Any]] = []
+    original_get_item = repo.table.get_item
+
+    def get_item(**kwargs: Any) -> dict[str, Any]:
+        if kwargs.get("Key") == {"PK": "USER#user", "SK": "PROFILE"}:
+            profile_reads.append(kwargs)
+            if kwargs.get("ConsistentRead") is not True:
+                return {"Item": deepcopy(initial_item)}
+        return original_get_item(**kwargs)
+
+    mocker.patch.object(repo.table, "get_item", side_effect=get_item)
+
+    handler.handle_conversational(_profile_text("eat more vegetables"))
+
+    final_profile = repo.get_profile("user", consistent_read=True)
+    assert final_profile is not None
+    assert final_profile.name == initial_profile.name
+    assert final_profile.people_count == initial_profile.people_count
+    assert final_profile.family_members == initial_profile.family_members
+    assert final_profile.dietary_preferences == (
+        initial_profile.dietary_preferences
+    )
+    assert final_profile.dietary_constraints == ["peanuts"]
+    assert final_profile.goals == ["eat well", "eat more vegetables"]
+    final_state = repo.get_conversation_state("user", consistent_read=True)
+    assert final_state is not None
+    assert final_state.step is ConversationWorkflowStep.PROFILE_MENU
+    assert final_state.profile_category is None
+    assert final_state.profile_operation is None
+    assert any(read.get("ConsistentRead") is True for read in profile_reads)
+    assert amendment_transaction.call_count == 2
+    profile_puts = [
+        item
+        for call in transaction.call_args_list
+        for item in call.kwargs["TransactItems"]
+        if item.get("Put", {}).get("Item", {}).get("SK") == "PROFILE"
+    ]
+    assert len(profile_puts) == 2
+    handler.llm_client.chat_sync.assert_not_called()
 
 
 def test_profile_amendment_full_repository_flow_is_deterministic(
