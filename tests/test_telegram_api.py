@@ -7,14 +7,19 @@ from urllib.error import HTTPError, URLError
 import pytest
 from pytest_mock import MockerFixture
 
-from meal_planner.models.schemas import MealOutcome, MealType
+from meal_planner.models.schemas import (
+    MealOutcome,
+    MealType,
+    ProfileEditCategory,
+    ProfileEditOperation,
+)
 from meal_planner.telegram.api import (
     TelegramAPI,
     TelegramAPIError,
     split_text,
 )
 from meal_planner.telegram.commands import TelegramCommand
-from tests.factories import make_plan
+from tests.factories import make_plan, make_profile
 
 
 def _response() -> BytesIO:
@@ -207,3 +212,161 @@ def test_answer_callback_query(mocker: MockerFixture) -> None:
     TelegramAPI("token").answer_callback_query("query-id", "done")
     payload = json.loads(urlopen.call_args.args[0].data.decode())
     assert payload == {"callback_query_id": "query-id", "text": "done"}
+
+
+def _last_payload(urlopen: object) -> dict[str, object]:
+    """Decode the most recently posted Telegram payload."""
+    request = urlopen.call_args.args[0]  # type: ignore[attr-defined]
+    return json.loads(request.data.decode())
+
+
+def test_profile_summary_renders_canonical_text_and_root_controls(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+
+    TelegramAPI("token").send_profile(1, make_profile())
+
+    payload = _last_payload(urlopen)
+    assert "Dietary constraints: None" in payload["text"]
+    assert "Allergies:" not in payload["text"]
+    assert payload["reply_markup"] == {
+        "inline_keyboard": [
+            [{"text": "Amend profile", "callback_data": "profile:root"}],
+            [{"text": "Close", "callback_data": "profile:close"}],
+        ]
+    }
+
+
+def test_profile_root_renders_all_categories_and_close(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+
+    TelegramAPI("token").send_profile_root(1)
+
+    payload = _last_payload(urlopen)
+    assert payload["reply_markup"] == {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "Family",
+                    "callback_data": "profile:category:family",
+                }
+            ],
+            [
+                {
+                    "text": "Dietary constraints",
+                    "callback_data": ("profile:category:dietary_constraints"),
+                }
+            ],
+            [
+                {
+                    "text": "Dietary preferences",
+                    "callback_data": ("profile:category:dietary_preferences"),
+                }
+            ],
+            [{"text": "Goals", "callback_data": "profile:category:goals"}],
+            [{"text": "Done", "callback_data": "profile:done"}],
+            [{"text": "Close", "callback_data": "profile:close"}],
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "category, expected_operations",
+    [
+        (
+            ProfileEditCategory.FAMILY,
+            [
+                (ProfileEditOperation.ADD, "Add member"),
+                (ProfileEditOperation.REMOVE, "Remove member"),
+                (ProfileEditOperation.CHANGE_CALORIES, "Change calories"),
+            ],
+        ),
+        (
+            ProfileEditCategory.DIETARY_CONSTRAINTS,
+            [
+                (ProfileEditOperation.ADD, "Add constraint"),
+                (ProfileEditOperation.REMOVE, "Remove constraint"),
+            ],
+        ),
+        (
+            ProfileEditCategory.DIETARY_PREFERENCES,
+            [
+                (ProfileEditOperation.ADD, "Add preference"),
+                (ProfileEditOperation.REMOVE, "Remove preference"),
+            ],
+        ),
+        (
+            ProfileEditCategory.GOALS,
+            [
+                (ProfileEditOperation.ADD, "Add goal"),
+                (ProfileEditOperation.REMOVE, "Remove goal"),
+            ],
+        ),
+    ],
+)
+def test_profile_category_renders_valid_operations_and_navigation(
+    mocker: MockerFixture,
+    category: ProfileEditCategory,
+    expected_operations: list[tuple[ProfileEditOperation, str]],
+) -> None:
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+
+    TelegramAPI("token").send_profile_category(1, category)
+
+    payload = _last_payload(urlopen)
+    buttons = payload["reply_markup"]["inline_keyboard"]
+    assert [
+        (button["text"], button["callback_data"])
+        for row in buttons[:-2]
+        for button in row
+    ] == [
+        (
+            label,
+            f"profile:operation:{category.value}:{operation.value}",
+        )
+        for operation, label in expected_operations
+    ]
+    assert buttons[-2:] == [
+        [{"text": "Back", "callback_data": "profile:back"}],
+        [{"text": "Done", "callback_data": "profile:done"}],
+    ]
+
+
+def test_profile_operation_renders_guidance_and_compact_navigation(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+
+    TelegramAPI("token").send_profile_operation(
+        1,
+        ProfileEditCategory.FAMILY,
+        ProfileEditOperation.CHANGE_CALORIES,
+    )
+
+    payload = _last_payload(urlopen)
+    assert "name and new calorie target" in payload["text"]
+    assert payload["reply_markup"] == {
+        "inline_keyboard": [
+            [{"text": "Back", "callback_data": "profile:back"}],
+            [{"text": "Done", "callback_data": "profile:done"}],
+            [{"text": "Close", "callback_data": "profile:close"}],
+        ]
+    }
+    for row in payload["reply_markup"]["inline_keyboard"]:
+        for button in row:
+            assert len(button["callback_data"].encode()) <= 64

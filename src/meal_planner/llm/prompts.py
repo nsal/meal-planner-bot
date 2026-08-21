@@ -30,10 +30,10 @@ def _profile_text(profile: UserProfile | None) -> str:
         f"Family Name: {profile.name}\n"
         f"People Count: {profile.people_count}\n"
         f"Family Members: {members}\n"
-        f"Allergies: {', '.join(profile.allergies) or 'None'}\n"
+        f"Dietary constraints: "
+        f"{', '.join(profile.dietary_constraints) or 'None'}\n"
         f"Dietary Preferences: "
         f"{', '.join(profile.dietary_preferences) or 'None'}\n"
-        f"Restrictions: {', '.join(profile.restrictions) or 'None'}\n"
         f"Goals: {', '.join(profile.goals) or 'None'}"
     )
 
@@ -57,16 +57,16 @@ def build_conversational_prompt(
             or "None specified"
         )
         dietary_str = ", ".join(profile.dietary_preferences) or "None"
-        allergies_str = ", ".join(profile.allergies) or "None"
-        restrictions_str = ", ".join(profile.restrictions) or "None"
+        dietary_constraints_str = (
+            ", ".join(profile.dietary_constraints) or "None"
+        )
         goals_str = ", ".join(profile.goals) or "None"
         profile_text = (
             f"Family Name: {profile.name}\n"
             f"People Count: {profile.people_count}\n"
             f"Family Members: {members_str}\n"
-            f"Allergies: {allergies_str}\n"
+            f"Dietary constraints: {dietary_constraints_str}\n"
             f"Dietary Preferences: {dietary_str}\n"
-            f"Restrictions: {restrictions_str}\n"
             f"Goals: {goals_str}"
         )
 
@@ -77,9 +77,8 @@ def build_conversational_prompt(
             "name",
             "people_count",
             "family_members",
-            "allergies",
+            "dietary_constraints",
             "dietary_preferences",
-            "restrictions",
             "goals",
         )
         for field in pending_fields:
@@ -162,7 +161,7 @@ def build_conversational_prompt(
         "The top-level 'name' field means the household's family "
         "name, and must be collected separately from each individual "
         "member's name. Use family_members with each member's name and "
-        "calorie_target, plus allergies, dietary_preferences, restrictions, "
+        "calorie_target, plus dietary_constraints, dietary_preferences, "
         "and goals. Never use an individual member's name as the family "
         "name unless the user explicitly provides it. Meal dates must use "
         "YYYY-MM-DD. Today's date is "
@@ -203,16 +202,16 @@ def build_plan_prompt(
             or f"1 person ({profile.name})"
         )
         dietary_str = ", ".join(profile.dietary_preferences) or "None"
-        allergies_str = ", ".join(profile.allergies) or "None"
-        restrictions_str = ", ".join(profile.restrictions) or "None"
+        dietary_constraints_str = (
+            ", ".join(profile.dietary_constraints) or "None"
+        )
         goals_str = ", ".join(profile.goals) or "None"
         profile_text = (
             f"Family Name: {profile.name}\n"
             f"Total People Count: {profile.people_count}\n"
             f"Family Members & Calorie Targets: {members_str}\n"
-            f"Allergies: {allergies_str}\n"
+            f"Dietary constraints: {dietary_constraints_str}\n"
             f"Dietary Preferences: {dietary_str}\n"
-            f"Restrictions: {restrictions_str}\n"
             f"Goals: {goals_str}"
         )
 
@@ -279,7 +278,7 @@ def build_plan_prompt(
         "=== REQUEST-SPECIFIC PREFERENCE (HIGH PRIORITY) ===\n"
         f"{preference.strip() if preference else 'No additional preference.'}\n"
         "Use this request preference when compatible with the permanent "
-        "profile constraints below. Allergies, restrictions, calorie "
+        "profile constraints below. Dietary constraints, calorie "
         "targets, and safety requirements always take precedence.\n\n"
         "=== INTERPRETED PREFERENCE RULES (EXACT COMPLIANCE) ===\n"
         f"{requirement_text}\n"
@@ -438,7 +437,7 @@ def build_plan_revision_prompt(
         "=== LATEST USER AMENDMENT (HIGHEST REQUEST PRIORITY) ===\n"
         f"{amendment}\n\n"
         "Satisfy all compatible instructions and preserve sensible "
-        "unaffected choices. Permanent allergies, dietary restrictions, "
+        "unaffected choices. Permanent dietary constraints, "
         "calorie targets, and safety rules take precedence over every "
         "request-specific instruction. Use the same week and return all "
         f"seven days for week start {target_week}. Do not return a patch.\n\n"

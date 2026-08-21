@@ -3,9 +3,14 @@
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
-from meal_planner.models.schemas import MealOutcome, MealType
+from meal_planner.models.schemas import (
+    MealOutcome,
+    MealType,
+    ProfileEditCategory,
+    ProfileEditOperation,
+)
 from meal_planner.telegram.commands import BOT_COMMANDS
 
 MAX_CALLBACK_DATA_BYTES = 64
@@ -47,6 +52,44 @@ class CheckinCallback(BaseModel):
     outcome: MealOutcome
 
 
+class ProfileCallbackAction(str, Enum):
+    """Navigation actions supported by the profile edit menu."""
+
+    ROOT = "root"
+    CATEGORY = "category"
+    OPERATION = "operation"
+    BACK = "back"
+    DONE = "done"
+    CLOSE = "close"
+
+
+class ProfileCallback(BaseModel):
+    """Validated callback payload for deterministic profile editing."""
+
+    action: ProfileCallbackAction
+    category: ProfileEditCategory | None = None
+    operation: ProfileEditOperation | None = None
+
+    @model_validator(mode="after")
+    def validate_payload_shape(self) -> "ProfileCallback":
+        """Require exactly the fields allowed by each callback action."""
+        if self.action is ProfileCallbackAction.CATEGORY:
+            if self.category is None or self.operation is not None:
+                raise ValueError("category callbacks require only a category")
+            return self
+        if self.action is ProfileCallbackAction.OPERATION:
+            if self.category is None or self.operation is None:
+                raise ValueError(
+                    "operation callbacks require category and operation"
+                )
+            if not self.operation.is_valid_for(self.category):
+                raise ValueError("operation is invalid for its category")
+            return self
+        if self.category is not None or self.operation is not None:
+            raise ValueError("navigation callbacks cannot contain selections")
+        return self
+
+
 def parse_checkin_callback(data: str) -> CheckinCallback | None:
     """Parse the exact callback format accepted by check-in handlers."""
     if len(data.encode("utf-8")) > MAX_CALLBACK_DATA_BYTES:
@@ -65,6 +108,47 @@ def parse_checkin_callback(data: str) -> CheckinCallback | None:
             outcome=MealOutcome(parts[4]),
         )
     except TypeError, ValueError:
+        return None
+
+
+def parse_profile_callback(data: str) -> ProfileCallback | None:
+    """Parse the exact compact callback format for profile editing."""
+    if (
+        not isinstance(data, str)
+        or len(data.encode("utf-8")) > MAX_CALLBACK_DATA_BYTES
+    ):
+        return None
+
+    parts = data.split(":")
+    if not parts or parts[0] != "profile":
+        return None
+
+    try:
+        action = ProfileCallbackAction(parts[1])
+        if action in {
+            ProfileCallbackAction.ROOT,
+            ProfileCallbackAction.BACK,
+            ProfileCallbackAction.DONE,
+            ProfileCallbackAction.CLOSE,
+        }:
+            if len(parts) != 2:
+                return None
+            return ProfileCallback(action=action)
+        if action is ProfileCallbackAction.CATEGORY:
+            if len(parts) != 3:
+                return None
+            return ProfileCallback(
+                action=action,
+                category=ProfileEditCategory(parts[2]),
+            )
+        if len(parts) != 4:
+            return None
+        return ProfileCallback(
+            action=action,
+            category=ProfileEditCategory(parts[2]),
+            operation=ProfileEditOperation(parts[3]),
+        )
+    except IndexError, TypeError, ValueError, ValidationError:
         return None
 
 

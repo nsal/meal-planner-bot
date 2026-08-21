@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from meal_planner.models.schemas import (
     ConversationState,
+    ConversationWorkflowKind,
     ConversationWorkflowStep,
     MealLogEntry,
     MealOutcome,
@@ -53,21 +54,108 @@ class DynamoRepository:
             key: value for key, value in item.items() if key not in {"PK", "SK"}
         }
 
-    def get_profile(self, user_id: str) -> Optional[UserProfile]:
-        response = self.table.get_item(
-            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}
-        )
+    def get_profile(
+        self, user_id: str, *, consistent_read: bool = False
+    ) -> Optional[UserProfile]:
+        """Return the user's canonical profile, if it exists."""
+        get_kwargs: dict[str, Any] = {
+            "Key": {"PK": f"USER#{user_id}", "SK": "PROFILE"}
+        }
+        if consistent_read:
+            get_kwargs["ConsistentRead"] = True
+        response = self.table.get_item(**get_kwargs)
         item = response.get("Item")
         return UserProfile.model_validate(self._data(item)) if item else None
 
-    def save_profile(self, user_id: str, profile: UserProfile) -> None:
-        self.table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": "PROFILE",
-                **profile.model_dump(mode="json"),
-            }
+    def save_profile(
+        self,
+        user_id: str,
+        profile: UserProfile,
+    ) -> None:
+        """Replace the user's canonical profile document."""
+        item = {
+            "PK": f"USER#{user_id}",
+            "SK": "PROFILE",
+            **profile.model_dump(mode="json"),
+        }
+        self.table.put_item(Item=item)
+
+    def save_profile_and_transition_state(
+        self,
+        user_id: str,
+        profile: UserProfile,
+        next_state: ConversationState,
+        observed_state: ConversationState,
+    ) -> bool:
+        """Atomically save a profile and consume its observed edit state."""
+        if (
+            observed_state.workflow_kind
+            is not ConversationWorkflowKind.PROFILE_EDIT
+            or observed_state.step
+            is not ConversationWorkflowStep.AWAITING_PROFILE_INPUT
+            or observed_state.profile_category is None
+            or observed_state.profile_operation is None
+        ):
+            return False
+        profile_item = {
+            "PK": f"USER#{user_id}",
+            "SK": "PROFILE",
+            **profile.model_dump(mode="json"),
+        }
+        state_item = {
+            **self._conversation_key(user_id),
+            **next_state.model_dump(mode="json"),
+        }
+        condition = (
+            "#revision = :observed_revision AND "
+            "#created_at = :observed_created_at AND "
+            "#workflow_kind = :observed_workflow_kind AND "
+            "#step = :observed_step AND "
+            "#profile_category = :observed_profile_category AND "
+            "#profile_operation = :observed_profile_operation"
         )
+        names = {
+            "#revision": "revision",
+            "#created_at": "created_at",
+            "#workflow_kind": "workflow_kind",
+            "#step": "step",
+            "#profile_category": "profile_category",
+            "#profile_operation": "profile_operation",
+        }
+        observed_data = observed_state.model_dump(mode="json")
+        values = {
+            ":observed_revision": observed_data["revision"],
+            ":observed_created_at": observed_data["created_at"],
+            ":observed_workflow_kind": observed_data["workflow_kind"],
+            ":observed_step": observed_data["step"],
+            ":observed_profile_category": observed_data["profile_category"],
+            ":observed_profile_operation": observed_data["profile_operation"],
+        }
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": profile_item,
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": state_item,
+                            "ConditionExpression": condition,
+                            "ExpressionAttributeNames": names,
+                            "ExpressionAttributeValues": values,
+                        }
+                    },
+                ]
+            )
+        except ClientError as exc:
+            if self._is_transaction_conditional_failure(exc):
+                return False
+            raise
+        return True
 
     def get_profile_draft(
         self, user_id: str

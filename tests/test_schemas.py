@@ -27,6 +27,8 @@ from meal_planner.models.schemas import (
     PlanRevisionContext,
     PlanStatus,
     PreferenceRequirement,
+    ProfileEditCategory,
+    ProfileEditOperation,
     ProfileUpdateEntities,
     UserProfile,
     WeeklyPlan,
@@ -297,6 +299,160 @@ def test_conversation_state_validates_workflow_shape_and_expiry() -> None:
         )
 
 
+def test_profile_edit_menu_state_has_no_selected_operation() -> None:
+    """A profile edit menu records no category or operation selection."""
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PROFILE_EDIT,
+        step=ConversationWorkflowStep.PROFILE_MENU,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+
+    assert state.profile_category is None
+    assert state.profile_operation is None
+
+
+@pytest.mark.parametrize(
+    ("category", "operation"),
+    [
+        (ProfileEditCategory.FAMILY, ProfileEditOperation.ADD),
+        (ProfileEditCategory.FAMILY, ProfileEditOperation.REMOVE),
+        (ProfileEditCategory.FAMILY, ProfileEditOperation.CHANGE_CALORIES),
+        (
+            ProfileEditCategory.DIETARY_CONSTRAINTS,
+            ProfileEditOperation.ADD,
+        ),
+        (
+            ProfileEditCategory.DIETARY_CONSTRAINTS,
+            ProfileEditOperation.REMOVE,
+        ),
+        (ProfileEditCategory.DIETARY_PREFERENCES, ProfileEditOperation.ADD),
+        (
+            ProfileEditCategory.DIETARY_PREFERENCES,
+            ProfileEditOperation.REMOVE,
+        ),
+        (ProfileEditCategory.GOALS, ProfileEditOperation.ADD),
+        (ProfileEditCategory.GOALS, ProfileEditOperation.REMOVE),
+    ],
+)
+def test_profile_edit_awaiting_input_accepts_valid_operation(
+    category: ProfileEditCategory,
+    operation: ProfileEditOperation,
+) -> None:
+    """An awaiting profile edit must carry a category-valid operation."""
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PROFILE_EDIT,
+        step=ConversationWorkflowStep.AWAITING_PROFILE_INPUT,
+        profile_category=category,
+        profile_operation=operation,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+
+    assert state.profile_category is category
+    assert state.profile_operation is operation
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {
+            "step": ConversationWorkflowStep.PROFILE_MENU,
+            "profile_category": ProfileEditCategory.FAMILY,
+        },
+        {
+            "step": ConversationWorkflowStep.PROFILE_MENU,
+            "profile_operation": ProfileEditOperation.ADD,
+        },
+        {
+            "step": ConversationWorkflowStep.AWAITING_PROFILE_INPUT,
+            "profile_category": ProfileEditCategory.FAMILY,
+        },
+        {
+            "step": ConversationWorkflowStep.AWAITING_PROFILE_INPUT,
+            "profile_category": ProfileEditCategory.FAMILY,
+            "profile_operation": ProfileEditOperation.ADD,
+            "meal_draft": MealLogDraft(),
+        },
+        {
+            "step": ConversationWorkflowStep.AWAITING_PROFILE_INPUT,
+            "profile_category": ProfileEditCategory.DIETARY_CONSTRAINTS,
+            "profile_operation": ProfileEditOperation.CHANGE_CALORIES,
+        },
+        {
+            "step": ConversationWorkflowStep.AWAITING_PROFILE_INPUT,
+            "profile_category": ProfileEditCategory.FAMILY,
+            "profile_operation": ProfileEditOperation.ADD,
+            "preference": "vegetarian",
+        },
+        {
+            "step": ConversationWorkflowStep.AWAITING_PROFILE_INPUT,
+            "profile_category": ProfileEditCategory.FAMILY,
+            "profile_operation": ProfileEditOperation.ADD,
+            "expires_at": 1,
+        },
+    ],
+)
+def test_profile_edit_rejects_invalid_state_shapes(
+    values: dict[str, object],
+) -> None:
+    """Reject missing, unrelated, expired, and category-invalid state data."""
+    now = datetime.now(timezone.utc)
+    defaults: dict[str, object] = {
+        "workflow_kind": ConversationWorkflowKind.PROFILE_EDIT,
+        "step": ConversationWorkflowStep.PROFILE_MENU,
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": now + timedelta(hours=24),
+    }
+
+    with pytest.raises(ValidationError):
+        ConversationState(**{**defaults, **values})
+
+
+def test_non_profile_workflows_reject_profile_fields() -> None:
+    """Profile selections are invalid on meal, plan, and revision states."""
+    now = datetime.now(timezone.utc)
+    common = {
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": now + timedelta(hours=24),
+    }
+
+    with pytest.raises(ValidationError):
+        ConversationState(
+            **common,
+            workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+            step=ConversationWorkflowStep.AWAITING_DATE,
+            meal_draft=MealLogDraft(),
+            profile_category=ProfileEditCategory.FAMILY,
+        )
+    with pytest.raises(ValidationError):
+        ConversationState(
+            **common,
+            workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+            step=ConversationWorkflowStep.AWAITING_PREFERENCE,
+            preference="vegetarian",
+            request_id="request-1",
+            profile_operation=ProfileEditOperation.ADD,
+        )
+    with pytest.raises(ValidationError):
+        ConversationState(
+            **common,
+            workflow_kind=ConversationWorkflowKind.PLAN_REVISION,
+            step=ConversationWorkflowStep.GENERATING,
+            amendment="Avoid cauliflower",
+            target_week=date(2026, 8, 10),
+            expected_plan_revision=1,
+            request_id="request-1",
+            profile_category=ProfileEditCategory.GOALS,
+        )
+
+
 def test_plan_preference_can_be_retained_while_awaiting_clarification() -> None:
     """Pending clarification keeps the raw preference in the same workflow."""
     now = datetime.now(timezone.utc)
@@ -333,9 +489,8 @@ def test_user_profile_defaults() -> None:
     profile = UserProfile(name="John Doe")
     assert profile.name == "John Doe"
     assert profile.family_members == []
-    assert profile.allergies == []
+    assert profile.dietary_constraints == []
     assert profile.dietary_preferences == []
-    assert profile.restrictions == []
     assert profile.goals == []
     assert profile.people_count == 1
 
@@ -349,15 +504,136 @@ def test_user_profile_full() -> None:
             member,
             FamilyMember(name="Jane Doe", calorie_target=1800),
         ],
-        allergies=["peanuts"],
+        dietary_constraints=["peanuts", "gluten-free"],
         dietary_preferences=["keto"],
-        restrictions=["gluten-free"],
         goals=["weight-loss"],
         people_count=2,
     )
     assert len(profile.family_members) == 2
-    assert profile.allergies == ["peanuts"]
+    assert profile.dietary_constraints == ["peanuts", "gluten-free"]
     assert profile.people_count == 2
+
+
+def test_user_profile_merges_legacy_constraints_in_order_and_deduplicates() -> (
+    None
+):
+    """Merge legacy fields while retaining the first display spelling."""
+    profile = UserProfile.model_validate(
+        {
+            "name": "John Doe",
+            "allergies": ["Peanuts", "Shellfish"],
+            "restrictions": ["peanuts", "Gluten-free", "SHELLFISH"],
+        }
+    )
+
+    assert profile.dietary_constraints == [
+        "Peanuts",
+        "Shellfish",
+        "Gluten-free",
+    ]
+    dumped = profile.model_dump()
+    assert dumped["dietary_constraints"] == profile.dietary_constraints
+    assert "allergies" not in dumped
+    assert "restrictions" not in dumped
+
+
+def test_user_profile_prefers_present_canonical_constraints_over_legacy() -> (
+    None
+):
+    """An explicit canonical field takes precedence over legacy fields."""
+    profile = UserProfile.model_validate(
+        {
+            "name": "John Doe",
+            "dietary_constraints": ["Vegan"],
+            "allergies": ["peanuts"],
+            "restrictions": ["dairy-free"],
+        }
+    )
+
+    assert profile.dietary_constraints == ["Vegan"]
+
+
+def test_user_profile_has_no_constraints_when_legacy_data_is_empty() -> None:
+    """Profiles without either legacy field get an empty canonical list."""
+    profile = UserProfile.model_validate(
+        {"name": "John Doe", "allergies": [], "restrictions": []}
+    )
+
+    assert profile.dietary_constraints == []
+
+
+@pytest.mark.parametrize(
+    ("legacy", "expected"),
+    [
+        ({}, None),
+        ({"allergies": None, "restrictions": None}, None),
+        ({"allergies": None, "restrictions": []}, []),
+        ({"allergies": "none", "restrictions": None}, []),
+        ({"allergies": "nothing", "restrictions": None}, []),
+        ({"allergies": None, "restrictions": "N/A!"}, []),
+        ({"allergies": "not applicable", "restrictions": None}, []),
+        ({"allergies": "no allergies", "restrictions": None}, []),
+        (
+            {"allergies": "no dietary constraints", "restrictions": None},
+            [],
+        ),
+        (
+            {
+                "allergies": ["Peanuts", "none", "peanuts"],
+                "restrictions": ["Vegan", "NO RESTRICTIONS", "vegan"],
+            },
+            ["Peanuts", "Vegan"],
+        ),
+        (
+            {"allergies": "shellfish", "restrictions": "Dairy-free"},
+            ["shellfish", "Dairy-free"],
+        ),
+    ],
+)
+def test_profile_update_normalizes_legacy_constraints(
+    legacy: dict[str, object], expected: list[str] | None
+) -> None:
+    """Partial legacy drafts preserve unanswered and explicit-empty states."""
+    update = ProfileUpdateEntities.model_validate(legacy)
+
+    assert update.dietary_constraints == expected
+    dumped = update.model_dump()
+    assert "allergies" not in dumped
+    assert "restrictions" not in dumped
+
+
+def test_profile_update_canonical_constraints_are_authoritative() -> None:
+    """A present canonical value wins over legacy constraint fields."""
+    update = ProfileUpdateEntities.model_validate(
+        {
+            "dietary_constraints": None,
+            "allergies": ["peanuts"],
+            "restrictions": ["vegan"],
+        }
+    )
+
+    assert update.dietary_constraints is None
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        {},
+        {"allergies": None, "restrictions": None},
+        {"allergies": [], "restrictions": None},
+        {"allergies": "none", "restrictions": "no restrictions"},
+    ],
+)
+def test_user_profile_normalizes_legacy_constraints_to_complete_list(
+    legacy: dict[str, object],
+) -> None:
+    """Complete profiles always expose a canonical constraint list."""
+    profile = UserProfile.model_validate({"name": "John Doe", **legacy})
+
+    assert profile.dietary_constraints == []
+    dumped = profile.model_dump()
+    assert "allergies" not in dumped
+    assert "restrictions" not in dumped
 
 
 def test_user_profile_invalid_people_count() -> None:
@@ -366,12 +642,25 @@ def test_user_profile_invalid_people_count() -> None:
         UserProfile(name="John", people_count=0)
 
 
+def test_user_profile_ignores_legacy_revision_on_read() -> None:
+    """Legacy profile revisions are ignored by the canonical model."""
+    profile = UserProfile.model_validate(
+        {
+            "name": "John Doe",
+            "allergies": ["peanuts"],
+            "restrictions": ["vegetarian"],
+            "revision": 7,
+        }
+    )
+
+    assert "revision" not in profile.model_dump()
+
+
 @pytest.mark.parametrize(
     "field",
     [
-        "allergies",
+        "dietary_constraints",
         "dietary_preferences",
-        "restrictions",
         "goals",
     ],
 )
@@ -391,10 +680,10 @@ def test_profile_update_normalizes_generic_no_value_phrases(
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("allergies", "no allergies"),
+        ("dietary_constraints", "no dietary constraints"),
         ("dietary_preferences", "no dietary preferences."),
         ("dietary_preferences", "NO PREFERENCES"),
-        ("restrictions", " No restrictions! "),
+        ("dietary_constraints", " No dietary constraints! "),
         ("goals", "not applicable"),
         ("goals", "no goals"),
     ],
@@ -411,9 +700,8 @@ def test_profile_update_normalizes_field_specific_no_value_phrases(
 @pytest.mark.parametrize(
     "field",
     [
-        "allergies",
+        "dietary_constraints",
         "dietary_preferences",
-        "restrictions",
         "goals",
     ],
 )
@@ -430,9 +718,8 @@ def test_profile_update_preserves_none_and_lists(
 @pytest.mark.parametrize(
     "field",
     [
-        "allergies",
+        "dietary_constraints",
         "dietary_preferences",
-        "restrictions",
         "goals",
     ],
 )

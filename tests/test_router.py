@@ -3,7 +3,13 @@
 import pytest
 
 from meal_planner.models.schemas import MealOutcome, MealType
-from meal_planner.router import RouteType, parse_checkin_callback, route_update
+from meal_planner.router import (
+    ProfileCallbackAction,
+    RouteType,
+    parse_checkin_callback,
+    parse_profile_callback,
+    route_update,
+)
 
 
 def test_route_command_and_conversation() -> None:
@@ -147,6 +153,86 @@ def test_parse_plan_specific_checkin_callback() -> None:
     assert callback.day == 7
     assert callback.meal_type is MealType.DINNER
     assert callback.outcome is MealOutcome.SWAPPED
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "profile:root",
+        "profile:back",
+        "profile:done",
+        "profile:close",
+        "profile:category:family",
+        "profile:category:dietary_constraints",
+        "profile:category:dietary_preferences",
+        "profile:category:goals",
+        "profile:operation:family:add",
+        "profile:operation:family:remove",
+        "profile:operation:family:change_calories",
+        "profile:operation:dietary_constraints:add",
+        "profile:operation:dietary_constraints:remove",
+        "profile:operation:dietary_preferences:add",
+        "profile:operation:dietary_preferences:remove",
+        "profile:operation:goals:add",
+        "profile:operation:goals:remove",
+    ],
+)
+def test_parse_every_accepted_profile_callback(payload: str) -> None:
+    """Accept only the documented profile navigation and operation actions."""
+    callback = parse_profile_callback(payload)
+
+    assert callback is not None
+    assert callback.action in {
+        ProfileCallbackAction.ROOT,
+        ProfileCallbackAction.BACK,
+        ProfileCallbackAction.DONE,
+        ProfileCallbackAction.CLOSE,
+        ProfileCallbackAction.CATEGORY,
+        ProfileCallbackAction.OPERATION,
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "profile",
+        "profile:",
+        "profile:unknown",
+        "profile:root:extra",
+        "profile:category",
+        "profile:category:unknown",
+        "profile:category:family:extra",
+        "profile:operation",
+        "profile:operation:family",
+        "profile:operation:family:unknown",
+        "profile:operation:unknown:add",
+        "profile:operation:dietary_constraints:change_calories",
+        "profile:operation:family:add:extra",
+        "checkin:2026-08-10:1:lunch:cooked",
+        "profile:category:family:with:arbitrary:data",
+    ],
+)
+def test_parse_profile_callback_rejects_malformed_or_wrong_operations(
+    payload: str,
+) -> None:
+    """Reject malformed payloads and operations for unrelated categories."""
+    assert parse_profile_callback(payload) is None
+
+
+def test_profile_callback_parser_enforces_telegram_byte_limit() -> None:
+    """Reject callback data above Telegram's 64-byte UTF-8 limit."""
+    oversized = "profile:category:" + "é" * 25
+
+    assert len(oversized.encode("utf-8")) > 64
+    assert parse_profile_callback(oversized) is None
+
+
+def test_profile_callbacks_remain_within_telegram_byte_limit() -> None:
+    """The longest documented profile operation fits the wire limit."""
+    payload = "profile:operation:dietary_preferences:remove"
+
+    assert len(payload.encode("utf-8")) <= 64
+    assert parse_profile_callback(payload) is not None
 
 
 @pytest.mark.parametrize(

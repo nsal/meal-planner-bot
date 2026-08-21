@@ -2,24 +2,31 @@
 
 import base64
 import json
+from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Generator
 
+import boto3
 import pytest
+from moto import mock_aws
 
 from meal_planner.bot_handler import BotHandler, lambda_handler
-from meal_planner.db.dynamo import ActivePlanSnapshot
+from meal_planner.db.dynamo import ActivePlanSnapshot, DynamoRepository
 from meal_planner.models.schemas import (
     ConversationIntent,
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
+    FamilyMember,
     GroceryStatus,
     MealLogDraft,
     MealOutcome,
     PlanStatus,
     PreferenceRequirement,
+    ProfileEditCategory,
+    ProfileEditOperation,
     ProfileUpdateEntities,
+    UserProfile,
 )
 from meal_planner.router import RouteResult, RouteType
 from meal_planner.telegram.access import TelegramAccessPolicy
@@ -38,6 +45,38 @@ def handler(mocker: Any) -> BotHandler:
         llm_client=mocker.MagicMock(),
         access_policy=TelegramAccessPolicy(frozenset({"1"})),
     )
+
+
+@pytest.fixture
+def real_profile_handler(
+    mocker: Any,
+) -> Generator[tuple[BotHandler, DynamoRepository], None, None]:
+    """Create a handler backed by a real moto DynamoDB table."""
+    with mock_aws():
+        table = boto3.resource(
+            "dynamodb", region_name="us-east-1"
+        ).create_table(
+            TableName="test-meal-planner-handler",
+            KeySchema=[
+                {"AttributeName": "PK", "KeyType": "HASH"},
+                {"AttributeName": "SK", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "PK", "AttributeType": "S"},
+                {"AttributeName": "SK", "AttributeType": "S"},
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        repo = DynamoRepository(table)
+        handler = BotHandler(
+            repo,
+            mocker.MagicMock(),
+            lambda_client=mocker.MagicMock(),
+            planner_function_name="planner",
+            llm_client=mocker.MagicMock(),
+            access_policy=TelegramAccessPolicy(frozenset({"1"})),
+        )
+        yield handler, repo
 
 
 def _command(name: str) -> RouteResult:
@@ -84,6 +123,9 @@ def test_start_requests_family_name_separately_from_member_names(
     message = handler.telegram_api.send_message.call_args.args[1].lower()
     assert "family name" in message
     assert "each household member's name" in message
+    assert "dietary constraints" in message
+    assert "allergies" not in message
+    assert "restrictions" not in message
     assert "tell me your name" not in message
 
 
@@ -123,10 +165,1017 @@ def test_profile_displays_family_name_and_individual_members(
 
     handler.handle_command(_command("profile"))
 
-    message = handler.telegram_api.send_message.call_args.args[1]
-    assert "Family name: Alex" in message
-    assert "Family members:" in message
-    assert "- Alex (2000 kcal/day)" in message
+    sent_profile = handler.telegram_api.send_profile.call_args.args[1]
+    assert sent_profile.name == "Alex"
+    assert sent_profile.family_members[0].name == "Alex"
+
+
+def _profile_callback(
+    data: str,
+    *,
+    query_id: str | None = "profile-query",
+) -> RouteResult:
+    """Build a callback route for profile navigation tests."""
+    return RouteResult(
+        route_type=RouteType.CALLBACK,
+        chat_id=1,
+        user_id="user",
+        callback_data=data,
+        callback_query_id=query_id,
+    )
+
+
+def test_profile_command_replaces_existing_workflow_with_profile_menu(
+    handler: BotHandler,
+) -> None:
+    handler.repo.get_profile.return_value = make_profile()
+    previous = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = previous
+
+    handler.handle_command(_command("profile"))
+
+    saved = handler.repo.save_conversation_state.call_args.args[1]
+    assert saved.workflow_kind is ConversationWorkflowKind.PROFILE_EDIT
+    assert saved.step is ConversationWorkflowStep.PROFILE_MENU
+    assert (
+        handler.repo.save_conversation_state.call_args.kwargs[
+            "expected_revision"
+        ]
+        == previous.revision
+    )
+    handler.repo.save_profile.assert_not_called()
+
+
+def test_cancel_clears_active_profile_edit_state(
+    handler: BotHandler,
+) -> None:
+    """Cancel removes an active profile edit with its revision guard."""
+    state = handler._new_profile_state().model_copy(update={"revision": 3})
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.delete_conversation_state.return_value = True
+
+    handler.handle_command(_command("cancel"))
+
+    handler.repo.delete_conversation_state.assert_called_once_with(
+        "user", expected_revision=3
+    )
+    assert (
+        "cancelled"
+        in handler.telegram_api.send_message.call_args.args[1].lower()
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "workflow_kind", "expected_text"),
+    [
+        ("plan", ConversationWorkflowKind.PLAN_REQUEST, "preference"),
+        ("submit_meals", ConversationWorkflowKind.MEAL_LOG, "what date"),
+    ],
+)
+def test_plan_and_submit_meals_replace_active_profile_edit(
+    handler: BotHandler,
+    command: str,
+    workflow_kind: ConversationWorkflowKind,
+    expected_text: str,
+) -> None:
+    """New command workflows replace profile editing through CAS."""
+    handler.repo.get_profile.return_value = make_profile()
+    active_edit = handler._new_profile_state().model_copy(
+        update={"revision": 4}
+    )
+    handler.repo.get_conversation_state.return_value = active_edit
+    handler.repo.save_conversation_state.return_value = True
+
+    handler.handle_command(_command(command))
+
+    replacement = handler.repo.save_conversation_state.call_args.args[1]
+    assert replacement.workflow_kind is workflow_kind
+    assert (
+        handler.repo.save_conversation_state.call_args.kwargs[
+            "expected_revision"
+        ]
+        == active_edit.revision
+    )
+    assert (
+        expected_text
+        in handler.telegram_api.send_message.call_args.args[1].lower()
+    )
+
+
+def test_profile_replaces_active_profile_edit_with_fresh_menu(
+    handler: BotHandler,
+) -> None:
+    """Reopening /profile replaces the active edit through CAS."""
+    handler.repo.get_profile.return_value = make_profile()
+    active_edit = handler._new_profile_state().model_copy(
+        update={"revision": 5}
+    )
+    handler.repo.get_conversation_state.return_value = active_edit
+    handler.repo.save_conversation_state.return_value = True
+
+    handler.handle_command(_command("profile"))
+
+    replacement = handler.repo.save_conversation_state.call_args.args[1]
+    assert replacement.workflow_kind is ConversationWorkflowKind.PROFILE_EDIT
+    assert replacement.step is ConversationWorkflowStep.PROFILE_MENU
+    assert replacement.revision == active_edit.revision + 1
+    handler.telegram_api.send_profile.assert_called_once_with(1, make_profile())
+    assert (
+        handler.repo.save_conversation_state.call_args.kwargs[
+            "expected_revision"
+        ]
+        == active_edit.revision
+    )
+
+
+def test_profile_root_callback_renders_categories_and_acknowledges(
+    handler: BotHandler,
+) -> None:
+    handler.repo.get_conversation_state.return_value = (
+        handler._new_profile_state()
+    )
+
+    handler.handle_callback(_profile_callback("profile:root"))
+
+    handler.telegram_api.send_profile_root.assert_called_once_with(1)
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "profile-query", "Processing profile action"
+    )
+    handler.repo.save_profile.assert_not_called()
+
+
+def test_profile_callback_acknowledges_before_state_read_and_rendering(
+    handler: BotHandler,
+) -> None:
+    events: list[str] = []
+    state = handler._new_profile_state()
+
+    def acknowledge(query_id: str, text: str) -> None:
+        del query_id, text
+        events.append("acknowledge")
+
+    def read_state(user_id: str, *, consistent_read: bool) -> ConversationState:
+        del user_id, consistent_read
+        events.append("state read")
+        return state
+
+    def render_root(chat_id: int | str) -> None:
+        del chat_id
+        events.append("render")
+
+    handler.telegram_api.answer_callback_query.side_effect = acknowledge
+    handler.repo.get_conversation_state.side_effect = read_state
+    handler.telegram_api.send_profile_root.side_effect = render_root
+
+    handler.handle_callback(_profile_callback("profile:root"))
+
+    assert events == ["acknowledge", "state read", "render"]
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "profile-query", "Processing profile action"
+    )
+
+
+def test_profile_callback_acknowledges_before_stale_state_message(
+    handler: BotHandler,
+) -> None:
+    events: list[str] = []
+
+    def acknowledge(query_id: str, text: str) -> None:
+        del query_id, text
+        events.append("acknowledge")
+
+    def read_state(user_id: str, *, consistent_read: bool) -> None:
+        del user_id, consistent_read
+        events.append("state read")
+        return None
+
+    def send_message(
+        chat_id: int | str,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        del chat_id, text, reply_markup
+        events.append("message")
+
+    handler.telegram_api.answer_callback_query.side_effect = acknowledge
+    handler.repo.get_conversation_state.side_effect = read_state
+    handler.telegram_api.send_message.side_effect = send_message
+
+    handler.handle_callback(_profile_callback("profile:root"))
+
+    assert events == ["acknowledge", "state read", "message"]
+    handler.telegram_api.answer_callback_query.assert_called_once()
+
+
+@pytest.mark.parametrize("failure_source", ["repository", "telegram delivery"])
+def test_profile_callback_acknowledges_once_when_processing_fails(
+    handler: BotHandler, failure_source: str
+) -> None:
+    events: list[str] = []
+    state = handler._new_profile_state()
+
+    def acknowledge(query_id: str, text: str) -> None:
+        del query_id, text
+        events.append("acknowledge")
+
+    def send_error(
+        chat_id: int | str,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        del chat_id, text, reply_markup
+        events.append("error message")
+
+    handler.telegram_api.answer_callback_query.side_effect = acknowledge
+    handler.telegram_api.send_message.side_effect = send_error
+    if failure_source == "repository":
+
+        def read_state(
+            user_id: str, *, consistent_read: bool
+        ) -> ConversationState:
+            del user_id, consistent_read
+            events.append("state read")
+            raise RuntimeError("database unavailable")
+
+        handler.repo.get_conversation_state.side_effect = read_state
+        expected_events = ["acknowledge", "state read", "error message"]
+    else:
+
+        def read_state(
+            user_id: str, *, consistent_read: bool
+        ) -> ConversationState:
+            del user_id, consistent_read
+            events.append("state read")
+            return state
+
+        def render_root(chat_id: int | str) -> None:
+            del chat_id
+            events.append("render")
+            raise TelegramAPIError("delivery unavailable")
+
+        handler.repo.get_conversation_state.side_effect = read_state
+        handler.telegram_api.send_profile_root.side_effect = render_root
+        expected_events = [
+            "acknowledge",
+            "state read",
+            "render",
+            "error message",
+        ]
+
+    handler.handle_callback(_profile_callback("profile:root"))
+
+    assert events == expected_events
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "profile-query", "Processing profile action"
+    )
+
+
+def test_profile_callback_continues_when_acknowledgement_fails(
+    handler: BotHandler,
+) -> None:
+    events: list[str] = []
+    state = handler._new_profile_state()
+
+    def acknowledge(query_id: str, text: str) -> None:
+        del query_id, text
+        events.append("acknowledge")
+        raise TelegramAPIError("acknowledgement unavailable")
+
+    def read_state(user_id: str, *, consistent_read: bool) -> ConversationState:
+        del user_id, consistent_read
+        events.append("state read")
+        return state
+
+    def render_root(chat_id: int | str) -> None:
+        del chat_id
+        events.append("render")
+
+    handler.repo.get_conversation_state.side_effect = read_state
+    handler.telegram_api.answer_callback_query.side_effect = acknowledge
+    handler.telegram_api.send_profile_root.side_effect = render_root
+
+    handler.handle_callback(_profile_callback("profile:root"))
+
+    assert events == ["acknowledge", "state read", "render"]
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "profile-query", "Processing profile action"
+    )
+    handler.repo.get_conversation_state.assert_called_once_with(
+        "user", consistent_read=True
+    )
+    handler.telegram_api.send_profile_root.assert_called_once_with(1)
+
+
+def test_profile_callback_without_query_id_does_not_process_profile_action(
+    handler: BotHandler,
+) -> None:
+    handler.handle_callback(
+        _profile_callback("profile:operation:family:add", query_id=None)
+    )
+
+    handler.telegram_api.answer_callback_query.assert_not_called()
+    handler.repo.get_conversation_state.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
+    handler.telegram_api.send_message.assert_not_called()
+
+
+def test_profile_category_and_operation_callbacks_use_cas_without_profile_write(
+    handler: BotHandler,
+) -> None:
+    state = handler._new_profile_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_callback(
+        _profile_callback("profile:category:dietary_constraints")
+    )
+    handler.telegram_api.send_profile_category.assert_called_once_with(
+        1, ProfileEditCategory.DIETARY_CONSTRAINTS
+    )
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "profile-query", "Processing profile action"
+    )
+    handler.repo.save_profile.assert_not_called()
+
+    handler.telegram_api.reset_mock()
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.transition_conversation_state.return_value = True
+    handler.handle_callback(
+        _profile_callback("profile:operation:family:change_calories")
+    )
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PROFILE_INPUT
+    assert saved.profile_category is ProfileEditCategory.FAMILY
+    assert saved.profile_operation is ProfileEditOperation.CHANGE_CALORIES
+    handler.telegram_api.send_profile_operation.assert_called_once_with(
+        1,
+        ProfileEditCategory.FAMILY,
+        ProfileEditOperation.CHANGE_CALORIES,
+    )
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "profile-query", "Processing profile action"
+    )
+    handler.repo.save_profile.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "payload", ["profile:back", "profile:done", "profile:close"]
+)
+def test_profile_navigation_callbacks_do_not_write_profile(
+    handler: BotHandler, payload: str
+) -> None:
+    state = handler._new_profile_state()
+    if payload == "profile:back":
+        state = state.model_copy(
+            update={
+                "step": ConversationWorkflowStep.AWAITING_PROFILE_INPUT,
+                "profile_category": ProfileEditCategory.FAMILY,
+                "profile_operation": ProfileEditOperation.ADD,
+            }
+        )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.delete_conversation_state.return_value = True
+
+    handler.handle_callback(_profile_callback(payload))
+
+    if payload == "profile:back":
+        handler.telegram_api.send_profile_root.assert_called_once_with(1)
+        handler.repo.transition_conversation_state.assert_called_once()
+    else:
+        handler.repo.delete_conversation_state.assert_called_once_with(
+            "user", expected_revision=state.revision
+        )
+    handler.repo.save_profile.assert_not_called()
+    handler.telegram_api.answer_callback_query.assert_called_once()
+
+
+def _profile_input_state(
+    handler: BotHandler,
+    category: ProfileEditCategory,
+    operation: ProfileEditOperation,
+) -> ConversationState:
+    """Return an active profile input state for amendment tests."""
+    return handler._new_profile_state().model_copy(
+        update={
+            "step": ConversationWorkflowStep.AWAITING_PROFILE_INPUT,
+            "profile_category": category,
+            "profile_operation": operation,
+        }
+    )
+
+
+def _profile_text(text: str) -> RouteResult:
+    """Build a conversational route for profile amendment input."""
+    return RouteResult(
+        route_type=RouteType.CONVERSATIONAL,
+        chat_id=1,
+        user_id="user",
+        text=text,
+    )
+
+
+@pytest.mark.parametrize(
+    ("category", "operation", "text", "expected"),
+    [
+        (
+            ProfileEditCategory.FAMILY,
+            ProfileEditOperation.ADD,
+            "Taylor 1600",
+            ["Alex", "Sam", "Taylor"],
+        ),
+        (
+            ProfileEditCategory.FAMILY,
+            ProfileEditOperation.REMOVE,
+            "sam",
+            ["Alex"],
+        ),
+        (
+            ProfileEditCategory.FAMILY,
+            ProfileEditOperation.CHANGE_CALORIES,
+            "sam 2100",
+            [2000, 2100],
+        ),
+        (
+            ProfileEditCategory.DIETARY_CONSTRAINTS,
+            ProfileEditOperation.ADD,
+            "No peanuts",
+            ["No peanuts"],
+        ),
+        (
+            ProfileEditCategory.DIETARY_CONSTRAINTS,
+            ProfileEditOperation.REMOVE,
+            "PEANUTS",
+            [],
+        ),
+        (
+            ProfileEditCategory.DIETARY_PREFERENCES,
+            ProfileEditOperation.ADD,
+            "Mediterranean",
+            ["balanced", "Mediterranean"],
+        ),
+        (
+            ProfileEditCategory.DIETARY_PREFERENCES,
+            ProfileEditOperation.REMOVE,
+            "BALANCED",
+            [],
+        ),
+        (
+            ProfileEditCategory.GOALS,
+            ProfileEditOperation.ADD,
+            "Eat more vegetables",
+            ["eat well", "Eat more vegetables"],
+        ),
+        (
+            ProfileEditCategory.GOALS,
+            ProfileEditOperation.REMOVE,
+            "EAT WELL",
+            [],
+        ),
+    ],
+)
+def test_profile_amendment_successes_return_to_category_menu(
+    handler: BotHandler,
+    category: ProfileEditCategory,
+    operation: ProfileEditOperation,
+    text: str,
+    expected: list[Any],
+) -> None:
+    """Successful deterministic amendments save and render the category."""
+    profile = make_profile()
+    if (
+        operation is ProfileEditOperation.REMOVE
+        and category is not ProfileEditCategory.FAMILY
+    ):
+        existing = {
+            ProfileEditCategory.DIETARY_CONSTRAINTS: ["Peanuts"],
+            ProfileEditCategory.DIETARY_PREFERENCES: ["balanced"],
+            ProfileEditCategory.GOALS: ["eat well"],
+        }[category]
+        profile = profile.model_copy(update={category.value: existing})
+    state = _profile_input_state(handler, category, operation)
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = profile
+    handler.repo.save_profile_and_transition_state.return_value = True
+
+    handler.handle_conversational(_profile_text(text))
+
+    saved = handler.repo.save_profile_and_transition_state.call_args.args[1]
+    if category is ProfileEditCategory.FAMILY:
+        if operation is ProfileEditOperation.CHANGE_CALORIES:
+            assert [
+                member.calorie_target for member in saved.family_members
+            ] == expected
+        else:
+            assert [member.name for member in saved.family_members] == expected
+    else:
+        assert getattr(saved, category.value) == expected
+    assert saved is not profile
+    handler.repo.save_profile.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
+    transitioned = (
+        handler.repo.save_profile_and_transition_state.call_args.args[2]
+    )
+    assert transitioned.step is ConversationWorkflowStep.PROFILE_MENU
+    assert transitioned.profile_category is None
+    assert transitioned.profile_operation is None
+    handler.telegram_api.send_profile_category.assert_called_once_with(
+        1, category
+    )
+    handler.llm_client.chat_sync.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("operation", "text", "message_part"),
+    [
+        (ProfileEditOperation.ADD, "Sam 1800", "already"),
+        (ProfileEditOperation.CHANGE_CALORIES, "Unknown 1800", "find"),
+        (ProfileEditOperation.REMOVE, "Unknown", "find"),
+    ],
+)
+def test_family_profile_amendment_errors_do_not_write(
+    handler: BotHandler,
+    operation: ProfileEditOperation,
+    text: str,
+    message_part: str,
+) -> None:
+    """Duplicate, missing, and malformed family edits are controlled."""
+    state = _profile_input_state(handler, ProfileEditCategory.FAMILY, operation)
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = make_profile()
+
+    handler.handle_conversational(_profile_text(text))
+
+    handler.repo.save_profile.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
+    message = handler.telegram_api.send_message.call_args.args[1].lower()
+    assert message_part in message
+    handler.llm_client.chat_sync.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "member_names",
+    [
+        ["Nick", "NICK"],
+        ["Nick", " nick "],
+        [" NICK ", "nick"],
+    ],
+)
+def test_profile_onboarding_rejects_duplicate_member_identities(
+    handler: BotHandler, member_names: list[str]
+) -> None:
+    """Onboarding rejects names equal after stripping and case-folding."""
+    handler.repo.get_profile_draft.return_value = ProfileUpdateEntities()
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.UPDATE_PROFILE,
+        {
+            "name": "Household",
+            "people_count": 2,
+            "family_members": [
+                {"name": member_name, "calorie_target": 1800}
+                for member_name in member_names
+            ],
+            "dietary_constraints": [],
+            "dietary_preferences": [],
+            "goals": [],
+        },
+        None,
+    )
+
+    assert not result.success
+    assert result.message and "unique" in result.message.lower()
+    handler.repo.save_profile_draft.assert_not_called()
+    handler.repo.save_profile.assert_not_called()
+    handler.repo.delete_profile_draft.assert_not_called()
+
+
+def test_profile_replacement_rejects_duplicate_member_identities(
+    handler: BotHandler,
+) -> None:
+    """A family replacement cannot introduce duplicate member identities."""
+    existing = make_profile()
+    handler.repo.get_profile_draft.return_value = None
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.UPDATE_PROFILE,
+        {
+            "people_count": 2,
+            "family_members": [
+                {"name": "Nick", "calorie_target": 1800},
+                {"name": " nick ", "calorie_target": 2000},
+            ],
+        },
+        existing,
+    )
+
+    assert not result.success
+    assert result.message and "unique" in result.message.lower()
+    handler.repo.save_profile_draft.assert_not_called()
+    handler.repo.save_profile.assert_not_called()
+    handler.repo.delete_profile_draft.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("operation", "text"),
+    [
+        (ProfileEditOperation.REMOVE, "nick"),
+        (ProfileEditOperation.CHANGE_CALORIES, "NICK 2100"),
+    ],
+)
+def test_legacy_duplicate_member_amendments_are_controlled(
+    handler: BotHandler,
+    operation: ProfileEditOperation,
+    text: str,
+) -> None:
+    """Name edits do not choose arbitrarily in a legacy duplicate profile."""
+    profile = make_profile().model_copy(
+        update={
+            "family_members": [
+                FamilyMember(name="Nick", calorie_target=1800),
+                FamilyMember(name="NICK", calorie_target=2000),
+            ],
+            "people_count": 2,
+        }
+    )
+    state = _profile_input_state(handler, ProfileEditCategory.FAMILY, operation)
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = profile
+
+    handler.handle_conversational(_profile_text(text))
+
+    message = handler.telegram_api.send_message.call_args.args[1].lower()
+    assert "ambiguous" in message
+    handler.repo.save_profile.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
+
+
+def test_unique_member_match_is_case_insensitive_and_preserves_display_name(
+    handler: BotHandler,
+) -> None:
+    """A unique match ignores case while retaining the stored spelling."""
+    profile = UserProfile(
+        name="Household",
+        people_count=1,
+        family_members=[FamilyMember(name="Nick", calorie_target=1800)],
+    )
+
+    updated, message = handler._apply_profile_amendment(
+        profile,
+        ProfileEditCategory.FAMILY,
+        ProfileEditOperation.CHANGE_CALORIES,
+        " nIcK 2100 ",
+    )
+
+    assert updated is not None
+    assert updated.family_members[0].name == "Nick"
+    assert updated.family_members[0].calorie_target == 2100
+    assert "Nick" in message
+
+
+def test_family_addition_preserves_display_spelling(
+    handler: BotHandler,
+) -> None:
+    """A new member keeps the display spelling supplied by the user."""
+    profile = make_profile()
+
+    updated, _ = handler._apply_profile_amendment(
+        profile,
+        ProfileEditCategory.FAMILY,
+        ProfileEditOperation.ADD,
+        "  nIcKy 1600 ",
+    )
+
+    assert updated is not None
+    assert updated.family_members[-1].name == "nIcKy"
+
+
+@pytest.mark.parametrize(
+    ("category", "text"),
+    [
+        (ProfileEditCategory.DIETARY_CONSTRAINTS, "dairy"),
+        (ProfileEditCategory.DIETARY_PREFERENCES, "Mediterranean"),
+        (ProfileEditCategory.GOALS, "eat better"),
+    ],
+)
+def test_unrelated_amendment_is_allowed_on_legacy_duplicate_profile(
+    handler: BotHandler,
+    category: ProfileEditCategory,
+    text: str,
+) -> None:
+    """Legacy duplicate names do not block unrelated profile amendments."""
+    profile = make_profile().model_copy(
+        update={
+            "family_members": [
+                FamilyMember(name="Nick", calorie_target=1800),
+                FamilyMember(name="NICK", calorie_target=2000),
+            ],
+            "people_count": 2,
+        }
+    )
+    state = _profile_input_state(
+        handler,
+        category,
+        ProfileEditOperation.ADD,
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = profile
+    handler.repo.save_profile_and_transition_state.return_value = True
+
+    handler.handle_conversational(_profile_text(text))
+
+    saved = handler.repo.save_profile_and_transition_state.call_args.args[1]
+    assert getattr(saved, category.value)[-1] == text
+    handler.repo.save_profile_and_transition_state.assert_called_once()
+    handler.repo.save_profile.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("category", "operation", "text"),
+    [
+        (
+            ProfileEditCategory.DIETARY_CONSTRAINTS,
+            ProfileEditOperation.ADD,
+            "none",
+        ),
+        (
+            ProfileEditCategory.DIETARY_PREFERENCES,
+            ProfileEditOperation.REMOVE,
+            "missing",
+        ),
+        (ProfileEditCategory.GOALS, ProfileEditOperation.ADD, "   "),
+    ],
+)
+def test_item_profile_amendment_errors_do_not_write(
+    handler: BotHandler,
+    category: ProfileEditCategory,
+    operation: ProfileEditOperation,
+    text: str,
+) -> None:
+    """Item grammar rejects duplicate, missing, and empty values safely."""
+    state = _profile_input_state(handler, category, operation)
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = make_profile()
+
+    handler.handle_conversational(_profile_text(text))
+
+    handler.repo.save_profile.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
+    assert handler.telegram_api.send_message.call_count == 1
+    handler.llm_client.chat_sync.assert_not_called()
+
+
+def test_profile_amendment_rejects_malformed_calories_and_last_member(
+    handler: BotHandler,
+) -> None:
+    """Malformed calorie input and removing the final member are safe."""
+    state = _profile_input_state(
+        handler,
+        ProfileEditCategory.FAMILY,
+        ProfileEditOperation.CHANGE_CALORIES,
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = make_profile()
+
+    handler.handle_conversational(_profile_text("Sam many"))
+
+    message = handler.telegram_api.send_message.call_args.args[1].lower()
+    assert "format" in message
+    handler.repo.save_profile.assert_not_called()
+
+    handler.telegram_api.send_message.reset_mock()
+    one_member = make_profile().model_copy(
+        update={
+            "family_members": [make_profile().family_members[0]],
+            "people_count": 1,
+        }
+    )
+    handler.repo.get_profile.return_value = one_member
+    remove_state = _profile_input_state(
+        handler, ProfileEditCategory.FAMILY, ProfileEditOperation.REMOVE
+    )
+    handler.repo.get_conversation_state.return_value = remove_state
+
+    handler.handle_conversational(_profile_text("Alex"))
+
+    message = handler.telegram_api.send_message.call_args.args[1].lower()
+    assert "at least one" in message
+    handler.repo.save_profile.assert_not_called()
+
+
+def test_profile_amendment_does_not_use_profile_revision_cas(
+    handler: BotHandler,
+) -> None:
+    """Profile amendments use the atomic transaction path."""
+    state = _profile_input_state(
+        handler,
+        ProfileEditCategory.DIETARY_CONSTRAINTS,
+        ProfileEditOperation.ADD,
+    )
+    profile = make_profile()
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = profile
+
+    handler.handle_conversational(_profile_text("dairy"))
+
+    handler.repo.save_profile_and_transition_state.assert_called_once()
+    handler.repo.save_profile.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
+
+
+def test_profile_amendment_requests_consistent_profile_read(
+    handler: BotHandler,
+) -> None:
+    """Profile amendments derive replacements from a consistent read."""
+    state = _profile_input_state(
+        handler,
+        ProfileEditCategory.DIETARY_CONSTRAINTS,
+        ProfileEditOperation.ADD,
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.save_profile_and_transition_state.return_value = True
+
+    handler.handle_conversational(_profile_text("dairy"))
+
+    handler.repo.get_profile.assert_called_once_with(
+        "user", consistent_read=True
+    )
+
+
+def test_profile_amendment_conflict_does_not_claim_profile_changed(
+    handler: BotHandler,
+) -> None:
+    """A stale edit sends no success message or category rendering."""
+    state = _profile_input_state(
+        handler,
+        ProfileEditCategory.DIETARY_CONSTRAINTS,
+        ProfileEditOperation.ADD,
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.save_profile_and_transition_state.return_value = False
+
+    handler.handle_conversational(_profile_text("dairy"))
+
+    message = handler.telegram_api.send_message.call_args.args[1].lower()
+    assert "stale" in message
+    assert "changed" not in message
+    handler.telegram_api.send_profile_category.assert_not_called()
+    handler.repo.save_profile.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
+
+
+def test_profile_amendment_unexpected_save_failure_is_not_partial_success(
+    handler: BotHandler,
+) -> None:
+    """An unexpected transaction error uses a generic save failure message."""
+    state = _profile_input_state(
+        handler,
+        ProfileEditCategory.DIETARY_CONSTRAINTS,
+        ProfileEditOperation.ADD,
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.save_profile_and_transition_state.side_effect = RuntimeError(
+        "dynamodb unavailable"
+    )
+
+    handler.handle_conversational(_profile_text("dairy"))
+
+    message = handler.telegram_api.send_message.call_args.args[1].lower()
+    assert "couldn't save" in message
+    assert "changed" not in message
+    handler.telegram_api.send_profile_category.assert_not_called()
+    handler.repo.save_profile.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
+
+
+def test_sequential_profile_amendments_preserve_prior_changes(
+    real_profile_handler: tuple[BotHandler, DynamoRepository],
+    mocker: Any,
+) -> None:
+    """A strongly consistent amendment read preserves the prior amendment."""
+    handler, repo = real_profile_handler
+    initial_profile = make_profile()
+    repo.save_profile("user", initial_profile)
+    initial_item = deepcopy(
+        repo.table.get_item(Key={"PK": "USER#user", "SK": "PROFILE"})["Item"]
+    )
+    transaction = mocker.spy(repo.table.meta.client, "transact_write_items")
+    amendment_transaction = mocker.spy(
+        repo, "save_profile_and_transition_state"
+    )
+
+    handler.handle_command(_command("profile"))
+    handler.handle_callback(
+        _profile_callback("profile:category:dietary_constraints")
+    )
+    handler.handle_callback(
+        _profile_callback("profile:operation:dietary_constraints:add")
+    )
+    handler.handle_conversational(_profile_text("peanuts"))
+
+    after_amendment_a = repo.get_profile("user", consistent_read=True)
+    assert after_amendment_a is not None
+    assert after_amendment_a.dietary_constraints == ["peanuts"]
+    state_after_amendment_a = repo.get_conversation_state(
+        "user", consistent_read=True
+    )
+    assert state_after_amendment_a is not None
+    assert state_after_amendment_a.step is ConversationWorkflowStep.PROFILE_MENU
+
+    handler.handle_callback(_profile_callback("profile:category:goals"))
+    handler.handle_callback(_profile_callback("profile:operation:goals:add"))
+
+    profile_reads: list[dict[str, Any]] = []
+    original_get_item = repo.table.get_item
+
+    def get_item(**kwargs: Any) -> dict[str, Any]:
+        if kwargs.get("Key") == {"PK": "USER#user", "SK": "PROFILE"}:
+            profile_reads.append(kwargs)
+            if kwargs.get("ConsistentRead") is not True:
+                return {"Item": deepcopy(initial_item)}
+        return original_get_item(**kwargs)
+
+    mocker.patch.object(repo.table, "get_item", side_effect=get_item)
+
+    handler.handle_conversational(_profile_text("eat more vegetables"))
+
+    final_profile = repo.get_profile("user", consistent_read=True)
+    assert final_profile is not None
+    assert final_profile.name == initial_profile.name
+    assert final_profile.people_count == initial_profile.people_count
+    assert final_profile.family_members == initial_profile.family_members
+    assert final_profile.dietary_preferences == (
+        initial_profile.dietary_preferences
+    )
+    assert final_profile.dietary_constraints == ["peanuts"]
+    assert final_profile.goals == ["eat well", "eat more vegetables"]
+    final_state = repo.get_conversation_state("user", consistent_read=True)
+    assert final_state is not None
+    assert final_state.step is ConversationWorkflowStep.PROFILE_MENU
+    assert final_state.profile_category is None
+    assert final_state.profile_operation is None
+    assert any(read.get("ConsistentRead") is True for read in profile_reads)
+    assert amendment_transaction.call_count == 2
+    profile_puts = [
+        item
+        for call in transaction.call_args_list
+        for item in call.kwargs["TransactItems"]
+        if item.get("Put", {}).get("Item", {}).get("SK") == "PROFILE"
+    ]
+    assert len(profile_puts) == 2
+    handler.llm_client.chat_sync.assert_not_called()
+
+
+def test_profile_amendment_full_repository_flow_is_deterministic(
+    real_profile_handler: tuple[BotHandler, DynamoRepository],
+    mocker: Any,
+) -> None:
+    """The complete profile flow writes once and never invokes the LLM."""
+    handler, repo = real_profile_handler
+    profile = make_profile()
+    repo.save_profile("user", profile)
+    transaction = mocker.spy(repo.table.meta.client, "transact_write_items")
+
+    handler.handle_command(_command("profile"))
+    assert repo.get_conversation_state("user").step is (
+        ConversationWorkflowStep.PROFILE_MENU
+    )
+    handler.handle_callback(
+        _profile_callback("profile:category:dietary_constraints")
+    )
+    handler.handle_callback(
+        _profile_callback("profile:operation:dietary_constraints:add")
+    )
+    handler.handle_conversational(_profile_text("peanuts"))
+
+    updated = repo.get_profile("user")
+    assert updated is not None
+    assert updated.dietary_constraints == ["peanuts"]
+    menu_state = repo.get_conversation_state("user")
+    assert menu_state is not None
+    assert menu_state.step is ConversationWorkflowStep.PROFILE_MENU
+    assert menu_state.profile_category is None
+    assert menu_state.profile_operation is None
+    assert (
+        len(
+            [
+                item
+                for call in transaction.call_args_list
+                for item in call.kwargs["TransactItems"]
+                if item.get("Put", {}).get("Item", {}).get("SK") == "PROFILE"
+            ]
+        )
+        == 1
+    )
+    handler.llm_client.chat_sync.assert_not_called()
+
+    handler.handle_callback(_profile_callback("profile:category:goals"))
+    handler.handle_callback(_profile_callback("profile:done"))
+    assert repo.get_conversation_state("user") is None
 
 
 def test_plan_command_collects_preference_before_generation(
@@ -1143,9 +2192,8 @@ def test_profile_onboarding_accumulates_then_saves(handler: BotHandler) -> None:
             {"name": "Alex", "calorie_target": 2000},
             {"name": "Sam", "calorie_target": 1800},
         ],
-        "allergies": [],
+        "dietary_constraints": [],
         "dietary_preferences": ["balanced"],
-        "restrictions": [],
         "goals": ["health"],
     }
     completed = handler._apply_intent_metadata(
@@ -1176,7 +2224,7 @@ def test_profile_onboarding_two_turn_no_value_answers_complete_profile(
                 {"name": "Val", "calorie_target": 1800},
                 {"name": "Mike", "calorie_target": 2000},
             ],
-            "allergies": "none",
+            "dietary_constraints": "none",
             "dietary_preferences": "no preferences",
             "goals": ["eat well"],
         },
@@ -1185,7 +2233,8 @@ def test_profile_onboarding_two_turn_no_value_answers_complete_profile(
 
     assert first_turn.success
     assert first_turn.message and "family name" in first_turn.message
-    assert "restrictions" in first_turn.message
+    assert "dietary constraints" not in first_turn.message
+    assert "restrictions" not in first_turn.message
     handler.repo.delete_profile_draft.assert_not_called()
 
     saved_draft = handler.repo.save_profile_draft.call_args.args[1]
@@ -1194,7 +2243,7 @@ def test_profile_onboarding_two_turn_no_value_answers_complete_profile(
         "user",
         1,
         ConversationIntent.UPDATE_PROFILE,
-        {"name": "Nick", "restrictions": "none"},
+        {"name": "Nick", "dietary_constraints": "none"},
         None,
     )
 
@@ -1209,9 +2258,8 @@ def test_profile_onboarding_two_turn_no_value_answers_complete_profile(
     assert [
         member.calorie_target for member in saved_profile.family_members
     ] == [2200, 1800, 2000]
-    assert saved_profile.allergies == []
+    assert saved_profile.dietary_constraints == []
     assert saved_profile.dietary_preferences == []
-    assert saved_profile.restrictions == []
     assert saved_profile.goals == ["eat well"]
     handler.repo.delete_profile_draft.assert_called_once_with("user")
 
@@ -1222,7 +2270,7 @@ def test_profile_onboarding_rejects_ambiguous_scalar_without_draft_mutation(
     draft = ProfileUpdateEntities(
         name="Nick",
         people_count=3,
-        restrictions=[],
+        dietary_constraints=[],
     )
     handler.repo.get_profile_draft.return_value = draft
 
@@ -1230,7 +2278,7 @@ def test_profile_onboarding_rejects_ambiguous_scalar_without_draft_mutation(
         "user",
         1,
         ConversationIntent.UPDATE_PROFILE,
-        {"restrictions": "no peanuts"},
+        {"dietary_constraints": "no peanuts"},
         None,
     )
 
@@ -1276,9 +2324,8 @@ def test_incomplete_complete_looking_profile_is_saved_as_draft(
             "name": "Alex",
             "people_count": 2,
             "family_members": [{"name": "Alex", "calorie_target": 2000}],
-            "allergies": [],
+            "dietary_constraints": [],
             "dietary_preferences": [],
-            "restrictions": [],
             "goals": [],
         },
         None,
@@ -1327,7 +2374,7 @@ def test_existing_profile_same_size_update_preserves_members(
         "user",
         1,
         ConversationIntent.UPDATE_PROFILE,
-        {"people_count": 2, "allergies": ["peanuts"]},
+        {"people_count": 2, "dietary_constraints": ["peanuts"]},
         existing,
     )
 
@@ -1337,7 +2384,34 @@ def test_existing_profile_same_size_update_preserves_members(
         "Alex",
         "Sam",
     ]
-    assert saved.allergies == ["peanuts"]
+    assert saved.dietary_constraints == ["peanuts"]
+
+
+def test_profile_onboarding_legacy_constraints_are_saved_canonically(
+    handler: BotHandler,
+) -> None:
+    handler.repo.get_profile_draft.return_value = ProfileUpdateEntities()
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.UPDATE_PROFILE,
+        {
+            "name": "Alex",
+            "people_count": 1,
+            "family_members": [{"name": "Alex", "calorie_target": 2000}],
+            "allergies": ["Peanuts", "no allergies"],
+            "dietary_preferences": [],
+            "restrictions": ["Vegan", "no restrictions"],
+            "goals": [],
+        },
+        None,
+    )
+
+    assert result.success
+    saved = handler.repo.save_profile.call_args.args[1]
+    assert saved.dietary_constraints == ["Peanuts", "Vegan"]
+    assert "allergies" not in saved.model_dump()
+    assert "restrictions" not in saved.model_dump()
 
 
 def test_confirm_and_edit_refresh_exact_week(handler: BotHandler) -> None:

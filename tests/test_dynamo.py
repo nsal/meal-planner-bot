@@ -24,7 +24,10 @@ from meal_planner.models.schemas import (
     MealLogEntry,
     MealOutcome,
     PlanStatus,
+    ProfileEditCategory,
+    ProfileEditOperation,
     ProfileUpdateEntities,
+    UserProfile,
 )
 from tests.factories import make_plan, make_profile
 
@@ -66,6 +69,442 @@ def test_profile_and_onboarding_draft_round_trip(
     assert repo.get_profile("user") == profile
     repo.delete_profile_draft("user")
     assert repo.get_profile_draft("user") is None
+
+
+def test_profile_read_consistency_is_opt_in(mocker: Any) -> None:
+    """Profile reads add ConsistentRead only when explicitly requested."""
+    table = mocker.MagicMock()
+    profile = make_profile()
+    table.get_item.return_value = {
+        "Item": {
+            "PK": "USER#user",
+            "SK": "PROFILE",
+            **profile.model_dump(mode="json"),
+        }
+    }
+    repo = DynamoRepository(table)
+
+    assert repo.get_profile("user") == profile
+    assert table.get_item.call_args.kwargs == {
+        "Key": {"PK": "USER#user", "SK": "PROFILE"}
+    }
+
+    assert repo.get_profile("user", consistent_read=True) == profile
+    assert table.get_item.call_args.kwargs == {
+        "Key": {"PK": "USER#user", "SK": "PROFILE"},
+        "ConsistentRead": True,
+    }
+
+
+def test_profile_read_consistency_selects_current_table_response(
+    mocker: Any,
+) -> None:
+    """A simulated strong read returns current data instead of stale data."""
+    table = mocker.MagicMock()
+    stale_profile = make_profile().model_copy(update={"name": "Stale"})
+    current_profile = make_profile().model_copy(update={"name": "Current"})
+
+    def get_item(**kwargs: Any) -> dict[str, Any]:
+        profile = (
+            current_profile
+            if kwargs.get("ConsistentRead") is True
+            else stale_profile
+        )
+        return {
+            "Item": {
+                "PK": "USER#user",
+                "SK": "PROFILE",
+                **profile.model_dump(mode="json"),
+            }
+        }
+
+    table.get_item.side_effect = get_item
+    repo = DynamoRepository(table)
+
+    assert repo.get_profile("user") == stale_profile
+    assert repo.get_profile("user", consistent_read=True) == current_profile
+
+
+def _profile_edit_state(
+    *,
+    revision: int = 3,
+    created_at: datetime | None = None,
+    operation: ProfileEditOperation = ProfileEditOperation.ADD,
+) -> ConversationState:
+    """Build a persisted state that owns one profile text amendment."""
+    current = created_at or datetime.now(timezone.utc)
+    return ConversationState(
+        workflow_kind=ConversationWorkflowKind.PROFILE_EDIT,
+        step=ConversationWorkflowStep.AWAITING_PROFILE_INPUT,
+        profile_category=ProfileEditCategory.DIETARY_CONSTRAINTS,
+        profile_operation=operation,
+        revision=revision,
+        created_at=current,
+        updated_at=current,
+        expires_at=int((current + timedelta(hours=24)).timestamp()),
+    )
+
+
+def _profile_menu_state(state: ConversationState) -> ConversationState:
+    """Build the next profile menu state for an observed edit state."""
+    return state.model_copy(
+        update={
+            "step": ConversationWorkflowStep.PROFILE_MENU,
+            "profile_category": None,
+            "profile_operation": None,
+            "revision": state.revision + 1,
+            "updated_at": state.updated_at + timedelta(seconds=1),
+        }
+    )
+
+
+def test_profile_amendment_transaction_commits_matching_profile_and_state(
+    repo: DynamoRepository,
+) -> None:
+    """A matching profile edit commits both documents atomically."""
+    original = make_profile()
+    updated = original.model_copy(update={"dietary_constraints": ["peanuts"]})
+    observed = _profile_edit_state()
+    next_state = _profile_menu_state(observed)
+    repo.save_profile("user", original)
+    assert repo.save_conversation_state("user", observed)
+
+    assert repo.save_profile_and_transition_state(
+        "user", updated, next_state, observed
+    )
+
+    assert repo.get_profile("user") == updated
+    assert repo.get_conversation_state("user") == next_state
+
+
+@pytest.mark.parametrize("conflict", ["deleted", "changed_operation"])
+def test_profile_amendment_transaction_conflicts_leave_documents_unchanged(
+    repo: DynamoRepository,
+    conflict: str,
+) -> None:
+    """Cancellation and changed operation cannot commit a profile write."""
+    original = make_profile()
+    updated = original.model_copy(update={"dietary_constraints": ["peanuts"]})
+    observed = _profile_edit_state()
+    repo.save_profile("user", original)
+    assert repo.save_conversation_state("user", observed)
+    if conflict == "deleted":
+        assert repo.delete_conversation_state("user")
+        replacement = None
+    else:
+        replacement = observed.model_copy(
+            update={"profile_operation": ProfileEditOperation.REMOVE}
+        )
+        repo.table.put_item(
+            Item={
+                "PK": "USER#user",
+                "SK": "CONVERSATION_STATE",
+                **replacement.model_dump(mode="json"),
+            }
+        )
+
+    assert not repo.save_profile_and_transition_state(
+        "user", updated, _profile_menu_state(observed), observed
+    )
+
+    assert repo.get_profile("user") == original
+    assert repo.get_conversation_state("user") == replacement
+
+
+def test_profile_amendment_transaction_replacement_reuses_revision_safely(
+    repo: DynamoRepository,
+) -> None:
+    """A replacement workflow with the same revision cannot authorize input."""
+    original = make_profile()
+    updated = original.model_copy(update={"goals": ["eat well", "save time"]})
+    observed = _profile_edit_state()
+    replacement = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+        step=ConversationWorkflowStep.AWAITING_PREFERENCE,
+        request_id="replacement",
+        revision=observed.revision,
+        created_at=observed.created_at + timedelta(seconds=1),
+        updated_at=observed.updated_at + timedelta(seconds=1),
+        expires_at=observed.expires_at,
+    )
+    repo.save_profile("user", original)
+    assert repo.save_conversation_state("user", observed)
+    repo.table.put_item(
+        Item={
+            "PK": "USER#user",
+            "SK": "CONVERSATION_STATE",
+            **replacement.model_dump(mode="json"),
+        }
+    )
+
+    assert not repo.save_profile_and_transition_state(
+        "user", updated, _profile_menu_state(observed), observed
+    )
+
+    assert repo.get_profile("user") == original
+    assert repo.get_conversation_state("user") == replacement
+
+
+@pytest.mark.parametrize("replacement_kind", ["plan", "meal", "profile"])
+def test_profile_amendment_transaction_rejects_replacement_workflows(
+    repo: DynamoRepository,
+    replacement_kind: str,
+) -> None:
+    """Commands replacing an edit cannot be overwritten by stale input."""
+    original = make_profile()
+    updated = original.model_copy(update={"goals": ["eat well", "save time"]})
+    observed = _profile_edit_state()
+    replacement_time = observed.created_at + timedelta(seconds=1)
+    if replacement_kind == "plan":
+        replacement = ConversationState(
+            workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+            step=ConversationWorkflowStep.AWAITING_PREFERENCE,
+            request_id="replacement-plan",
+            revision=observed.revision,
+            created_at=replacement_time,
+            updated_at=replacement_time,
+            expires_at=observed.expires_at,
+        )
+    elif replacement_kind == "meal":
+        replacement = ConversationState(
+            workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+            step=ConversationWorkflowStep.AWAITING_DATE,
+            meal_draft=MealLogDraft(),
+            revision=observed.revision,
+            created_at=replacement_time,
+            updated_at=replacement_time,
+            expires_at=observed.expires_at,
+        )
+    else:
+        replacement = _profile_edit_state(
+            revision=observed.revision, created_at=replacement_time
+        )
+    repo.save_profile("user", original)
+    assert repo.save_conversation_state("user", observed)
+    assert repo.save_conversation_state(
+        "user", replacement, expected_revision=observed.revision
+    )
+
+    assert not repo.save_profile_and_transition_state(
+        "user", updated, _profile_menu_state(observed), observed
+    )
+
+    assert repo.get_profile("user") == original
+    assert repo.get_conversation_state("user") == replacement
+
+
+def test_profile_amendment_transaction_duplicate_input_is_idempotently_rejected(
+    repo: DynamoRepository,
+) -> None:
+    """A second submission using the consumed state changes nothing."""
+    original = make_profile()
+    first_update = original.model_copy(
+        update={"dietary_constraints": ["peanuts"]}
+    )
+    duplicate_update = original.model_copy(
+        update={"dietary_constraints": ["shellfish"]}
+    )
+    observed = _profile_edit_state()
+    repo.save_profile("user", original)
+    assert repo.save_conversation_state("user", observed)
+    next_state = _profile_menu_state(observed)
+    assert repo.save_profile_and_transition_state(
+        "user", first_update, next_state, observed
+    )
+
+    assert not repo.save_profile_and_transition_state(
+        "user", duplicate_update, next_state, observed
+    )
+
+    assert repo.get_profile("user") == first_update
+    assert repo.get_conversation_state("user") == next_state
+
+
+def test_profile_amendment_transaction_reraises_unrelated_failure(
+    repo: DynamoRepository,
+    mocker: Any,
+) -> None:
+    """Unexpected DynamoDB failures remain visible to the handler."""
+    observed = _profile_edit_state()
+    error = ClientError(
+        {
+            "Error": {
+                "Code": "TransactionCanceledException",
+                "Message": "transaction conflict",
+            },
+            "CancellationReasons": [
+                {"Code": "None"},
+                {"Code": "TransactionConflict"},
+            ],
+        },
+        "TransactWriteItems",
+    )
+    mocker.patch.object(
+        repo.table.meta.client,
+        "transact_write_items",
+        side_effect=error,
+    )
+
+    with pytest.raises(ClientError) as raised:
+        repo.save_profile_and_transition_state(
+            "user",
+            make_profile(),
+            _profile_menu_state(observed),
+            observed,
+        )
+
+    assert raised.value is error
+
+
+def test_legacy_profile_draft_round_trip_preserves_unanswered_constraints(
+    repo: DynamoRepository,
+) -> None:
+    """Legacy drafts with null constraint fields remain unanswered."""
+    repo.table.put_item(
+        Item={
+            "PK": "USER#user",
+            "SK": "PROFILE_DRAFT",
+            "name": "Alex",
+            "people_count": 2,
+            "allergies": None,
+            "restrictions": None,
+        }
+    )
+
+    draft = repo.get_profile_draft("user")
+
+    assert draft is not None
+    assert draft.dietary_constraints is None
+    repo.save_profile_draft("user", draft)
+    saved_item = repo.table.get_item(
+        Key={"PK": "USER#user", "SK": "PROFILE_DRAFT"}
+    )["Item"]
+    assert saved_item["dietary_constraints"] is None
+    assert "allergies" not in saved_item
+    assert "restrictions" not in saved_item
+
+
+def test_legacy_profile_draft_round_trip_normalizes_explicit_empty(
+    repo: DynamoRepository,
+) -> None:
+    """Legacy no-value draft answers round-trip as an explicit empty list."""
+    repo.table.put_item(
+        Item={
+            "PK": "USER#user",
+            "SK": "PROFILE_DRAFT",
+            "name": "Alex",
+            "people_count": 2,
+            "allergies": "no allergies",
+            "restrictions": None,
+        }
+    )
+
+    draft = repo.get_profile_draft("user")
+
+    assert draft is not None
+    assert draft.dietary_constraints == []
+    repo.save_profile_draft("user", draft)
+    saved_item = repo.table.get_item(
+        Key={"PK": "USER#user", "SK": "PROFILE_DRAFT"}
+    )["Item"]
+    assert saved_item["dietary_constraints"] == []
+    assert "allergies" not in saved_item
+    assert "restrictions" not in saved_item
+
+
+def test_legacy_profile_resave_removes_aliases_and_keeps_constraints(
+    repo: DynamoRepository,
+) -> None:
+    """Canonical profile re-saves retain real legacy constraints only."""
+    repo.table.put_item(
+        Item={
+            "PK": "USER#user",
+            "SK": "PROFILE",
+            "name": "Alex",
+            "family_members": [],
+            "allergies": ["Peanuts", "no allergies"],
+            "restrictions": ["Vegan", "NO RESTRICTIONS", "peanuts"],
+            "dietary_preferences": [],
+            "goals": [],
+            "people_count": 1,
+        }
+    )
+
+    profile = repo.get_profile("user")
+    assert profile is not None
+    repo.save_profile("user", profile)
+
+    item = repo.table.get_item(Key={"PK": "USER#user", "SK": "PROFILE"})["Item"]
+    assert profile.dietary_constraints == ["Peanuts", "Vegan"]
+    assert item["dietary_constraints"] == ["Peanuts", "Vegan"]
+    assert "allergies" not in item
+    assert "restrictions" not in item
+
+
+def test_save_profile_creates_canonical_revisionless_item(
+    repo: DynamoRepository,
+) -> None:
+    """Onboarding saves create a canonical profile without a revision."""
+    profile = UserProfile(
+        name="Alex",
+        dietary_constraints=["peanuts"],
+    )
+
+    repo.save_profile("user", profile)
+
+    item = repo.table.get_item(Key={"PK": "USER#user", "SK": "PROFILE"})["Item"]
+    assert "revision" not in item
+    assert item["dietary_constraints"] == ["peanuts"]
+    assert "allergies" not in item
+    assert "restrictions" not in item
+
+
+def test_save_profile_replaces_existing_document_without_revision(
+    repo: DynamoRepository,
+) -> None:
+    """A normal profile save directly replaces the existing document."""
+    initial = UserProfile(name="Alex", dietary_constraints=["peanuts"])
+    updated = UserProfile(name="Alex", dietary_constraints=["dairy-free"])
+    repo.save_profile("user", initial)
+
+    repo.save_profile("user", updated)
+
+    saved = repo.get_profile("user")
+    assert saved is not None
+    assert saved.dietary_constraints == ["dairy-free"]
+
+
+def test_save_profile_omits_legacy_revision_on_first_write(
+    repo: DynamoRepository,
+) -> None:
+    """A legacy revision is removed by the first canonical profile save."""
+    repo.table.put_item(
+        Item={
+            "PK": "USER#user",
+            "SK": "PROFILE",
+            "name": "Alex",
+            "family_members": [],
+            "allergies": ["Peanuts"],
+            "restrictions": ["vegetarian"],
+            "dietary_preferences": [],
+            "goals": [],
+            "people_count": 1,
+            "revision": 7,
+        }
+    )
+    legacy_read = repo.get_profile("user")
+    assert legacy_read is not None
+    canonical = legacy_read.model_copy(
+        update={"dietary_constraints": ["Peanuts", "vegan"]}
+    )
+
+    repo.save_profile("user", canonical)
+
+    item = repo.table.get_item(Key={"PK": "USER#user", "SK": "PROFILE"})["Item"]
+    assert "revision" not in item
+    assert item["dietary_constraints"] == ["Peanuts", "vegan"]
+    assert "allergies" not in item
+    assert "restrictions" not in item
 
 
 def test_conversation_state_round_trip_and_revision_guard(

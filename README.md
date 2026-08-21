@@ -29,7 +29,17 @@ the locked `uv` environment.
 - `/checkin` shows buttons for cooked, skipped, or swapped outcomes on today's
   confirmed plan. `/submit_meals` does not require an active plan.
 - `/cancel` clears an unfinished meal or plan workflow. Starting `/submit_meals`
-  or `/plan` replaces an older unfinished workflow.
+  or `/plan` replaces an older unfinished workflow. `/profile` also replaces
+  an older unfinished workflow when it opens the profile editor.
+- `/profile` lets you view and amend the saved household profile. Tap `Amend profile`, choose
+  `Family`, `Dietary constraints`, `Dietary preferences`, or `Goals`, then
+  choose an operation. Each operation accepts one guided message: use
+  `John 1500` to add a family member or change a member's calories, the exact
+  member name to remove someone, or one item such as `dairy` or `eat more
+  vegetables` to add or remove a constraint, preference, or goal. After a
+  successful change the category menu returns so you can make another
+  amendment. Use `Back` to navigate, `Done` to finish and save the session,
+  `Close` to leave it, or `/cancel` to clear the active edit.
 - `/plan` asks for a request-specific preference before starting asynchronous
   generation. `no preference` and `anything` remove the extra constraint; the
   saved family profile is never changed. A failed request retains the
@@ -365,7 +375,7 @@ The Telegram command menu and `/help` show the same command reference:
 
 - `/start` — Start onboarding or view what to do next.
 - `/help` — Show the available commands.
-- `/profile` — View the household profile.
+- `/profile` — View and amend the household profile.
 - `/plan` — Create or retry a weekly meal plan.
 - `/grocery` — View the active grocery list.
 - `/today` — View today's planned meals.
@@ -374,10 +384,15 @@ The Telegram command menu and `/help` show the same command reference:
 - `/cancel` — Cancel an unfinished workflow.
 
 - `/start` begins onboarding. Supply the family name separately from the
-  household size, every household member's name and calorie target, allergies,
-  preferences, restrictions, and goals. Known onboarding fields carry across
-  conversational turns, so provide only the fields the bot still requests.
-- `/profile` shows the persisted family name and individual member details.
+  household size, every household member's name and calorie target, dietary
+  constraints, dietary preferences, and
+  goals. Known onboarding fields carry across conversational turns, so provide
+  only the fields the bot still requests.
+- `/profile` shows the persisted family name and individual member details,
+  with button-led amendment navigation for family members, dietary
+  constraints, dietary preferences, and goals. Family add and calorie changes
+  use one message such as `John 1500`; list changes use one item such as
+  `dairy` or `eat more vegetables`.
 - Natural-language no-value answers such as `none`, `nothing`, `no allergies`,
   and `no restrictions` are stored as empty categories. They count as answers,
   while omitted fields remain missing until supplied.

@@ -25,9 +25,8 @@ def make_profile() -> UserProfile:
             FamilyMember(name="Alex", calorie_target=2000),
             FamilyMember(name="Sam", calorie_target=1800),
         ],
-        allergies=[],
+        dietary_constraints=[],
         dietary_preferences=["balanced"],
-        restrictions=[],
         goals=["eat well"],
     )
 
