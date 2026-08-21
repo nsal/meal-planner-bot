@@ -64,9 +64,8 @@ def test_build_conversational_prompt_with_context() -> None:
             member,
             FamilyMember(name="John", calorie_target=2100),
         ],
-        allergies=["peanuts"],
+        dietary_constraints=["peanuts", "dairy-free"],
         dietary_preferences=["low-carb"],
-        restrictions=["dairy-free"],
         goals=["weight-loss"],
         people_count=2,
     )
@@ -88,7 +87,9 @@ def test_build_conversational_prompt_with_context() -> None:
     )
     assert "John" in prompt
     assert "Alice (1800 kcal)" in prompt
-    assert "peanuts" in prompt
+    assert "Dietary constraints: peanuts, dairy-free" in prompt
+    assert "Allergies:" not in prompt
+    assert "Restrictions:" not in prompt
     assert "low-carb" in prompt
     assert "Status: confirmed" in prompt
     assert "Day 1: lunch: Salad" in prompt
@@ -105,7 +106,9 @@ def test_build_conversational_prompt_with_partial_profile_draft() -> None:
     assert "Family Name: Alex" in prompt
     assert "People Count: 2" in prompt
     assert "Family Members: Missing" in prompt
-    assert "Allergies: Missing" in prompt
+    assert "Dietary Constraints: Missing" in prompt
+    assert "Allergies:" not in prompt
+    assert "Restrictions:" not in prompt
     assert "Family Members: None specified" not in prompt
 
 
@@ -126,8 +129,8 @@ def test_conversational_prompt_distinguishes_family_and_member_names() -> None:
 
 
 def test_prompt_separates_saved_and_pending_values() -> None:
-    profile = UserProfile(name="Alex", allergies=["shellfish"])
-    draft = ProfileUpdateEntities(allergies=["peanuts"])
+    profile = UserProfile(name="Alex", dietary_constraints=["shellfish"])
+    draft = ProfileUpdateEntities(dietary_constraints=["peanuts"])
 
     prompt = build_conversational_prompt(
         profile=profile,
@@ -136,8 +139,10 @@ def test_prompt_separates_saved_and_pending_values() -> None:
 
     saved_start = prompt.index("--- Saved Profile ---")
     pending_start = prompt.index("--- Pending Profile Updates ---")
-    assert "Allergies: shellfish" in prompt[saved_start:pending_start]
-    assert "Allergies: peanuts" in prompt[pending_start:]
+    assert "Dietary constraints: shellfish" in prompt[saved_start:pending_start]
+    assert "Dietary Constraints: peanuts" in prompt[pending_start:]
+    assert "Allergies:" not in prompt
+    assert "Restrictions:" not in prompt
 
 
 def test_build_conversational_prompt_renders_pending_family_members() -> None:
@@ -194,7 +199,7 @@ def test_build_plan_prompt_with_context() -> None:
             FamilyMember(name="Alice", calorie_target=1800),
             FamilyMember(name="Charlie", calorie_target=2000),
         ],
-        allergies=["shellfish"],
+        dietary_constraints=["shellfish"],
         dietary_preferences=["keto"],
         people_count=3,
     )
@@ -248,19 +253,19 @@ def test_build_plan_prompt_with_context() -> None:
 def test_plan_prompt_renders_preference_and_constraints() -> None:
     """A request preference is visible without mutating profile context."""
     prompt = build_plan_prompt(
-        profile=UserProfile(name="Alice", allergies=["peanuts"]),
+        profile=UserProfile(name="Alice", dietary_constraints=["peanuts"]),
         preference="Indian and pasta",
     )
     assert "REQUEST-SPECIFIC PREFERENCE" in prompt
     assert "Indian and pasta" in prompt
-    assert "Allergies: peanuts" in prompt
+    assert "Dietary constraints: peanuts" in prompt
     assert "always take precedence" in prompt
 
 
 def test_plan_prompt_renders_raw_preference_and_every_exact_rule() -> None:
     """The planner sees raw wording and the application interpretation."""
     prompt = build_plan_prompt(
-        profile=UserProfile(name="Alice", allergies=["peanuts"]),
+        profile=UserProfile(name="Alice", dietary_constraints=["peanuts"]),
         preference="crepes or pancakes once at breakfast, eggs three times",
         requirements=[
             PreferenceRequirement(
@@ -289,7 +294,7 @@ def test_plan_prompt_renders_raw_preference_and_every_exact_rule() -> None:
     assert "foods_any_of: eggs" in prompt
     assert "meal_type: any meal" in prompt
     assert "exact_count: 3" in prompt
-    assert "Allergies: peanuts" in prompt
+    assert "Dietary constraints: peanuts" in prompt
     assert "always take precedence" in prompt
 
 
@@ -382,7 +387,7 @@ def test_build_plan_revision_prompt_contains_trusted_full_context() -> None:
     profile = UserProfile(
         name="Alex",
         family_members=[FamilyMember(name="Alex", calorie_target=2000)],
-        allergies=["peanuts"],
+        dietary_constraints=["peanuts"],
     )
     plan = WeeklyPlan(
         week_start="2026-08-10",
@@ -406,7 +411,9 @@ def test_build_plan_revision_prompt_contains_trusted_full_context() -> None:
         "day, and avoid cauliflower"
     )
     prompt = build_plan_revision_prompt(profile, plan, amendment)
-    assert "Allergies: peanuts" in prompt
+    assert "Dietary constraints: peanuts" in prompt
+    assert "Allergies:" not in prompt
+    assert "Restrictions:" not in prompt
     assert '"ingredients"' in prompt
     assert "Three egg breakfasts" in prompt
     assert amendment in prompt

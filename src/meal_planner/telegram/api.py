@@ -11,6 +11,9 @@ from meal_planner.models.schemas import (
     GrocerySection,
     MealOutcome,
     PlannedMeal,
+    ProfileEditCategory,
+    ProfileEditOperation,
+    UserProfile,
     WeeklyPlan,
 )
 from meal_planner.telegram.commands import (
@@ -156,6 +159,161 @@ class TelegramAPI:
         if text:
             payload["text"] = text
         return self._post("answerCallbackQuery", payload)
+
+    def send_profile(
+        self, chat_id: int | str, profile: UserProfile
+    ) -> list[dict[str, Any]]:
+        """Render a saved profile with controls for deterministic editing."""
+        lines = [
+            f"Family name: {profile.name}",
+            f"People count: {profile.people_count}",
+            "Family members:",
+            *(
+                f"- {member.name} ({member.calorie_target} kcal/day)"
+                for member in profile.family_members
+            ),
+            "Dietary constraints: "
+            f"{', '.join(profile.dietary_constraints) or 'None'}",
+            "Dietary preferences: "
+            f"{', '.join(profile.dietary_preferences) or 'None'}",
+            f"Goals: {', '.join(profile.goals) or 'None'}",
+        ]
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "Amend profile",
+                        "callback_data": "profile:root",
+                    }
+                ],
+                [{"text": "Close", "callback_data": "profile:close"}],
+            ]
+        }
+        return self.send_message(
+            chat_id, "\n".join(lines), reply_markup=keyboard
+        )
+
+    def send_profile_root(self, chat_id: int | str) -> list[dict[str, Any]]:
+        """Render the top-level profile amendment category menu."""
+        categories = [
+            (ProfileEditCategory.FAMILY, "Family"),
+            (ProfileEditCategory.DIETARY_CONSTRAINTS, "Dietary constraints"),
+            (ProfileEditCategory.DIETARY_PREFERENCES, "Dietary preferences"),
+            (ProfileEditCategory.GOALS, "Goals"),
+        ]
+        keyboard = [
+            [
+                {
+                    "text": label,
+                    "callback_data": f"profile:category:{category.value}",
+                }
+            ]
+            for category, label in categories
+        ]
+        keyboard.extend(
+            [
+                [{"text": "Done", "callback_data": "profile:done"}],
+                [{"text": "Close", "callback_data": "profile:close"}],
+            ]
+        )
+        return self.send_message(
+            chat_id,
+            "What would you like to amend?",
+            reply_markup={"inline_keyboard": keyboard},
+        )
+
+    def send_profile_category(
+        self, chat_id: int | str, category: ProfileEditCategory
+    ) -> list[dict[str, Any]]:
+        """Render operations valid for one profile category."""
+        labels = {
+            ProfileEditOperation.ADD: {
+                ProfileEditCategory.FAMILY: "Add member",
+                ProfileEditCategory.DIETARY_CONSTRAINTS: "Add constraint",
+                ProfileEditCategory.DIETARY_PREFERENCES: "Add preference",
+                ProfileEditCategory.GOALS: "Add goal",
+            },
+            ProfileEditOperation.REMOVE: {
+                ProfileEditCategory.FAMILY: "Remove member",
+                ProfileEditCategory.DIETARY_CONSTRAINTS: "Remove constraint",
+                ProfileEditCategory.DIETARY_PREFERENCES: "Remove preference",
+                ProfileEditCategory.GOALS: "Remove goal",
+            },
+            ProfileEditOperation.CHANGE_CALORIES: {
+                ProfileEditCategory.FAMILY: "Change calories",
+            },
+        }
+        operations = [
+            operation
+            for operation in ProfileEditOperation
+            if operation.is_valid_for(category)
+        ]
+        keyboard = [
+            [
+                {
+                    "text": labels[operation][category],
+                    "callback_data": (
+                        f"profile:operation:{category.value}:{operation.value}"
+                    ),
+                }
+            ]
+            for operation in operations
+        ]
+        keyboard.extend(
+            [
+                [{"text": "Back", "callback_data": "profile:back"}],
+                [{"text": "Done", "callback_data": "profile:done"}],
+            ]
+        )
+        return self.send_message(
+            chat_id,
+            f"Choose an operation for {category.value.replace('_', ' ')}:",
+            reply_markup={"inline_keyboard": keyboard},
+        )
+
+    def send_profile_operation(
+        self,
+        chat_id: int | str,
+        category: ProfileEditCategory,
+        operation: ProfileEditOperation,
+    ) -> list[dict[str, Any]]:
+        """Render one guided input prompt and its navigation controls."""
+        if not operation.is_valid_for(category):
+            raise ValueError("operation is invalid for its category")
+        prompts = {
+            (
+                ProfileEditCategory.FAMILY,
+                ProfileEditOperation.ADD,
+            ): "Send the member's name and calorie target, for example: "
+            "John 1500.",
+            (
+                ProfileEditCategory.FAMILY,
+                ProfileEditOperation.REMOVE,
+            ): "Send the exact member name to remove.",
+            (
+                ProfileEditCategory.FAMILY,
+                ProfileEditOperation.CHANGE_CALORIES,
+            ): "Send the member's name and new calorie target, for example: "
+            "John 1500.",
+        }
+        item_name = {
+            ProfileEditCategory.DIETARY_CONSTRAINTS: "constraint",
+            ProfileEditCategory.DIETARY_PREFERENCES: "preference",
+            ProfileEditCategory.GOALS: "goal",
+        }.get(category, "item")
+        prompt = prompts.get(
+            (category, operation),
+            f"Send one non-empty {item_name} to "
+            f"{'add' if operation is ProfileEditOperation.ADD else 'remove'}.",
+        )
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "Back", "callback_data": "profile:back"}],
+                [{"text": "Done", "callback_data": "profile:done"}],
+                [{"text": "Close", "callback_data": "profile:close"}],
+            ]
+        }
+        return self.send_message(chat_id, prompt, reply_markup=keyboard)
 
     def send_plan(
         self, chat_id: int | str, plan: WeeklyPlan

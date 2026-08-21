@@ -25,6 +25,7 @@ from meal_planner.models.schemas import (
     MealOutcome,
     PlanStatus,
     ProfileUpdateEntities,
+    UserProfile,
 )
 from tests.factories import make_plan, make_profile
 
@@ -66,6 +67,96 @@ def test_profile_and_onboarding_draft_round_trip(
     assert repo.get_profile("user") == profile
     repo.delete_profile_draft("user")
     assert repo.get_profile_draft("user") is None
+
+
+def test_save_profile_creates_canonical_revision_zero_item(
+    repo: DynamoRepository,
+) -> None:
+    """Onboarding saves create a canonical profile at revision zero."""
+    profile = UserProfile(
+        name="Alex",
+        dietary_constraints=["peanuts"],
+    )
+
+    repo.save_profile("user", profile)
+
+    item = repo.table.get_item(Key={"PK": "USER#user", "SK": "PROFILE"})["Item"]
+    assert item["revision"] == 0
+    assert item["dietary_constraints"] == ["peanuts"]
+    assert "allergies" not in item
+    assert "restrictions" not in item
+
+
+def test_save_profile_updates_matching_revision_atomically(
+    repo: DynamoRepository,
+) -> None:
+    """A matching revision is replaced and incremented atomically."""
+    initial = UserProfile(name="Alex", dietary_constraints=["peanuts"])
+    updated = UserProfile(name="Alex", dietary_constraints=["dairy-free"])
+    repo.save_profile("user", initial)
+
+    assert repo.save_profile(
+        "user", updated, expected_revision=initial.revision
+    )
+
+    saved = repo.get_profile("user")
+    assert saved is not None
+    assert saved.dietary_constraints == ["dairy-free"]
+    assert saved.revision == 1
+
+
+def test_save_profile_rejects_stale_revision_without_mutating_data(
+    repo: DynamoRepository,
+) -> None:
+    """A stale conditional write fails and leaves the winning profile intact."""
+    initial = UserProfile(name="Alex", dietary_constraints=["peanuts"])
+    winner = UserProfile(name="Alex", dietary_constraints=["dairy-free"])
+    stale = UserProfile(name="Alex", dietary_constraints=["shellfish"])
+    repo.save_profile("user", initial)
+    assert repo.save_profile("user", winner, expected_revision=initial.revision)
+
+    assert not repo.save_profile(
+        "user", stale, expected_revision=initial.revision
+    )
+
+    saved = repo.get_profile("user")
+    assert saved is not None
+    assert saved.dietary_constraints == ["dairy-free"]
+    assert saved.revision == 1
+
+
+def test_save_profile_migrates_legacy_revisionless_item_on_first_write(
+    repo: DynamoRepository,
+) -> None:
+    """Revision zero permits the first canonical write of a legacy item."""
+    repo.table.put_item(
+        Item={
+            "PK": "USER#user",
+            "SK": "PROFILE",
+            "name": "Alex",
+            "family_members": [],
+            "allergies": ["Peanuts"],
+            "restrictions": ["vegetarian"],
+            "dietary_preferences": [],
+            "goals": [],
+            "people_count": 1,
+        }
+    )
+    legacy_read = repo.get_profile("user")
+    assert legacy_read is not None
+    canonical = legacy_read.model_copy(
+        update={"dietary_constraints": ["Peanuts", "vegan"]}
+    )
+
+    assert repo.save_profile(
+        "user", canonical, expected_revision=legacy_read.revision
+    )
+
+    item = repo.table.get_item(Key={"PK": "USER#user", "SK": "PROFILE"})["Item"]
+    assert item["revision"] == 1
+    assert item["dietary_constraints"] == ["Peanuts", "vegan"]
+    assert "allergies" not in item
+    assert "restrictions" not in item
 
 
 def test_conversation_state_round_trip_and_revision_guard(

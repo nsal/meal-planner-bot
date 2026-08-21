@@ -61,13 +61,38 @@ _GENERIC_NO_VALUE_PHRASES = frozenset(
     {"none", "no", "nothing", "n/a", "not applicable"}
 )
 _FIELD_NO_VALUE_PHRASES = {
-    "allergies": frozenset({"no allergies"}),
+    "dietary_constraints": frozenset({"no dietary constraints"}),
     "dietary_preferences": frozenset(
         {"no dietary preferences", "no preferences"}
     ),
-    "restrictions": frozenset({"no restrictions"}),
     "goals": frozenset({"no goals"}),
 }
+
+
+def _normalize_legacy_constraints(value: Any) -> Any:
+    """Map legacy persisted constraint fields to the canonical field."""
+    if (
+        not isinstance(value, dict)
+        or "dietary_constraints" in value
+        or not {"allergies", "restrictions"} & value.keys()
+    ):
+        return value
+
+    constraints: list[Any] = []
+    for field_name in ("allergies", "restrictions"):
+        legacy_value = value.get(field_name)
+        if legacy_value is None:
+            continue
+        if isinstance(legacy_value, list):
+            constraints.extend(legacy_value)
+        else:
+            constraints.append(legacy_value)
+
+    normalized = dict(value)
+    normalized["dietary_constraints"] = constraints
+    normalized.pop("allergies", None)
+    normalized.pop("restrictions", None)
+    return normalized
 
 
 class ConversationIntent(str, Enum):
@@ -116,6 +141,36 @@ class MealType(str, Enum):
     SNACK = "snack"
 
 
+class ProfileEditCategory(str, Enum):
+    """Profile categories exposed by the deterministic edit workflow."""
+
+    FAMILY = "family"
+    DIETARY_CONSTRAINTS = "dietary_constraints"
+    DIETARY_PREFERENCES = "dietary_preferences"
+    GOALS = "goals"
+
+
+class ProfileEditOperation(str, Enum):
+    """Operations available for a selected profile category."""
+
+    ADD = "add"
+    REMOVE = "remove"
+    CHANGE_CALORIES = "change_calories"
+
+    def is_valid_for(self, category: ProfileEditCategory) -> bool:
+        """Return whether this operation belongs to the category."""
+        if category is ProfileEditCategory.FAMILY:
+            return self in {
+                ProfileEditOperation.ADD,
+                ProfileEditOperation.REMOVE,
+                ProfileEditOperation.CHANGE_CALORIES,
+            }
+        return self in {
+            ProfileEditOperation.ADD,
+            ProfileEditOperation.REMOVE,
+        }
+
+
 class PreferenceRequirement(BaseModel):
     """One bounded, exact-count preference for a weekly meal plan."""
 
@@ -152,6 +207,7 @@ class ConversationWorkflowKind(str, Enum):
     MEAL_LOG = "meal_log"
     PLAN_REQUEST = "plan_request"
     PLAN_REVISION = "plan_revision"
+    PROFILE_EDIT = "profile_edit"
 
 
 class ConversationWorkflowStep(str, Enum):
@@ -164,6 +220,8 @@ class ConversationWorkflowStep(str, Enum):
     AWAITING_PREFERENCE = "awaiting_preference"
     GENERATING = "generating"
     RETRY_READY = "retry_ready"
+    PROFILE_MENU = "profile_menu"
+    AWAITING_PROFILE_INPUT = "awaiting_profile_input"
 
 
 class MealLogDraft(BaseModel):
@@ -184,6 +242,8 @@ class ConversationState(BaseModel):
     requirements: list[PreferenceRequirement] = Field(
         default_factory=list, max_length=20
     )
+    profile_category: ProfileEditCategory | None = None
+    profile_operation: ProfileEditOperation | None = None
     amendment: PlanInstruction | None = None
     target_week: date | None = Field(
         default=None,
@@ -236,6 +296,8 @@ class ConversationState(BaseModel):
                 self.preference is not None
                 or self.requirements
                 or self.request_id is not None
+                or self.profile_category is not None
+                or self.profile_operation is not None
                 or self.amendment is not None
                 or self.target_week is not None
                 or self.expected_plan_revision is not None
@@ -250,13 +312,15 @@ class ConversationState(BaseModel):
                 self.amendment is not None
                 or self.target_week is not None
                 or self.expected_plan_revision is not None
+                or self.profile_category is not None
+                or self.profile_operation is not None
             ):
                 raise ValueError("plan requests cannot contain revision fields")
             if self.preference is None and self.requirements:
                 raise ValueError(
                     "plan requirements require a request preference"
                 )
-        else:
+        elif self.workflow_kind is ConversationWorkflowKind.PLAN_REVISION:
             if self.step not in {
                 ConversationWorkflowStep.GENERATING,
                 ConversationWorkflowStep.RETRY_READY,
@@ -266,6 +330,8 @@ class ConversationState(BaseModel):
                 self.meal_draft is not None
                 or self.preference is not None
                 or self.requirements
+                or self.profile_category is not None
+                or self.profile_operation is not None
             ):
                 raise ValueError(
                     "revision workflows cannot contain other fields"
@@ -279,6 +345,46 @@ class ConversationState(BaseModel):
                 raise ValueError(
                     "revision workflows require amendment and plan snapshot"
                 )
+        else:
+            if self.step not in {
+                ConversationWorkflowStep.PROFILE_MENU,
+                ConversationWorkflowStep.AWAITING_PROFILE_INPUT,
+            }:
+                raise ValueError("profile workflows require a profile step")
+            if (
+                self.meal_draft is not None
+                or self.preference is not None
+                or self.requirements
+                or self.request_id is not None
+                or self.amendment is not None
+                or self.target_week is not None
+                or self.expected_plan_revision is not None
+            ):
+                raise ValueError(
+                    "profile workflows cannot contain unrelated fields"
+                )
+            if self.step is ConversationWorkflowStep.PROFILE_MENU:
+                if (
+                    self.profile_category is not None
+                    or self.profile_operation is not None
+                ):
+                    raise ValueError(
+                        "profile menus cannot contain a selected operation"
+                    )
+            else:
+                if (
+                    self.profile_category is None
+                    or self.profile_operation is None
+                ):
+                    raise ValueError(
+                        "profile input requires category and operation"
+                    )
+                if not self.profile_operation.is_valid_for(
+                    self.profile_category
+                ):
+                    raise ValueError(
+                        "profile operation is invalid for its category"
+                    )
         if self.updated_at < self.created_at:
             raise ValueError("conversation state timestamps are out of order")
         if self.expires_at <= int(self.updated_at.timestamp()):
@@ -389,12 +495,31 @@ class UserProfile(BaseModel):
     """Persisted user profile."""
 
     name: ShortText
+    revision: int = Field(default=0, ge=0)
     family_members: list[FamilyMember] = Field(default_factory=list)
-    allergies: list[ShortText] = Field(default_factory=list)
+    dietary_constraints: list[ShortText] = Field(default_factory=list)
     dietary_preferences: list[ShortText] = Field(default_factory=list)
-    restrictions: list[ShortText] = Field(default_factory=list)
     goals: list[ShortText] = Field(default_factory=list)
     people_count: int = Field(default=1, ge=1, le=20)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_constraints(cls, value: Any) -> Any:
+        """Map legacy persisted constraint fields to the canonical field."""
+        return _normalize_legacy_constraints(value)
+
+    @field_validator("dietary_constraints")
+    @classmethod
+    def deduplicate_constraints(cls, value: list[str]) -> list[str]:
+        """Keep the first spelling of each case-insensitive constraint."""
+        deduplicated: list[str] = []
+        seen: set[str] = set()
+        for constraint in value:
+            key = constraint.casefold()
+            if key not in seen:
+                seen.add(key)
+                deduplicated.append(constraint)
+        return deduplicated
 
     @model_validator(mode="after")
     def validate_member_count(self) -> "UserProfile":
@@ -418,15 +543,19 @@ class ProfileUpdateEntities(BaseModel):
     name: ShortText | None = None
     people_count: int | None = Field(default=None, ge=1, le=20)
     family_members: list[FamilyMember] | None = None
-    allergies: list[ShortText] | None = None
+    dietary_constraints: list[ShortText] | None = None
     dietary_preferences: list[ShortText] | None = None
-    restrictions: list[ShortText] | None = None
     goals: list[ShortText] | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_constraints(cls, value: Any) -> Any:
+        """Map legacy profile-update fields to the canonical field."""
+        return _normalize_legacy_constraints(value)
+
     @field_validator(
-        "allergies",
+        "dietary_constraints",
         "dietary_preferences",
-        "restrictions",
         "goals",
         mode="before",
     )
@@ -443,6 +572,23 @@ class ProfileUpdateEntities(BaseModel):
             _GENERIC_NO_VALUE_PHRASES | (_FIELD_NO_VALUE_PHRASES[field_name])
         )
         return [] if normalized in no_value_phrases else value
+
+    @field_validator("dietary_constraints")
+    @classmethod
+    def deduplicate_constraints(
+        cls, value: list[str] | None
+    ) -> list[str] | None:
+        """Keep the first spelling of each case-insensitive constraint."""
+        if value is None:
+            return None
+        deduplicated: list[str] = []
+        seen: set[str] = set()
+        for constraint in value:
+            key = constraint.casefold()
+            if key not in seen:
+                seen.add(key)
+                deduplicated.append(constraint)
+        return deduplicated
 
 
 class Ingredient(BaseModel):

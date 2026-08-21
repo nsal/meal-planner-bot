@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
@@ -33,6 +34,7 @@ from meal_planner.models.schemas import (
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
+    FamilyMember,
     GroceryStatus,
     Ingredient,
     MealLogDraft,
@@ -42,6 +44,8 @@ from meal_planner.models.schemas import (
     PlannedMeal,
     PlanStatus,
     PreferenceRequirement,
+    ProfileEditCategory,
+    ProfileEditOperation,
     ProfileUpdateEntities,
     UserProfile,
     WeeklyPlan,
@@ -52,9 +56,12 @@ from meal_planner.planner_handler import (
     REVISE_PLAN,
 )
 from meal_planner.router import (
+    ProfileCallback,
+    ProfileCallbackAction,
     RouteResult,
     RouteType,
     parse_checkin_callback,
+    parse_profile_callback,
     route_update,
 )
 from meal_planner.telegram.access import TelegramAccessPolicy
@@ -192,20 +199,18 @@ class BotHandler:
                 chat_id, "No complete profile found. Use /start to begin."
             )
             return
-        lines = [
-            f"Family name: {profile.name}",
-            f"People count: {profile.people_count}",
-            "Family members:",
-            *(
-                f"- {member.name} ({member.calorie_target} kcal/day)"
-                for member in profile.family_members
-            ),
-            f"Allergies: {', '.join(profile.allergies) or 'None'}",
-            f"Preferences: {', '.join(profile.dietary_preferences) or 'None'}",
-            f"Restrictions: {', '.join(profile.restrictions) or 'None'}",
-            f"Goals: {', '.join(profile.goals) or 'None'}",
-        ]
-        self.telegram_api.send_message(chat_id, "\n".join(lines))
+        previous = self._get_conversation_state(user_id)
+        profile_state = self._new_profile_state()
+        if not self._replace_conversation_state(
+            user_id, profile_state, previous
+        ):
+            self.telegram_api.send_message(
+                chat_id,
+                "That workflow changed while I was opening /profile. "
+                "Please try again.",
+            )
+            return
+        self.telegram_api.send_profile(chat_id, profile)
 
     def _cmd_plan(self, chat_id: int | str, user_id: str) -> None:
         profile = self.repo.get_profile(user_id)
@@ -351,6 +356,19 @@ class BotHandler:
             expires_at=int((now + timedelta(hours=24)).timestamp()),
         )
 
+    @staticmethod
+    def _new_profile_state() -> ConversationState:
+        """Create an empty durable profile amendment menu state."""
+        now = datetime.now(timezone.utc)
+        return ConversationState(
+            workflow_kind=ConversationWorkflowKind.PROFILE_EDIT,
+            step=ConversationWorkflowStep.PROFILE_MENU,
+            revision=0,
+            created_at=now,
+            updated_at=now,
+            expires_at=int((now + timedelta(hours=24)).timestamp()),
+        )
+
     def _replace_conversation_state(
         self,
         user_id: str,
@@ -372,6 +390,11 @@ class BotHandler:
         return next((item for item in plan.days if item.day == offset), None)
 
     def handle_callback(self, route: RouteResult) -> None:
+        if route.callback_data:
+            profile_callback = parse_profile_callback(route.callback_data)
+            if profile_callback is not None:
+                self._handle_profile_callback(route, profile_callback)
+                return
         acknowledgement = "Unable to update meal"
         try:
             if (
@@ -446,6 +469,167 @@ class BotHandler:
                 except TelegramAPIError:
                     logger.error("Failed to acknowledge callback query")
 
+    def _handle_profile_callback(
+        self, route: RouteResult, callback: ProfileCallback
+    ) -> None:
+        """Navigate the profile editor without changing the profile."""
+        acknowledgement = "Invalid profile action"
+        try:
+            if route.chat_id is None or not route.user_id:
+                return
+            state = self._get_conversation_state(route.user_id)
+            if (
+                state is None
+                or state.workflow_kind
+                is not ConversationWorkflowKind.PROFILE_EDIT
+            ):
+                self.telegram_api.send_message(
+                    route.chat_id,
+                    "That profile menu is no longer active. Use /profile "
+                    "to open it again.",
+                )
+                acknowledgement = "Profile menu expired"
+                return
+
+            if callback.action is ProfileCallbackAction.ROOT:
+                if state.step is not ConversationWorkflowStep.PROFILE_MENU:
+                    self.telegram_api.send_message(
+                        route.chat_id,
+                        "Finish or go back from the current profile edit "
+                        "first.",
+                    )
+                    acknowledgement = "Finish current edit"
+                    return
+                self.telegram_api.send_profile_root(route.chat_id)
+                acknowledgement = "Profile menu"
+                return
+
+            if callback.action is ProfileCallbackAction.CATEGORY:
+                assert callback.category is not None
+                if state.step is not ConversationWorkflowStep.PROFILE_MENU:
+                    self.telegram_api.send_message(
+                        route.chat_id,
+                        "Finish or go back from the current profile edit "
+                        "first.",
+                    )
+                    acknowledgement = "Finish current edit"
+                    return
+                self.telegram_api.send_profile_category(
+                    route.chat_id, callback.category
+                )
+                acknowledgement = "Category selected"
+                return
+
+            if callback.action is ProfileCallbackAction.OPERATION:
+                assert callback.category is not None
+                assert callback.operation is not None
+                if state.step is not ConversationWorkflowStep.PROFILE_MENU:
+                    self.telegram_api.send_message(
+                        route.chat_id,
+                        "Finish or go back from the current profile edit "
+                        "first.",
+                    )
+                    acknowledgement = "Finish current edit"
+                    return
+                now = datetime.now(timezone.utc)
+                candidate = state.model_copy(
+                    update={
+                        "step": ConversationWorkflowStep.AWAITING_PROFILE_INPUT,
+                        "profile_category": callback.category,
+                        "profile_operation": callback.operation,
+                        "revision": state.revision + 1,
+                        "updated_at": now,
+                    }
+                )
+                if not self.repo.transition_conversation_state(
+                    route.user_id,
+                    candidate,
+                    expected_revision=state.revision,
+                ):
+                    self.telegram_api.send_message(
+                        route.chat_id,
+                        "That profile menu changed. Please use /profile again.",
+                    )
+                    acknowledgement = "Profile menu changed"
+                    return
+                self.telegram_api.send_profile_operation(
+                    route.chat_id, callback.category, callback.operation
+                )
+                acknowledgement = "Ready for input"
+                return
+
+            if callback.action is ProfileCallbackAction.BACK:
+                if (
+                    state.step
+                    is ConversationWorkflowStep.AWAITING_PROFILE_INPUT
+                ):
+                    now = datetime.now(timezone.utc)
+                    candidate = state.model_copy(
+                        update={
+                            "step": ConversationWorkflowStep.PROFILE_MENU,
+                            "profile_category": None,
+                            "profile_operation": None,
+                            "revision": state.revision + 1,
+                            "updated_at": now,
+                        }
+                    )
+                    if not self.repo.transition_conversation_state(
+                        route.user_id,
+                        candidate,
+                        expected_revision=state.revision,
+                    ):
+                        self.telegram_api.send_message(
+                            route.chat_id,
+                            "That profile menu changed. Please try again.",
+                        )
+                        acknowledgement = "Profile menu changed"
+                        return
+                self.telegram_api.send_profile_root(route.chat_id)
+                acknowledgement = "Back to profile menu"
+                return
+
+            if callback.action in {
+                ProfileCallbackAction.DONE,
+                ProfileCallbackAction.CLOSE,
+            }:
+                if not self.repo.delete_conversation_state(
+                    route.user_id, expected_revision=state.revision
+                ):
+                    self.telegram_api.send_message(
+                        route.chat_id,
+                        "That profile menu changed. Please use /profile again.",
+                    )
+                    acknowledgement = "Profile menu changed"
+                    return
+                message = (
+                    "Profile amendments saved."
+                    if callback.action is ProfileCallbackAction.DONE
+                    else "Closed profile amendments."
+                )
+                self.telegram_api.send_message(route.chat_id, message)
+                acknowledgement = (
+                    "Profile complete"
+                    if callback.action is ProfileCallbackAction.DONE
+                    else "Profile closed"
+                )
+        except Exception:
+            logger.exception("Profile callback handling failed")
+            if route.chat_id is not None:
+                self.telegram_api.send_message(
+                    route.chat_id,
+                    "Sorry, I couldn't open that profile menu. Please try "
+                    "again.",
+                )
+            acknowledgement = "Unable to open profile"
+        finally:
+            if route.callback_query_id:
+                try:
+                    self.telegram_api.answer_callback_query(
+                        route.callback_query_id, acknowledgement
+                    )
+                except TelegramAPIError:
+                    logger.error("Failed to acknowledge profile callback")
+
     def handle_conversational(self, route: RouteResult) -> None:
         if route.chat_id is None or not route.user_id or not route.text:
             return
@@ -475,6 +659,16 @@ class BotHandler:
                     route.text,
                     state,
                 )
+                return
+            if (
+                state
+                and state.workflow_kind is ConversationWorkflowKind.PROFILE_EDIT
+            ):
+                message = self._handle_profile_edit_input(
+                    route.user_id, route.chat_id, route.text, state
+                )
+                if message is not None:
+                    self.telegram_api.send_message(route.chat_id, message)
                 return
             profile = self.repo.get_profile(route.user_id)
             profile_draft = self.repo.get_profile_draft(route.user_id)
@@ -530,6 +724,275 @@ class BotHandler:
                 route.chat_id,
                 "Sorry, I couldn't process that request. Please try again.",
             )
+
+    @staticmethod
+    def _parse_profile_name_calories(
+        text: str,
+    ) -> tuple[str, int] | None:
+        """Parse one member name followed by a positive calorie target."""
+        if "\n" in text or "\r" in text:
+            return None
+        match = re.fullmatch(r"(.+?)\s+([0-9]+)", text.strip())
+        if match is None:
+            return None
+        name = match.group(1).strip()
+        calories = int(match.group(2))
+        if not name or not 1 <= calories <= 10_000:
+            return None
+        return name, calories
+
+    @staticmethod
+    def _parse_profile_member_name(text: str) -> str | None:
+        """Parse one exact, non-empty family member name."""
+        if "\n" in text or "\r" in text:
+            return None
+        name = text.strip()
+        return name or None
+
+    @staticmethod
+    def _parse_profile_item(text: str) -> str | None:
+        """Parse one non-empty profile list item."""
+        if "\n" in text or "\r" in text:
+            return None
+        item = text.strip()
+        if not item or item.casefold() in {
+            "none",
+            "no",
+            "nothing",
+            "n/a",
+            "not applicable",
+        }:
+            return None
+        return item
+
+    @staticmethod
+    def _profile_with_updates(
+        profile: UserProfile, updates: dict[str, Any]
+    ) -> UserProfile:
+        """Create a validated profile copy without mutating the original."""
+        data = profile.model_dump(mode="json")
+        data.update(updates)
+        return UserProfile.model_validate(data)
+
+    @staticmethod
+    def _profile_items(
+        profile: UserProfile, category: ProfileEditCategory
+    ) -> list[str]:
+        """Return a copied list for a non-family profile category."""
+        if category is ProfileEditCategory.DIETARY_CONSTRAINTS:
+            return list(profile.dietary_constraints)
+        if category is ProfileEditCategory.DIETARY_PREFERENCES:
+            return list(profile.dietary_preferences)
+        if category is ProfileEditCategory.GOALS:
+            return list(profile.goals)
+        raise ValueError("family is not an item category")
+
+    def _handle_profile_edit_input(
+        self,
+        user_id: str,
+        chat_id: int | str,
+        text: str,
+        state: ConversationState,
+    ) -> str | None:
+        """Apply one deterministic profile amendment and return its result."""
+        if state.step is not ConversationWorkflowStep.AWAITING_PROFILE_INPUT:
+            return "Please choose a profile amendment from the buttons."
+        category = state.profile_category
+        operation = state.profile_operation
+        if category is None or operation is None:
+            return "That profile edit is invalid. Please use /profile again."
+
+        profile = self.repo.get_profile(user_id)
+        if profile is None:
+            return "No complete profile found. Use /start to begin."
+
+        try:
+            updated, message = self._apply_profile_amendment(
+                profile, category, operation, text
+            )
+        except ValidationError:
+            return "That profile change is invalid. Please use a shorter value."
+        except ValueError as exc:
+            return str(exc)
+        if updated is None:
+            return message
+
+        try:
+            saved = self.repo.save_profile(
+                user_id, updated, expected_revision=profile.revision
+            )
+        except Exception:
+            logger.exception("Profile amendment save failed")
+            return "I couldn't save that profile change. Please try again."
+        if not saved:
+            return (
+                "Your profile changed before this edit could be saved. "
+                "Please open /profile again."
+            )
+
+        now = datetime.now(timezone.utc)
+        menu_state = state.model_copy(
+            update={
+                "step": ConversationWorkflowStep.PROFILE_MENU,
+                "profile_category": None,
+                "profile_operation": None,
+                "revision": state.revision + 1,
+                "updated_at": now,
+            }
+        )
+        try:
+            transitioned = self.repo.transition_conversation_state(
+                user_id, menu_state, expected_revision=state.revision
+            )
+        except Exception:
+            logger.exception("Profile edit state transition failed")
+            return "Your profile changed, but the edit menu could not reopen."
+        if not transitioned:
+            return (
+                "Your profile changed, but that edit menu is stale. "
+                "Please open /profile again."
+            )
+        self.telegram_api.send_message(chat_id, message)
+        self.telegram_api.send_profile_category(chat_id, category)
+        return None
+
+    def _apply_profile_amendment(
+        self,
+        profile: UserProfile,
+        category: ProfileEditCategory,
+        operation: ProfileEditOperation,
+        text: str,
+    ) -> tuple[UserProfile | None, str]:
+        """Validate and apply one immutable profile amendment."""
+        if category is ProfileEditCategory.FAMILY:
+            return self._apply_family_amendment(profile, operation, text)
+        return self._apply_item_amendment(profile, category, operation, text)
+
+    @staticmethod
+    def _apply_family_amendment(
+        profile: UserProfile,
+        operation: ProfileEditOperation,
+        text: str,
+    ) -> tuple[UserProfile | None, str]:
+        """Apply a family member add, remove, or calorie change."""
+        members = list(profile.family_members)
+        if operation is ProfileEditOperation.REMOVE:
+            name = BotHandler._parse_profile_member_name(text)
+            if name is None:
+                return None, "Send one exact member name to remove."
+            if len(members) == 1:
+                return None, "You must keep at least one family member."
+            index = next(
+                (
+                    index
+                    for index, member in enumerate(members)
+                    if member.name.casefold() == name.casefold()
+                ),
+                None,
+            )
+            if index is None:
+                return None, "I couldn't find that family member."
+            removed = members.pop(index)
+            return (
+                BotHandler._profile_with_updates(
+                    profile,
+                    {
+                        "family_members": [
+                            member.model_dump(mode="json") for member in members
+                        ],
+                        "people_count": len(members),
+                    },
+                ),
+                f"Removed {removed.name}.",
+            )
+
+        parsed = BotHandler._parse_profile_name_calories(text)
+        if parsed is None:
+            return None, "Use the format: name calories, for example John 1500."
+        name, calories = parsed
+        index = next(
+            (
+                index
+                for index, member in enumerate(members)
+                if member.name.casefold() == name.casefold()
+            ),
+            None,
+        )
+        if operation is ProfileEditOperation.ADD:
+            if index is not None:
+                return None, "That family member already exists."
+            if len(members) >= 20:
+                return None, "A profile can have at most 20 family members."
+            member = FamilyMember(name=name, calorie_target=calories)
+            members.append(member)
+            return (
+                BotHandler._profile_with_updates(
+                    profile,
+                    {
+                        "family_members": [
+                            item.model_dump(mode="json") for item in members
+                        ],
+                        "people_count": len(members),
+                    },
+                ),
+                f"Added {name}.",
+            )
+        if index is None:
+            return None, "I couldn't find that family member."
+        members[index] = FamilyMember(
+            name=members[index].name, calorie_target=calories
+        )
+        return (
+            BotHandler._profile_with_updates(
+                profile,
+                {
+                    "family_members": [
+                        item.model_dump(mode="json") for item in members
+                    ],
+                    "people_count": len(members),
+                },
+            ),
+            f"Updated {members[index].name}'s calorie target.",
+        )
+
+    @staticmethod
+    def _apply_item_amendment(
+        profile: UserProfile,
+        category: ProfileEditCategory,
+        operation: ProfileEditOperation,
+        text: str,
+    ) -> tuple[UserProfile | None, str]:
+        """Apply one item-list addition or removal."""
+        item = BotHandler._parse_profile_item(text)
+        if item is None:
+            return None, "Send one non-empty item."
+        items = BotHandler._profile_items(profile, category)
+        matching_index = next(
+            (
+                index
+                for index, existing in enumerate(items)
+                if existing.casefold() == item.casefold()
+            ),
+            None,
+        )
+        label = category.value.replace("_", " ")
+        if operation is ProfileEditOperation.ADD:
+            if matching_index is not None:
+                return None, f"That {label[:-1]} already exists."
+            items.append(item)
+            return (
+                BotHandler._profile_with_updates(
+                    profile, {category.value: items}
+                ),
+                f"Added {item}.",
+            )
+        if matching_index is None:
+            return None, f"I couldn't find that {label[:-1]}."
+        removed = items.pop(matching_index)
+        return (
+            BotHandler._profile_with_updates(profile, {category.value: items}),
+            f"Removed {removed}.",
+        )
 
     def _handle_meal_workflow(
         self,

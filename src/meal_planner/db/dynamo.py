@@ -60,14 +60,47 @@ class DynamoRepository:
         item = response.get("Item")
         return UserProfile.model_validate(self._data(item)) if item else None
 
-    def save_profile(self, user_id: str, profile: UserProfile) -> None:
-        self.table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": "PROFILE",
-                **profile.model_dump(mode="json"),
-            }
-        )
+    def save_profile(
+        self,
+        user_id: str,
+        profile: UserProfile,
+        *,
+        expected_revision: int | None = None,
+    ) -> bool:
+        """Save a profile, optionally guarded by its observed revision.
+
+        The unguarded path preserves onboarding's existing replace behavior.
+        A guarded write treats a missing revision as zero, writes the next
+        revision, and replaces the item only when the observed revision still
+        matches.
+        """
+        item = {
+            "PK": f"USER#{user_id}",
+            "SK": "PROFILE",
+            **profile.model_dump(mode="json"),
+        }
+        if expected_revision is None:
+            self.table.put_item(Item=item)
+            return True
+
+        item["revision"] = expected_revision + 1
+        try:
+            self.table.put_item(
+                Item=item,
+                ConditionExpression=(
+                    "attribute_not_exists(#revision) OR "
+                    "#revision = :expected_revision"
+                ),
+                ExpressionAttributeNames={"#revision": "revision"},
+                ExpressionAttributeValues={
+                    ":expected_revision": expected_revision
+                },
+            )
+        except ClientError as exc:
+            if self._is_conditional_failure(exc):
+                return False
+            raise
+        return True
 
     def get_profile_draft(
         self, user_id: str
