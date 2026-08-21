@@ -1,6 +1,9 @@
 """Documentation assertions for user and operator-facing contracts."""
 
+import re
 from pathlib import Path
+
+from meal_planner.telegram.commands import BOT_COMMANDS, render_help
 
 PROJECT_ROOT = Path(__file__).parents[1]
 README_PATH = PROJECT_ROOT / "README.md"
@@ -14,6 +17,31 @@ def _read_readme() -> str:
 def _normalized_readme() -> str:
     """Load the README with Markdown line wrapping removed."""
     return " ".join(_read_readme().split())
+
+
+def test_profile_command_description_is_consistent_across_surfaces() -> None:
+    """Keep the documented profile command aligned with the bot catalogue."""
+    readme = _read_readme()
+    command_reference = readme.split(
+        "The Telegram command menu and `/help` show the same command "
+        "reference:\n",
+        maxsplit=1,
+    )[1].split("\n- `/start` begins onboarding.", maxsplit=1)[0]
+    documented = re.search(
+        r"^- `/profile` — (?P<description>.+)\.$",
+        command_reference,
+        re.MULTILINE,
+    )
+    assert documented is not None
+
+    catalogue_description = next(
+        command.description
+        for command in BOT_COMMANDS
+        if command.name == "profile"
+    )
+    description = documented.group("description")
+    assert description == catalogue_description
+    assert f"/profile — {description}" in render_help().splitlines()
 
 
 def test_readme_documents_preference_clarification_contract() -> None:

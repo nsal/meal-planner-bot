@@ -493,7 +493,6 @@ def test_user_profile_defaults() -> None:
     assert profile.dietary_preferences == []
     assert profile.goals == []
     assert profile.people_count == 1
-    assert profile.revision == 0
 
 
 def test_user_profile_full() -> None:
@@ -563,29 +562,98 @@ def test_user_profile_has_no_constraints_when_legacy_data_is_empty() -> None:
     assert profile.dietary_constraints == []
 
 
+@pytest.mark.parametrize(
+    ("legacy", "expected"),
+    [
+        ({}, None),
+        ({"allergies": None, "restrictions": None}, None),
+        ({"allergies": None, "restrictions": []}, []),
+        ({"allergies": "none", "restrictions": None}, []),
+        ({"allergies": "nothing", "restrictions": None}, []),
+        ({"allergies": None, "restrictions": "N/A!"}, []),
+        ({"allergies": "not applicable", "restrictions": None}, []),
+        ({"allergies": "no allergies", "restrictions": None}, []),
+        (
+            {"allergies": "no dietary constraints", "restrictions": None},
+            [],
+        ),
+        (
+            {
+                "allergies": ["Peanuts", "none", "peanuts"],
+                "restrictions": ["Vegan", "NO RESTRICTIONS", "vegan"],
+            },
+            ["Peanuts", "Vegan"],
+        ),
+        (
+            {"allergies": "shellfish", "restrictions": "Dairy-free"},
+            ["shellfish", "Dairy-free"],
+        ),
+    ],
+)
+def test_profile_update_normalizes_legacy_constraints(
+    legacy: dict[str, object], expected: list[str] | None
+) -> None:
+    """Partial legacy drafts preserve unanswered and explicit-empty states."""
+    update = ProfileUpdateEntities.model_validate(legacy)
+
+    assert update.dietary_constraints == expected
+    dumped = update.model_dump()
+    assert "allergies" not in dumped
+    assert "restrictions" not in dumped
+
+
+def test_profile_update_canonical_constraints_are_authoritative() -> None:
+    """A present canonical value wins over legacy constraint fields."""
+    update = ProfileUpdateEntities.model_validate(
+        {
+            "dietary_constraints": None,
+            "allergies": ["peanuts"],
+            "restrictions": ["vegan"],
+        }
+    )
+
+    assert update.dietary_constraints is None
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        {},
+        {"allergies": None, "restrictions": None},
+        {"allergies": [], "restrictions": None},
+        {"allergies": "none", "restrictions": "no restrictions"},
+    ],
+)
+def test_user_profile_normalizes_legacy_constraints_to_complete_list(
+    legacy: dict[str, object],
+) -> None:
+    """Complete profiles always expose a canonical constraint list."""
+    profile = UserProfile.model_validate({"name": "John Doe", **legacy})
+
+    assert profile.dietary_constraints == []
+    dumped = profile.model_dump()
+    assert "allergies" not in dumped
+    assert "restrictions" not in dumped
+
+
 def test_user_profile_invalid_people_count() -> None:
     """Test UserProfile with invalid people_count (< 1)."""
     with pytest.raises(ValidationError):
         UserProfile(name="John", people_count=0)
 
 
-def test_user_profile_legacy_read_defaults_revision_to_zero() -> None:
-    """Legacy profiles without a persisted revision read as revision zero."""
+def test_user_profile_ignores_legacy_revision_on_read() -> None:
+    """Legacy profile revisions are ignored by the canonical model."""
     profile = UserProfile.model_validate(
         {
             "name": "John Doe",
             "allergies": ["peanuts"],
             "restrictions": ["vegetarian"],
+            "revision": 7,
         }
     )
 
-    assert profile.revision == 0
-
-
-def test_user_profile_rejects_negative_revision() -> None:
-    """Profile revisions cannot be negative."""
-    with pytest.raises(ValidationError):
-        UserProfile(name="John Doe", revision=-1)
+    assert "revision" not in profile.model_dump()
 
 
 @pytest.mark.parametrize(

@@ -31,7 +31,7 @@ the locked `uv` environment.
 - `/cancel` clears an unfinished meal or plan workflow. Starting `/submit_meals`
   or `/plan` replaces an older unfinished workflow. `/profile` also replaces
   an older unfinished workflow when it opens the profile editor.
-- `/profile` displays the saved household profile. Tap `Amend profile`, choose
+- `/profile` lets you view and amend the saved household profile. Tap `Amend profile`, choose
   `Family`, `Dietary constraints`, `Dietary preferences`, or `Goals`, then
   choose an operation. Each operation accepts one guided message: use
   `John 1500` to add a family member or change a member's calories, the exact
@@ -385,7 +385,7 @@ The Telegram command menu and `/help` show the same command reference:
 
 - `/start` begins onboarding. Supply the family name separately from the
   household size, every household member's name and calorie target, dietary
-  constraints (including allergies and restrictions), dietary preferences, and
+  constraints, dietary preferences, and
   goals. Known onboarding fields carry across conversational turns, so provide
   only the fields the bot still requests.
 - `/profile` shows the persisted family name and individual member details,

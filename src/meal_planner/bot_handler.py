@@ -186,7 +186,8 @@ class BotHandler:
             message = (
                 "Welcome to Meal Planner Bot! Tell me your family name, "
                 "household size, each household member's name and calorie "
-                "target, allergies, preferences, restrictions, and goals. "
+                "target, dietary constraints, dietary preferences, and "
+                "goals. "
                 "After setup, use /plan, /submit_meals, /checkin, or "
                 "/cancel."
             )
@@ -473,10 +474,21 @@ class BotHandler:
         self, route: RouteResult, callback: ProfileCallback
     ) -> None:
         """Navigate the profile editor without changing the profile."""
-        acknowledgement = "Invalid profile action"
+        if (
+            route.chat_id is None
+            or not route.user_id
+            or not route.callback_query_id
+        ):
+            return
+
         try:
-            if route.chat_id is None or not route.user_id:
-                return
+            self.telegram_api.answer_callback_query(
+                route.callback_query_id, "Processing profile action"
+            )
+        except TelegramAPIError:
+            logger.error("Failed to acknowledge profile callback")
+
+        try:
             state = self._get_conversation_state(route.user_id)
             if (
                 state is None
@@ -488,7 +500,6 @@ class BotHandler:
                     "That profile menu is no longer active. Use /profile "
                     "to open it again.",
                 )
-                acknowledgement = "Profile menu expired"
                 return
 
             if callback.action is ProfileCallbackAction.ROOT:
@@ -498,10 +509,8 @@ class BotHandler:
                         "Finish or go back from the current profile edit "
                         "first.",
                     )
-                    acknowledgement = "Finish current edit"
                     return
                 self.telegram_api.send_profile_root(route.chat_id)
-                acknowledgement = "Profile menu"
                 return
 
             if callback.action is ProfileCallbackAction.CATEGORY:
@@ -512,12 +521,10 @@ class BotHandler:
                         "Finish or go back from the current profile edit "
                         "first.",
                     )
-                    acknowledgement = "Finish current edit"
                     return
                 self.telegram_api.send_profile_category(
                     route.chat_id, callback.category
                 )
-                acknowledgement = "Category selected"
                 return
 
             if callback.action is ProfileCallbackAction.OPERATION:
@@ -529,7 +536,6 @@ class BotHandler:
                         "Finish or go back from the current profile edit "
                         "first.",
                     )
-                    acknowledgement = "Finish current edit"
                     return
                 now = datetime.now(timezone.utc)
                 candidate = state.model_copy(
@@ -550,12 +556,10 @@ class BotHandler:
                         route.chat_id,
                         "That profile menu changed. Please use /profile again.",
                     )
-                    acknowledgement = "Profile menu changed"
                     return
                 self.telegram_api.send_profile_operation(
                     route.chat_id, callback.category, callback.operation
                 )
-                acknowledgement = "Ready for input"
                 return
 
             if callback.action is ProfileCallbackAction.BACK:
@@ -582,10 +586,8 @@ class BotHandler:
                             route.chat_id,
                             "That profile menu changed. Please try again.",
                         )
-                        acknowledgement = "Profile menu changed"
                         return
                 self.telegram_api.send_profile_root(route.chat_id)
-                acknowledgement = "Back to profile menu"
                 return
 
             if callback.action in {
@@ -599,7 +601,6 @@ class BotHandler:
                         route.chat_id,
                         "That profile menu changed. Please use /profile again.",
                     )
-                    acknowledgement = "Profile menu changed"
                     return
                 message = (
                     "Profile amendments saved."
@@ -607,28 +608,19 @@ class BotHandler:
                     else "Closed profile amendments."
                 )
                 self.telegram_api.send_message(route.chat_id, message)
-                acknowledgement = (
-                    "Profile complete"
-                    if callback.action is ProfileCallbackAction.DONE
-                    else "Profile closed"
-                )
         except Exception:
             logger.exception("Profile callback handling failed")
             if route.chat_id is not None:
-                self.telegram_api.send_message(
-                    route.chat_id,
-                    "Sorry, I couldn't open that profile menu. Please try "
-                    "again.",
-                )
-            acknowledgement = "Unable to open profile"
-        finally:
-            if route.callback_query_id:
                 try:
-                    self.telegram_api.answer_callback_query(
-                        route.callback_query_id, acknowledgement
+                    self.telegram_api.send_message(
+                        route.chat_id,
+                        "Sorry, I couldn't open that profile menu. Please try "
+                        "again.",
                     )
                 except TelegramAPIError:
-                    logger.error("Failed to acknowledge profile callback")
+                    logger.error(
+                        "Failed to deliver profile callback error message"
+                    )
 
     def handle_conversational(self, route: RouteResult) -> None:
         if route.chat_id is None or not route.user_id or not route.text:
@@ -750,6 +742,24 @@ class BotHandler:
         return name or None
 
     @staticmethod
+    def _member_identity(name: str) -> str:
+        """Return the stable identity key for a family member name."""
+        return name.strip().casefold()
+
+    @staticmethod
+    def _has_duplicate_member_identities(
+        members: list[FamilyMember],
+    ) -> bool:
+        """Return whether members contain a stripped, case-folded duplicate."""
+        identities: set[str] = set()
+        for member in members:
+            identity = BotHandler._member_identity(member.name)
+            if identity in identities:
+                return True
+            identities.add(identity)
+        return False
+
+    @staticmethod
     def _parse_profile_item(text: str) -> str | None:
         """Parse one non-empty profile list item."""
         if "\n" in text or "\r" in text:
@@ -817,19 +827,6 @@ class BotHandler:
         if updated is None:
             return message
 
-        try:
-            saved = self.repo.save_profile(
-                user_id, updated, expected_revision=profile.revision
-            )
-        except Exception:
-            logger.exception("Profile amendment save failed")
-            return "I couldn't save that profile change. Please try again."
-        if not saved:
-            return (
-                "Your profile changed before this edit could be saved. "
-                "Please open /profile again."
-            )
-
         now = datetime.now(timezone.utc)
         menu_state = state.model_copy(
             update={
@@ -841,17 +838,14 @@ class BotHandler:
             }
         )
         try:
-            transitioned = self.repo.transition_conversation_state(
-                user_id, menu_state, expected_revision=state.revision
+            committed = self.repo.save_profile_and_transition_state(
+                user_id, updated, menu_state, state
             )
         except Exception:
-            logger.exception("Profile edit state transition failed")
-            return "Your profile changed, but the edit menu could not reopen."
-        if not transitioned:
-            return (
-                "Your profile changed, but that edit menu is stale. "
-                "Please open /profile again."
-            )
+            logger.exception("Profile amendment transaction failed")
+            return "I couldn't save that profile change. Please try again."
+        if not committed:
+            return "That profile edit is stale. Please open /profile again."
         self.telegram_api.send_message(chat_id, message)
         self.telegram_api.send_profile_category(chat_id, category)
         return None
@@ -882,16 +876,21 @@ class BotHandler:
                 return None, "Send one exact member name to remove."
             if len(members) == 1:
                 return None, "You must keep at least one family member."
-            index = next(
-                (
-                    index
-                    for index, member in enumerate(members)
-                    if member.name.casefold() == name.casefold()
-                ),
-                None,
-            )
-            if index is None:
+            matching_indices = [
+                index
+                for index, member in enumerate(members)
+                if BotHandler._member_identity(member.name)
+                == BotHandler._member_identity(name)
+            ]
+            if len(matching_indices) > 1:
+                return (
+                    None,
+                    "That family member name is ambiguous in this legacy "
+                    "profile. Please update the names before trying again.",
+                )
+            if not matching_indices:
                 return None, "I couldn't find that family member."
+            index = matching_indices[0]
             removed = members.pop(index)
             return (
                 BotHandler._profile_with_updates(
@@ -910,16 +909,20 @@ class BotHandler:
         if parsed is None:
             return None, "Use the format: name calories, for example John 1500."
         name, calories = parsed
-        index = next(
-            (
-                index
-                for index, member in enumerate(members)
-                if member.name.casefold() == name.casefold()
-            ),
-            None,
-        )
+        matching_indices = [
+            index
+            for index, member in enumerate(members)
+            if BotHandler._member_identity(member.name)
+            == BotHandler._member_identity(name)
+        ]
         if operation is ProfileEditOperation.ADD:
-            if index is not None:
+            if len(matching_indices) > 1:
+                return (
+                    None,
+                    "That family member name is ambiguous in this legacy "
+                    "profile. Please update the names before trying again.",
+                )
+            if matching_indices:
                 return None, "That family member already exists."
             if len(members) >= 20:
                 return None, "A profile can have at most 20 family members."
@@ -937,8 +940,15 @@ class BotHandler:
                 ),
                 f"Added {name}.",
             )
-        if index is None:
+        if len(matching_indices) > 1:
+            return (
+                None,
+                "That family member name is ambiguous in this legacy profile. "
+                "Please update the names before trying again.",
+            )
+        if not matching_indices:
             return None, "I couldn't find that family member."
+        index = matching_indices[0]
         members[index] = FamilyMember(
             name=members[index].name, calorie_target=calories
         )
@@ -1416,13 +1426,22 @@ class BotHandler:
         for field in update.model_fields_set:
             data[field] = getattr(update, field)
         draft = ProfileUpdateEntities.model_validate(data)
+        if (
+            "family_members" in update.model_fields_set
+            and draft.family_members is not None
+            and self._has_duplicate_member_identities(draft.family_members)
+        ):
+            return MutationResult(
+                False,
+                "Family member names must be unique, ignoring capitalization "
+                "and surrounding spaces.",
+            )
         required = (
             "name",
             "people_count",
             "family_members",
-            "allergies",
+            "dietary_constraints",
             "dietary_preferences",
-            "restrictions",
             "goals",
         )
         missing = [field for field in required if getattr(draft, field) is None]
@@ -1433,9 +1452,8 @@ class BotHandler:
                 "family_members": (
                     "each household member's name and calorie target"
                 ),
-                "allergies": "allergies",
+                "dietary_constraints": "dietary constraints",
                 "dietary_preferences": "dietary preferences",
-                "restrictions": "restrictions",
                 "goals": "goals",
             }
             self.repo.save_profile_draft(user_id, draft)

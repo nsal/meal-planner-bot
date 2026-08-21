@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from meal_planner.models.schemas import (
     ConversationState,
+    ConversationWorkflowKind,
     ConversationWorkflowStep,
     MealLogEntry,
     MealOutcome,
@@ -64,40 +65,88 @@ class DynamoRepository:
         self,
         user_id: str,
         profile: UserProfile,
-        *,
-        expected_revision: int | None = None,
-    ) -> bool:
-        """Save a profile, optionally guarded by its observed revision.
-
-        The unguarded path preserves onboarding's existing replace behavior.
-        A guarded write treats a missing revision as zero, writes the next
-        revision, and replaces the item only when the observed revision still
-        matches.
-        """
+    ) -> None:
+        """Replace the user's canonical profile document."""
         item = {
             "PK": f"USER#{user_id}",
             "SK": "PROFILE",
             **profile.model_dump(mode="json"),
         }
-        if expected_revision is None:
-            self.table.put_item(Item=item)
-            return True
+        self.table.put_item(Item=item)
 
-        item["revision"] = expected_revision + 1
+    def save_profile_and_transition_state(
+        self,
+        user_id: str,
+        profile: UserProfile,
+        next_state: ConversationState,
+        observed_state: ConversationState,
+    ) -> bool:
+        """Atomically save a profile and consume its observed edit state."""
+        if (
+            observed_state.workflow_kind
+            is not ConversationWorkflowKind.PROFILE_EDIT
+            or observed_state.step
+            is not ConversationWorkflowStep.AWAITING_PROFILE_INPUT
+            or observed_state.profile_category is None
+            or observed_state.profile_operation is None
+        ):
+            return False
+        profile_item = {
+            "PK": f"USER#{user_id}",
+            "SK": "PROFILE",
+            **profile.model_dump(mode="json"),
+        }
+        state_item = {
+            **self._conversation_key(user_id),
+            **next_state.model_dump(mode="json"),
+        }
+        condition = (
+            "#revision = :observed_revision AND "
+            "#created_at = :observed_created_at AND "
+            "#workflow_kind = :observed_workflow_kind AND "
+            "#step = :observed_step AND "
+            "#profile_category = :observed_profile_category AND "
+            "#profile_operation = :observed_profile_operation"
+        )
+        names = {
+            "#revision": "revision",
+            "#created_at": "created_at",
+            "#workflow_kind": "workflow_kind",
+            "#step": "step",
+            "#profile_category": "profile_category",
+            "#profile_operation": "profile_operation",
+        }
+        observed_data = observed_state.model_dump(mode="json")
+        values = {
+            ":observed_revision": observed_data["revision"],
+            ":observed_created_at": observed_data["created_at"],
+            ":observed_workflow_kind": observed_data["workflow_kind"],
+            ":observed_step": observed_data["step"],
+            ":observed_profile_category": observed_data["profile_category"],
+            ":observed_profile_operation": observed_data["profile_operation"],
+        }
         try:
-            self.table.put_item(
-                Item=item,
-                ConditionExpression=(
-                    "attribute_not_exists(#revision) OR "
-                    "#revision = :expected_revision"
-                ),
-                ExpressionAttributeNames={"#revision": "revision"},
-                ExpressionAttributeValues={
-                    ":expected_revision": expected_revision
-                },
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": profile_item,
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": state_item,
+                            "ConditionExpression": condition,
+                            "ExpressionAttributeNames": names,
+                            "ExpressionAttributeValues": values,
+                        }
+                    },
+                ]
             )
         except ClientError as exc:
-            if self._is_conditional_failure(exc):
+            if self._is_transaction_conditional_failure(exc):
                 return False
             raise
         return True

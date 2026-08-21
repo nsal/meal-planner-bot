@@ -61,16 +61,70 @@ _GENERIC_NO_VALUE_PHRASES = frozenset(
     {"none", "no", "nothing", "n/a", "not applicable"}
 )
 _FIELD_NO_VALUE_PHRASES = {
-    "dietary_constraints": frozenset({"no dietary constraints"}),
+    "dietary_constraints": frozenset(
+        {"no dietary constraints", "no allergies", "no restrictions"}
+    ),
     "dietary_preferences": frozenset(
         {"no dietary preferences", "no preferences"}
     ),
     "goals": frozenset({"no goals"}),
 }
+_LEGACY_CONSTRAINT_NO_VALUE_PHRASES = {
+    "allergies": frozenset({"no dietary constraints", "no allergies"}),
+    "restrictions": frozenset({"no dietary constraints", "no restrictions"}),
+}
 
 
-def _normalize_legacy_constraints(value: Any) -> Any:
-    """Map legacy persisted constraint fields to the canonical field."""
+def _is_no_value_phrase(value: Any, field_name: str) -> bool:
+    """Return whether a value is an exact supported no-value phrase."""
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().casefold().rstrip(".!?,;:")
+    phrases = _GENERIC_NO_VALUE_PHRASES | _FIELD_NO_VALUE_PHRASES[field_name]
+    return normalized in phrases
+
+
+def _merge_legacy_constraint_field(
+    value: Any, field_name: str
+) -> tuple[bool, list[Any]]:
+    """Return whether a legacy field was answered and its real values."""
+    if value is None:
+        return False, []
+    values = value if isinstance(value, list) else [value]
+    phrases = (
+        _GENERIC_NO_VALUE_PHRASES
+        | (_LEGACY_CONSTRAINT_NO_VALUE_PHRASES[field_name])
+    )
+    real_values = [
+        item
+        for item in values
+        if not (
+            isinstance(item, str)
+            and item.strip().casefold().rstrip(".!?,;:") in phrases
+        )
+    ]
+    return True, real_values
+
+
+def _merge_legacy_constraints(
+    value: dict[str, Any],
+) -> tuple[bool, list[Any]]:
+    """Merge legacy fields in storage order and preserve their answer state."""
+    answered = False
+    constraints: list[Any] = []
+    for field_name in ("allergies", "restrictions"):
+        field_answered, field_values = _merge_legacy_constraint_field(
+            value.get(field_name), field_name
+        )
+        answered = answered or field_answered
+        constraints.extend(field_values)
+    return answered, constraints
+
+
+def _normalize_legacy_constraints(
+    value: Any, *, preserve_unanswered: bool
+) -> Any:
+    """Map legacy fields while adapting complete and partial model semantics."""
     if (
         not isinstance(value, dict)
         or "dietary_constraints" in value
@@ -78,18 +132,12 @@ def _normalize_legacy_constraints(value: Any) -> Any:
     ):
         return value
 
-    constraints: list[Any] = []
-    for field_name in ("allergies", "restrictions"):
-        legacy_value = value.get(field_name)
-        if legacy_value is None:
-            continue
-        if isinstance(legacy_value, list):
-            constraints.extend(legacy_value)
-        else:
-            constraints.append(legacy_value)
+    answered, constraints = _merge_legacy_constraints(value)
 
     normalized = dict(value)
-    normalized["dietary_constraints"] = constraints
+    normalized["dietary_constraints"] = (
+        constraints if answered or not preserve_unanswered else None
+    )
     normalized.pop("allergies", None)
     normalized.pop("restrictions", None)
     return normalized
@@ -495,7 +543,6 @@ class UserProfile(BaseModel):
     """Persisted user profile."""
 
     name: ShortText
-    revision: int = Field(default=0, ge=0)
     family_members: list[FamilyMember] = Field(default_factory=list)
     dietary_constraints: list[ShortText] = Field(default_factory=list)
     dietary_preferences: list[ShortText] = Field(default_factory=list)
@@ -506,7 +553,7 @@ class UserProfile(BaseModel):
     @classmethod
     def normalize_legacy_constraints(cls, value: Any) -> Any:
         """Map legacy persisted constraint fields to the canonical field."""
-        return _normalize_legacy_constraints(value)
+        return _normalize_legacy_constraints(value, preserve_unanswered=False)
 
     @field_validator("dietary_constraints")
     @classmethod
@@ -551,7 +598,7 @@ class ProfileUpdateEntities(BaseModel):
     @classmethod
     def normalize_legacy_constraints(cls, value: Any) -> Any:
         """Map legacy profile-update fields to the canonical field."""
-        return _normalize_legacy_constraints(value)
+        return _normalize_legacy_constraints(value, preserve_unanswered=True)
 
     @field_validator(
         "dietary_constraints",
@@ -562,16 +609,10 @@ class ProfileUpdateEntities(BaseModel):
     @classmethod
     def normalize_no_value_phrase(cls, value: Any, info: ValidationInfo) -> Any:
         """Convert explicit no-value answers to empty lists."""
-        if not isinstance(value, str):
-            return value
-        normalized = value.strip().casefold().rstrip(".!?,;:")
         field_name = info.field_name
         if field_name is None:
             return value
-        no_value_phrases = (
-            _GENERIC_NO_VALUE_PHRASES | (_FIELD_NO_VALUE_PHRASES[field_name])
-        )
-        return [] if normalized in no_value_phrases else value
+        return [] if _is_no_value_phrase(value, field_name) else value
 
     @field_validator("dietary_constraints")
     @classmethod
