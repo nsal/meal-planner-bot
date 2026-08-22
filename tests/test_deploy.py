@@ -489,6 +489,38 @@ def test_telegram_failure_identifies_successful_aws_deployment() -> None:
     assert "--post-deploy-only" in message
 
 
+def test_telegram_webhook_error_formats_historical_delivery_date() -> None:
+    class HistoricalErrorTelegram(FakeTelegram):
+        def get_webhook_info(self) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "result": {
+                    "url": "https://example/webhook",
+                    "last_error_message": (
+                        "Wrong response from the webhook: 503 "
+                        "Service Unavailable"
+                    ),
+                    "last_error_date": 1787220412,
+                },
+            }
+
+    with pytest.raises(deploy.PostDeploymentError) as error:
+        deploy.run_deployment(
+            _settings(),
+            deploy.DeploymentOptions(post_deploy_only=True),
+            runner=FakeRunner(),
+            input_fn=lambda _: "yes",
+            api_factory=HistoricalErrorTelegram,
+        )
+
+    message = str(error.value)
+    assert (
+        "last_error_message=Wrong response from the webhook: "
+        "503 Service Unavailable"
+    ) in message
+    assert "last_error_date=2026-08-20 10:06:52 UTC" in message
+
+
 def test_readme_documents_runner_contract() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
 

@@ -15,6 +15,7 @@ import tempfile
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, NoReturn, Self
 
@@ -812,7 +813,22 @@ def configure_telegram(
     if result.get("url") != outputs.webhook_url:
         raise DeploymentError("Telegram webhook URL verification failed")
     if result.get("last_error_message"):
-        raise DeploymentError("Telegram webhook reports an error")
+        error_message = result["last_error_message"]
+        error_date = result.get("last_error_date")
+        if isinstance(error_date, int) and not isinstance(error_date, bool):
+            try:
+                formatted_error_date = datetime.fromtimestamp(
+                    error_date, tz=timezone.utc
+                ).strftime("%Y-%m-%d %H:%M:%S UTC")
+            except OverflowError, OSError, ValueError:
+                formatted_error_date = str(error_date)
+        else:
+            formatted_error_date = str(error_date)
+        raise DeploymentError(
+            "Telegram webhook reports an error: "
+            f"last_error_message={error_message}, "
+            f"last_error_date={formatted_error_date}"
+        )
 
 
 def run_deployment(
