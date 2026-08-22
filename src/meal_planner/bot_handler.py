@@ -57,18 +57,15 @@ from meal_planner.planner_handler import (
     REVISE_PLAN,
 )
 from meal_planner.router import (
+    MealCallback,
     ProfileCallback,
     ProfileCallbackAction,
     RouteResult,
     RouteType,
     parse_checkin_callback,
-    parse_profile_callback,
-    MealCallback,
-    RouteResult,
-    RouteType,
-    parse_checkin_callback,
     parse_meal_callback,
     parse_meal_input,
+    parse_profile_callback,
     route_update,
 )
 from meal_planner.telegram.access import TelegramAccessPolicy
@@ -756,15 +753,24 @@ class BotHandler:
                 )
             if callback.action.value == "cancel":
                 return self._cancel_meal_callback(
-                    route.chat_id, route.user_id, state
+                    route.chat_id,
+                    route.user_id,
+                    state,
+                    callback.submission_id,
                 )
             if callback.action.value == "add":
                 return self._add_meal_callback(
-                    route.chat_id, route.user_id, state
+                    route.chat_id,
+                    route.user_id,
+                    state,
+                    callback.submission_id,
                 )
             if callback.action.value == "done":
                 return self._done_meal_callback(
-                    route.chat_id, route.user_id, state
+                    route.chat_id,
+                    route.user_id,
+                    state,
+                    callback.submission_id,
                 )
         except Exception:
             logger.exception("Error handling meal callback")
@@ -801,7 +807,9 @@ class BotHandler:
                 state.step
                 is ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
             ):
-                self._send_meal_message(chat_id, "That meal was already saved.")
+                self._send_saved_meal_continuation(
+                    chat_id, state, submission_id
+                )
                 return "Already saved"
             self._send_stale_meal_action(chat_id)
             return "Stale meal action"
@@ -861,13 +869,34 @@ class BotHandler:
             is ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
             and current.request_id == submission_id
         ):
-            self._send_meal_message(chat_id, "That meal was already saved.")
+            self._send_saved_meal_continuation(chat_id, current, submission_id)
             return "Already saved"
         self._send_stale_meal_action(chat_id)
         return "Stale meal action"
 
+    def _send_saved_meal_continuation(
+        self,
+        chat_id: int | str,
+        state: ConversationState,
+        submission_id: str,
+    ) -> None:
+        """Retry saved-meal delivery with its continuation controls."""
+        if state.meal_draft is None or state.meal_draft.description is None:
+            self._send_stale_meal_action(chat_id)
+            return
+        try:
+            self.telegram_api.send_meal_saved(
+                chat_id, state.meal_draft.description, submission_id
+            )
+        except TelegramAPIError:
+            logger.error("Already-saved meal delivery failed")
+
     def _cancel_meal_callback(
-        self, chat_id: int | str, user_id: str, state: ConversationState
+        self,
+        chat_id: int | str,
+        user_id: str,
+        state: ConversationState,
+        submission_id: str,
     ) -> str:
         """Discard an unconfirmed meal only at its observed revision."""
         if (
@@ -878,7 +907,12 @@ class BotHandler:
             return "Stale meal action"
         try:
             deleted = self.repo.delete_conversation_state(
-                user_id, expected_revision=state.revision
+                user_id,
+                expected_revision=state.revision,
+                expected_request_id=submission_id,
+                expected_step=(
+                    ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION
+                ),
             )
         except Exception:
             logger.exception("Meal cancellation persistence failed")
@@ -894,7 +928,11 @@ class BotHandler:
         return "Meal cancelled"
 
     def _add_meal_callback(
-        self, chat_id: int | str, user_id: str, state: ConversationState
+        self,
+        chat_id: int | str,
+        user_id: str,
+        state: ConversationState,
+        submission_id: str,
     ) -> str:
         """Start another empty submission after a confirmed meal."""
         if (
@@ -903,16 +941,20 @@ class BotHandler:
         ):
             self._send_stale_meal_action(chat_id)
             return "Stale meal action"
-        now = datetime.now(timezone.utc)
         next_state = self._new_submission_state().model_copy(
             update={
                 "revision": state.revision + 1,
-                "updated_at": now,
             }
         )
         try:
             transitioned = self.repo.transition_conversation_state(
-                user_id, next_state, expected_revision=state.revision
+                user_id,
+                next_state,
+                expected_revision=state.revision,
+                expected_request_id=submission_id,
+                expected_step=(
+                    ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+                ),
             )
         except Exception:
             logger.exception("Starting another meal persistence failed")
@@ -928,7 +970,11 @@ class BotHandler:
         return "Add more"
 
     def _done_meal_callback(
-        self, chat_id: int | str, user_id: str, state: ConversationState
+        self,
+        chat_id: int | str,
+        user_id: str,
+        state: ConversationState,
+        submission_id: str,
     ) -> str:
         """Finish meal logging after the current meal has been saved."""
         if (
@@ -939,7 +985,12 @@ class BotHandler:
             return "Stale meal action"
         try:
             deleted = self.repo.delete_conversation_state(
-                user_id, expected_revision=state.revision
+                user_id,
+                expected_revision=state.revision,
+                expected_request_id=submission_id,
+                expected_step=(
+                    ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+                ),
             )
         except Exception:
             logger.exception("Completing meal workflow persistence failed")
@@ -1085,6 +1136,7 @@ class BotHandler:
                 "Sorry, I couldn't process that request. Please try again.",
             )
 
+    @staticmethod
     def _parse_profile_name_calories(
         text: str,
     ) -> tuple[str, int] | None:

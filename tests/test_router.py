@@ -1,23 +1,53 @@
 """Telegram update and callback routing tests."""
 
+import os
+import subprocess
+import sys
 from datetime import date
+from pathlib import Path
 from uuid import UUID
 
 import pytest
 
 from meal_planner.models.schemas import MealOutcome, MealType
 from meal_planner.router import (
-    ProfileCallbackAction,
-    RouteType,
-    parse_checkin_callback,
-    parse_profile_callback,
     MealCallbackAction,
+    ProfileCallbackAction,
     RouteType,
     parse_checkin_callback,
     parse_meal_callback,
     parse_meal_input,
+    parse_profile_callback,
     route_update,
 )
+
+
+def test_router_imports_before_any_telegram_modules() -> None:
+    """Importing the router first works in a clean Python interpreter."""
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(source_root)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys\n"
+                "assert not any(\n"
+                "    name == 'meal_planner.telegram' or "
+                "name.startswith('meal_planner.telegram.')\n"
+                "    for name in sys.modules\n"
+                ")\n"
+                "import meal_planner.router\n"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_route_command_and_conversation() -> None:
@@ -222,6 +252,26 @@ def test_parse_meal_input_reports_field_specific_errors(
     assert result.draft is None
     assert result.errors
     assert all(isinstance(error, str) for error in result.errors)
+
+
+def test_parse_meal_input_accepts_maximum_description_length() -> None:
+    description = "x" * 500
+
+    result = parse_meal_input(f"today, lunch, {description}", date(2026, 8, 22))
+
+    assert result.is_valid
+    assert result.draft is not None
+    assert result.draft.description == description
+
+
+def test_parse_meal_input_reports_overlong_description_error() -> None:
+    description = "x" * 501
+
+    result = parse_meal_input(f"today, lunch, {description}", date(2026, 8, 22))
+
+    assert not result.is_valid
+    assert result.draft is None
+    assert result.errors == ("description must be 500 characters or fewer",)
 
 
 @pytest.mark.parametrize(

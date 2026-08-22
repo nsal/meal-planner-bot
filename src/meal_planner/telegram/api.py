@@ -10,6 +10,7 @@ from uuid import UUID
 
 from meal_planner.models.schemas import (
     GrocerySection,
+    MealCallbackAction,
     MealOutcome,
     PlannedMeal,
     ProfileEditCategory,
@@ -17,7 +18,6 @@ from meal_planner.models.schemas import (
     UserProfile,
     WeeklyPlan,
 )
-from meal_planner.router import MealCallbackAction
 from meal_planner.telegram.commands import (
     BOT_COMMANDS,
     TelegramCommand,
@@ -384,7 +384,6 @@ class TelegramAPI:
             ]
         }
         return self.send_message(chat_id, prompt, reply_markup=keyboard)
-
 
     def send_meal_review(
         self,

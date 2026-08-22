@@ -9,13 +9,12 @@ from uuid import UUID
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from meal_planner.models.schemas import (
+    MealCallbackAction,
+    MealLogDraft,
     MealOutcome,
     MealType,
     ProfileEditCategory,
     ProfileEditOperation,
-    MealLogDraft,
-    MealOutcome,
-    MealType,
 )
 from meal_planner.telegram.commands import BOT_COMMANDS
 
@@ -96,15 +95,6 @@ class ProfileCallback(BaseModel):
         return self
 
 
-class MealCallbackAction(str, Enum):
-    """Actions supported by the single-meal submission keyboard."""
-
-    CONFIRM = "confirm"
-    CANCEL = "cancel"
-    ADD = "add"
-    DONE = "done"
-
-
 class MealCallback(BaseModel):
     """Validated callback payload for one staged meal submission."""
 
@@ -183,6 +173,8 @@ def parse_meal_input(
 
     if not description:
         errors.append("description is required")
+    elif len(description) > 500:
+        errors.append("description must be 500 characters or fewer")
 
     if errors or parsed_date is None or parsed_meal_type is None:
         return MealInputParseResult(errors=tuple(errors))

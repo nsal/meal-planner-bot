@@ -299,7 +299,6 @@ def test_conversation_state_validates_workflow_shape_and_expiry() -> None:
         )
 
 
-
 def _conversation_state_values() -> dict[str, object]:
     """Return valid common values for conversation-state tests."""
     now = datetime.now(timezone.utc)
@@ -480,7 +479,6 @@ def test_plan_preference_can_be_retained_while_awaiting_clarification() -> None:
     )
 
     assert state.preference == "eggs three times, make it healthy"
-
 
 
 @pytest.mark.parametrize(

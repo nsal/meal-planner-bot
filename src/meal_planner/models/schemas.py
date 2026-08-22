@@ -249,6 +249,15 @@ class PreferenceRequirement(BaseModel):
         return self
 
 
+class MealCallbackAction(str, Enum):
+    """Actions supported by the single-meal submission keyboard."""
+
+    CONFIRM = "confirm"
+    CANCEL = "cancel"
+    ADD = "add"
+    DONE = "done"
+
+
 class ConversationWorkflowKind(str, Enum):
     """Kinds of durable, multi-turn conversation workflows."""
 
@@ -349,7 +358,6 @@ class ConversationState(BaseModel):
             if (
                 self.preference is not None
                 or self.requirements
-                or self.request_id is not None
                 or self.profile_category is not None
                 or self.profile_operation is not None
                 or self.amendment is not None
