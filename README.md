@@ -242,6 +242,12 @@ Secrets Manager secrets exist, runs `sam validate --lint` and
 the required stack outputs, registers the canonical Telegram command menu,
 sets the webhook, and verifies the webhook:
 
+Webhook verification confirms that Telegram reports the exact deployed
+`WebhookUrl`. Telegram can retain delivery error metadata from an earlier
+attempt; that metadata is reported as a warning and does not by itself fail
+the deployment. For an actual delivery problem, inspect the current webhook
+status and the Bot Lambda logs.
+
 The routine announcements are, in order:
 
 1. Check deployment prerequisites.
@@ -292,6 +298,10 @@ and webhook verification. It announces and skips secret checks, SAM
 validation, SAM building, deployment, and IAM simulation; it never checks or
 changes secrets. The same recovery mode can be used after a Telegram API
 failure without repeating an AWS deployment.
+Recovery uses the same webhook contract: verification requires Telegram's
+reported URL to match the deployed `WebhookUrl`; retained delivery errors are
+warnings, while current delivery problems require inspecting the current
+webhook status and Bot Lambda logs.
 The stack outputs `WebhookUrl`, `MealPlannerTableName`, `BotFunctionName`, and
 `PlannerFunctionName`; malformed or missing outputs are failures. The direct
 read-only IAM verifier remains available as a troubleshooting command and
@@ -457,8 +467,10 @@ non-empty section before it can become ready.
 - Incomplete profile updates are retained as a draft, including household
   size and partial member targets, so the next turn can finish onboarding
   without resubmitting known fields.
-- Telegram delivery failure: check the endpoint status in logs; logs omit bot
-  tokens and message content.
+- Telegram delivery failure: inspect the current webhook status and the Bot
+  Lambda logs; logs omit bot tokens and message content. Retained historical
+  delivery metadata is a warning during webhook verification, not a substitute
+  for checking current delivery behavior.
 - SAM smoke-test failure: rerun a clean SAM build. Tests reject stale source or
   generated templates.
 - Timeout failures: keep configured request timeouts below Lambda deadlines;

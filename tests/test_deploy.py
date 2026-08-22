@@ -1,6 +1,7 @@
 """Unit tests for the safe local deployment orchestrator."""
 
 import json
+import logging
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -149,6 +150,106 @@ class FakeTelegram:
     def get_webhook_info(self) -> dict[str, Any]:
         self.calls.append("get-webhook")
         return {"ok": True, "result": {"url": "https://example/webhook"}}
+
+
+def _stack_outputs() -> deploy.StackOutputs:
+    return deploy.StackOutputs(
+        webhook_url="https://example/webhook",
+        table_name="meal-planner-test-table",
+        bot_function_name="meal-planner-test-bot",
+        planner_function_name="meal-planner-test-planner",
+    )
+
+
+def test_configure_telegram_tolerates_historical_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class HistoricalErrorTelegram(FakeTelegram):
+        def get_webhook_info(self) -> dict[str, Any]:
+            self.calls.append("get-webhook")
+            return {
+                "ok": True,
+                "result": {
+                    "url": "https://example/webhook",
+                    "last_error_message": (
+                        "503 Service Unavailable bot-secret webhook-secret "
+                        "llm-secret"
+                    ),
+                    "last_error_date": 1_755_683_212,
+                },
+            }
+
+    settings = _settings()
+    FakeTelegram.calls = []
+
+    with caplog.at_level(logging.WARNING, logger="scripts.deploy"):
+        deploy.configure_telegram(
+            settings,
+            _stack_outputs(),
+            api_factory=HistoricalErrorTelegram,
+        )
+
+    warnings = [
+        record for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "503 Service Unavailable" in warnings[0].message
+    assert "last_error_date=1755683212" in warnings[0].message
+    assert all(
+        secret not in warnings[0].message for secret in settings.secret_values
+    )
+    assert FakeTelegram.calls == ["commands", "set-webhook", "get-webhook"]
+
+
+def test_configure_telegram_rejects_malformed_webhook_result() -> None:
+    class MalformedTelegram(FakeTelegram):
+        def get_webhook_info(self) -> dict[str, Any]:
+            self.calls.append("get-webhook")
+            return {"ok": True, "result": None}
+
+    with pytest.raises(
+        deploy.DeploymentError, match="malformed Telegram webhook response"
+    ):
+        deploy.configure_telegram(
+            _settings(),
+            _stack_outputs(),
+            api_factory=MalformedTelegram,
+        )
+
+
+def test_configure_telegram_rejects_webhook_url_mismatch() -> None:
+    class MismatchedTelegram(FakeTelegram):
+        def get_webhook_info(self) -> dict[str, Any]:
+            self.calls.append("get-webhook")
+            return {
+                "ok": True,
+                "result": {"url": "https://example/different-webhook"},
+            }
+
+    with pytest.raises(
+        deploy.DeploymentError,
+        match="Telegram webhook URL verification failed",
+    ):
+        deploy.configure_telegram(
+            _settings(),
+            _stack_outputs(),
+            api_factory=MismatchedTelegram,
+        )
+
+
+def test_configure_telegram_preserves_telegram_api_errors() -> None:
+    class FailingTelegram(FakeTelegram):
+        def set_webhook(self, url: str, secret_token: str) -> dict[str, Any]:
+            raise deploy.TelegramAPIError("Telegram setWebhook failed")
+
+    with pytest.raises(
+        deploy.TelegramAPIError, match="Telegram setWebhook failed"
+    ):
+        deploy.configure_telegram(
+            _settings(),
+            _stack_outputs(),
+            api_factory=FailingTelegram,
+        )
 
 
 def test_settings_load_env_file_and_environment_override(
@@ -491,6 +592,7 @@ def test_telegram_failure_identifies_successful_aws_deployment() -> None:
 
 def test_readme_documents_runner_contract() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
+    normalized_readme = " ".join(readme.split())
 
     assert "1. Check deployment prerequisites" in readme
     assert "7. AWS deployment completed" in readme
@@ -498,3 +600,13 @@ def test_readme_documents_runner_contract() -> None:
     assert "AWS deployment-completed boundary" in readme
     assert "--post-deploy-only" in readme
     assert "not part of routine, guided, or recovery deployment" in readme
+    assert "exact deployed `WebhookUrl`" in normalized_readme
+    assert (
+        "reported as a warning and does not by itself fail" in normalized_readme
+    )
+    assert "current webhook status and the Bot Lambda logs" in normalized_readme
+    assert (
+        "Retained historical delivery metadata is a warning"
+        in normalized_readme
+    )
+    assert "Recovery uses the same webhook contract" in normalized_readme
