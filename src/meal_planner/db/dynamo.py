@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from meal_planner.models.schemas import (
     ConversationState,
+    ConversationWorkflowKind,
     ConversationWorkflowStep,
     MealLogEntry,
     MealOutcome,
@@ -424,6 +425,92 @@ class DynamoRepository:
         try:
             self.table.meta.client.transact_write_items(
                 TransactItems=transact_items
+            )
+        except ClientError as exc:
+            if self._is_transaction_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def confirm_meal_and_transition(
+        self,
+        user_id: str,
+        entry: MealLogEntry,
+        state: ConversationState,
+        *,
+        expected_revision: int,
+        submission_id: str,
+    ) -> bool:
+        """Save one reviewed meal and advance its workflow atomically.
+
+        ``state`` is the state that should exist after confirmation.  The
+        transaction conditions its replacement on the prior state still
+        being the matching review step, revision, and submission.  The meal
+        key is derived from the submission ID so a retry cannot overwrite a
+        different meal or create a second item.
+        """
+        draft = state.meal_draft
+        if (
+            state.workflow_kind is not ConversationWorkflowKind.MEAL_LOG
+            or state.step
+            is not ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+            or draft is None
+            or state.request_id != submission_id
+            or state.revision != expected_revision + 1
+            or draft.date != entry.date
+            or draft.meal_type != entry.meal_type
+            or draft.description != entry.description
+        ):
+            return False
+
+        meal_item = {
+            "PK": f"USER#{user_id}",
+            "SK": (f"MEAL#{entry.date_key}#SUBMISSION#{submission_id}"),
+            **entry.model_dump(mode="json"),
+        }
+        state_item = {
+            **self._conversation_key(user_id),
+            **state.model_dump(mode="json"),
+        }
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": meal_item,
+                            "ConditionExpression": "attribute_not_exists(PK)",
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": state_item,
+                            "ConditionExpression": (
+                                "#workflow_kind = :meal_log "
+                                "AND #step = :awaiting_confirmation "
+                                "AND #revision = :expected_revision "
+                                "AND #request_id = :request_id"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#workflow_kind": "workflow_kind",
+                                "#step": "step",
+                                "#revision": "revision",
+                                "#request_id": "request_id",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":meal_log": (
+                                    ConversationWorkflowKind.MEAL_LOG.value
+                                ),
+                                ":awaiting_confirmation": (
+                                    ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION.value
+                                ),
+                                ":expected_revision": expected_revision,
+                                ":request_id": submission_id,
+                            },
+                        }
+                    },
+                ]
             )
         except ClientError as exc:
             if self._is_transaction_conditional_failure(exc):

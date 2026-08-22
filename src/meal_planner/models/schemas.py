@@ -107,6 +107,9 @@ class ConversationWorkflowKind(str, Enum):
 class ConversationWorkflowStep(str, Enum):
     """Steps supported by durable conversation workflows."""
 
+    AWAITING_MEAL_INPUT = "awaiting_meal_input"
+    AWAITING_MEAL_CONFIRMATION = "awaiting_meal_confirmation"
+    AWAITING_MEAL_CONTINUATION = "awaiting_meal_continuation"
     AWAITING_DATE = "awaiting_date"
     AWAITING_MEAL_TYPE = "awaiting_meal_type"
     AWAITING_DESCRIPTION = "awaiting_description"
@@ -137,7 +140,7 @@ class ConversationState(BaseModel):
         validation_alias=AliasChoices("target_week", "week_start"),
     )
     expected_plan_revision: int | None = Field(default=None, ge=0)
-    request_id: str | None = None
+    request_id: RequestId | None = None
     revision: int = Field(default=0, ge=0)
     created_at: datetime
     updated_at: datetime
@@ -166,6 +169,9 @@ class ConversationState(BaseModel):
     def validate_workflow_shape(self) -> "ConversationState":
         """Reject steps and fields that belong to another workflow."""
         meal_steps = {
+            ConversationWorkflowStep.AWAITING_MEAL_INPUT,
+            ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+            ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
             ConversationWorkflowStep.AWAITING_DATE,
             ConversationWorkflowStep.AWAITING_MEAL_TYPE,
             ConversationWorkflowStep.AWAITING_DESCRIPTION,
@@ -181,12 +187,41 @@ class ConversationState(BaseModel):
                 raise ValueError("meal workflows require a meal draft step")
             if (
                 self.preference is not None
-                or self.request_id is not None
                 or self.amendment is not None
                 or self.target_week is not None
                 or self.expected_plan_revision is not None
             ):
                 raise ValueError("meal workflows cannot contain plan fields")
+
+            draft_is_empty = (
+                self.meal_draft.date is None
+                and self.meal_draft.meal_type is None
+                and self.meal_draft.description is None
+            )
+            draft_is_complete = (
+                self.meal_draft.date is not None
+                and self.meal_draft.meal_type is not None
+                and self.meal_draft.description is not None
+            )
+            if self.step is ConversationWorkflowStep.AWAITING_MEAL_INPUT:
+                if self.request_id is None or not draft_is_empty:
+                    raise ValueError(
+                        "meal input states require an empty draft and "
+                        "request ID"
+                    )
+            elif self.step in {
+                ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+                ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+            }:
+                if self.request_id is None or not draft_is_complete:
+                    raise ValueError(
+                        "meal review states require a complete draft and "
+                        "request ID"
+                    )
+            elif self.request_id is not None:
+                raise ValueError(
+                    "legacy meal states cannot contain a request ID"
+                )
         elif self.workflow_kind is ConversationWorkflowKind.PLAN_REQUEST:
             if self.step not in plan_steps or self.request_id is None:
                 raise ValueError("plan workflows require a request ID step")
@@ -232,6 +267,12 @@ class ConversationState(BaseModel):
             )
         if self.workflow_kind is ConversationWorkflowKind.MEAL_LOG:
             assert self.meal_draft is not None
+            if self.step in {
+                ConversationWorkflowStep.AWAITING_MEAL_INPUT,
+                ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+                ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+            }:
+                return self
             expected_step = (
                 ConversationWorkflowStep.AWAITING_DATE
                 if self.meal_draft.date is None
