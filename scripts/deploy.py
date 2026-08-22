@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import secrets
@@ -44,6 +45,8 @@ LLM_REASONING_EFFORTS = (
 )
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MAX_COMMAND_DIAGNOSTIC_CHARS = 8_000
+
+logger = logging.getLogger(__name__)
 
 
 class DeploymentError(RuntimeError):
@@ -811,8 +814,16 @@ def configure_telegram(
         raise DeploymentError("malformed Telegram webhook response")
     if result.get("url") != outputs.webhook_url:
         raise DeploymentError("Telegram webhook URL verification failed")
-    if result.get("last_error_message"):
-        raise DeploymentError("Telegram webhook reports an error")
+    last_error_message = result.get("last_error_message")
+    if last_error_message:
+        warning = f"last_error_message={last_error_message!s}"
+        last_error_date = result.get("last_error_date")
+        if last_error_date is not None:
+            warning += f", last_error_date={last_error_date!s}"
+        logger.warning(
+            "Telegram webhook reports historical delivery metadata: %s",
+            _redact(warning, settings.secret_values),
+        )
 
 
 def run_deployment(
