@@ -6,6 +6,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Sequence
 from typing import Any
+from uuid import UUID
 
 from meal_planner.models.schemas import (
     GrocerySection,
@@ -16,6 +17,7 @@ from meal_planner.models.schemas import (
     UserProfile,
     WeeklyPlan,
 )
+from meal_planner.router import MealCallbackAction
 from meal_planner.telegram.commands import (
     BOT_COMMANDS,
     TelegramCommand,
@@ -29,6 +31,74 @@ MAX_MESSAGE_LENGTH = 4096
 
 class TelegramAPIError(RuntimeError):
     """A Telegram request failed or returned an unsuccessful response."""
+
+
+InlineKeyboard = dict[str, list[list[dict[str, str]]]]
+
+
+def _meal_callback_data(
+    action: MealCallbackAction,
+    submission_id: UUID | str,
+) -> str:
+    """Build a canonical, Telegram-safe callback for a meal submission."""
+    try:
+        canonical_id = str(UUID(str(submission_id)))
+    except (AttributeError, ValueError) as exc:
+        raise ValueError("submission_id must be a valid UUID") from exc
+    callback_data = f"meal:{action.value}:{canonical_id}"
+    if len(callback_data.encode("utf-8")) > 64:
+        raise ValueError("meal callback data exceeds Telegram's byte limit")
+    return callback_data
+
+
+def meal_review_keyboard(submission_id: UUID | str) -> InlineKeyboard:
+    """Return one-row Confirm and Cancel buttons for a staged meal."""
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "✅ Confirm",
+                    "callback_data": _meal_callback_data(
+                        MealCallbackAction.CONFIRM, submission_id
+                    ),
+                    "style": "success",
+                },
+                {
+                    "text": "❌ Cancel",
+                    "callback_data": _meal_callback_data(
+                        MealCallbackAction.CANCEL, submission_id
+                    ),
+                    "style": "danger",
+                },
+            ]
+        ]
+    }
+
+
+def meal_continuation_keyboard(
+    submission_id: UUID | str,
+) -> InlineKeyboard:
+    """Return one-row Add more and Done buttons after saving a meal."""
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "➕ Add more",
+                    "callback_data": _meal_callback_data(
+                        MealCallbackAction.ADD, submission_id
+                    ),
+                    "style": "primary",
+                },
+                {
+                    "text": "✅ Done",
+                    "callback_data": _meal_callback_data(
+                        MealCallbackAction.DONE, submission_id
+                    ),
+                    "style": "success",
+                },
+            ]
+        ]
+    }
 
 
 def split_text(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> list[str]:
@@ -314,6 +384,38 @@ class TelegramAPI:
             ]
         }
         return self.send_message(chat_id, prompt, reply_markup=keyboard)
+
+
+    def send_meal_review(
+        self,
+        chat_id: int | str,
+        submitted_text: str,
+        submission_id: UUID | str,
+    ) -> list[dict[str, Any]]:
+        """Echo a submitted meal and ask whether it should be saved."""
+        text = (
+            "Review this meal submission:\n"
+            f"{submitted_text}\n\n"
+            "Confirm to save it or cancel."
+        )
+        return self.send_message(
+            chat_id,
+            text,
+            reply_markup=meal_review_keyboard(submission_id),
+        )
+
+    def send_meal_saved(
+        self,
+        chat_id: int | str,
+        meal_description: str,
+        submission_id: UUID | str,
+    ) -> list[dict[str, Any]]:
+        """Report a saved meal and offer another submission or completion."""
+        return self.send_message(
+            chat_id,
+            f"✅ Meal saved: {meal_description}",
+            reply_markup=meal_continuation_keyboard(submission_id),
+        )
 
     def send_plan(
         self, chat_id: int | str, plan: WeeklyPlan

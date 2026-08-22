@@ -751,6 +751,205 @@ def _completed_meal_state(
     )
 
 
+def _review_meal_state(
+    *,
+    request_id: str = "123e4567-e89b-12d3-a456-426614174000",
+    revision: int = 0,
+    now: datetime | None = None,
+) -> ConversationState:
+    current = now or datetime.now(timezone.utc)
+    return ConversationState(
+        workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+        step=ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+        meal_draft=MealLogDraft(
+            date=date(2026, 8, 8),
+            meal_type="lunch",
+            description="Soup",
+        ),
+        request_id=request_id,
+        revision=revision,
+        created_at=current,
+        updated_at=current,
+        expires_at=current + timedelta(hours=24),
+    )
+
+
+def _continuation_meal_state(
+    review: ConversationState,
+) -> ConversationState:
+    return review.model_copy(
+        update={
+            "step": ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+            "revision": review.revision + 1,
+            "updated_at": review.updated_at + timedelta(seconds=1),
+        }
+    )
+
+
+def test_confirm_meal_atomically_writes_stable_key_and_continuation_state(
+    repo: DynamoRepository,
+) -> None:
+    review = _review_meal_state()
+    continuation = _continuation_meal_state(review)
+    assert repo.save_conversation_state("user", review)
+    entry = _meal(8, 12, "Soup")
+
+    assert repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        continuation,
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+    )
+
+    assert repo.get_conversation_state("user") == continuation
+    saved = repo.table.get_item(
+        Key={
+            "PK": "USER#user",
+            "SK": (
+                "MEAL#2026-08-08#SUBMISSION#"
+                "123e4567-e89b-12d3-a456-426614174000"
+            ),
+        }
+    )
+    assert saved["Item"]["description"] == "Soup"
+
+
+def test_confirm_meal_rejects_duplicate_submission_without_state_change(
+    repo: DynamoRepository,
+) -> None:
+    review = _review_meal_state()
+    continuation = _continuation_meal_state(review)
+    assert repo.save_conversation_state("user", review)
+    entry = _meal(8, 12, "Soup")
+    assert repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        continuation,
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+    )
+
+    duplicate_review = _review_meal_state(
+        request_id=review.request_id,
+        revision=2,
+    )
+    assert repo.save_conversation_state(
+        "user", duplicate_review, expected_revision=continuation.revision
+    )
+    duplicate_continuation = _continuation_meal_state(duplicate_review)
+
+    assert not repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        duplicate_continuation,
+        expected_revision=duplicate_review.revision,
+        submission_id=review.request_id,
+    )
+    assert repo.get_conversation_state("user") == duplicate_review
+    assert repo.get_meal_history("user", days=1, on_date=date(2026, 8, 8)) == [
+        entry
+    ]
+
+
+def test_confirm_meal_rejects_stale_revision_without_partial_write(
+    repo: DynamoRepository,
+) -> None:
+    review = _review_meal_state()
+    assert repo.save_conversation_state("user", review)
+    competing = review.model_copy(
+        update={
+            "revision": 1,
+            "updated_at": review.updated_at + timedelta(seconds=1),
+        }
+    )
+    assert repo.transition_conversation_state(
+        "user", competing, expected_revision=review.revision
+    )
+
+    assert not repo.confirm_meal_and_transition(
+        "user",
+        _meal(8, 12, "Stale meal"),
+        _continuation_meal_state(review),
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+    )
+    assert repo.get_conversation_state("user") == competing
+    assert repo.get_meal_history("user", days=1, on_date=date(2026, 8, 8)) == []
+
+
+@pytest.mark.parametrize(
+    "current_state, expected_revision, submission_id",
+    [
+        (
+            _review_meal_state(
+                request_id="123e4567-e89b-12d3-a456-426614174002"
+            ),
+            0,
+            "123e4567-e89b-12d3-a456-426614174000",
+        ),
+        (_completed_meal_state(), 0, "123e4567-e89b-12d3-a456-426614174000"),
+    ],
+)
+def test_confirm_meal_rejects_wrong_submission_or_step(
+    repo: DynamoRepository,
+    current_state: ConversationState,
+    expected_revision: int,
+    submission_id: str,
+) -> None:
+    assert repo.save_conversation_state("user", current_state)
+    continuation = _continuation_meal_state(
+        _review_meal_state(
+            request_id="123e4567-e89b-12d3-a456-426614174000",
+            revision=current_state.revision,
+            now=current_state.updated_at,
+        )
+    )
+
+    assert not repo.confirm_meal_and_transition(
+        "user",
+        _meal(8, 12, "Invalid confirmation"),
+        continuation,
+        expected_revision=expected_revision,
+        submission_id=submission_id,
+    )
+    assert repo.get_conversation_state("user") == current_state
+    assert repo.get_meal_history("user", days=1, on_date=date(2026, 8, 8)) == []
+
+
+def test_confirm_meal_propagates_transaction_contention(
+    repo: DynamoRepository, mocker: Any
+) -> None:
+    review = _review_meal_state()
+    assert repo.save_conversation_state("user", review)
+    error = ClientError(
+        {
+            "Error": {"Code": "TransactionCanceledException"},
+            "CancellationReasons": [
+                {"Code": "TransactionConflict"},
+                {"Code": "None"},
+            ],
+        },
+        "TransactWriteItems",
+    )
+    mocker.patch.object(
+        repo.table.meta.client, "transact_write_items", side_effect=error
+    )
+
+    with pytest.raises(ClientError) as raised:
+        repo.confirm_meal_and_transition(
+            "user",
+            _meal(8, 12, "Soup"),
+            _continuation_meal_state(review),
+            expected_revision=review.revision,
+            submission_id=review.request_id,
+        )
+
+    assert raised.value is error
+    assert repo.get_conversation_state("user") == review
+    assert repo.get_meal_history("user", days=1, on_date=date(2026, 8, 8)) == []
+
+
 def test_atomic_meal_and_state_transition_writes_one_meal_and_marker(
     repo: DynamoRepository,
 ) -> None:

@@ -23,9 +23,10 @@ the locked `uv` environment.
 
 ## Telegram workflows
 
-- `/submit_meals` starts guided actual-meal logging. It collects a date from
-  today through the previous seven days, a meal type, and a description one
-  at a time. Repeated meals of the same type and date are retained.
+- `/submit_meals` starts deterministic actual-meal logging. It first shows
+  meals recorded for UTC today and yesterday, then asks for one entry in the
+  form `when, meal type, what you ate`. Repeated meals of the same type and
+  date are retained.
 - `/checkin` shows buttons for cooked, skipped, or swapped outcomes on today's
   confirmed plan. `/submit_meals` does not require an active plan.
 - `/cancel` clears an unfinished meal or plan workflow. Starting `/submit_meals`
@@ -389,7 +390,7 @@ The Telegram command menu and `/help` show the same command reference:
 - `/plan` — Create or retry a weekly meal plan.
 - `/grocery` — View the active grocery list.
 - `/today` — View today's planned meals.
-- `/submit_meals` — Log meals eaten in the past week.
+- `/submit_meals` — Submit one meal eaten in the past seven UTC calendar days.
 - `/checkin` — Record today's planned meal outcomes.
 - `/cancel` — Cancel an unfinished workflow.
 
@@ -428,8 +429,32 @@ The Telegram command menu and `/help` show the same command reference:
   previous grocery attempt is in `error`; `pending` and `ready` are not reset.
 - `/grocery` reports `pending`, `ready`, or `error`, and shows ready sections.
 - `/today` shows the active confirmed plan's meals for today.
-- `/submit_meals` guides actual meal logging, including multiple meals of the
-  same type on one date. `/checkin` sends plan-specific buttons for `cooked`,
+- `/submit_meals` sends the recent history first, grouped under UTC `Today`
+  and `Yesterday`, followed by a separate input prompt. Enter exactly three
+  comma-separated fields:
+
+  ```text
+  when, meal type, what you ate
+  ```
+
+  Only the first two commas are separators, so later commas remain part of
+  the description. For `when`, use `today`, `yesterday`, or a strict
+  `YYYY-MM-DD` date. The bot interprets aliases and dates in UTC and accepts
+  only the inclusive seven-calendar-day range from six days ago through
+  today. The four valid meal types are `breakfast`, `lunch`, `snack`, and
+  `dinner`, case-insensitively. For example:
+
+  ```text
+  today, lunch, vegetable soup, with bread
+  ```
+
+  Invalid entries are rejected with an explanation and the full input
+  instructions again; they do not save anything. A valid entry is echoed in
+  a review message with `✅ Confirm` and `❌ Cancel`. Confirm saves exactly one
+  meal and shows `➕ Add more` and `✅ Done`; `Add more` starts another empty
+  submission, while `Done` ends meal logging. `Cancel` discards the
+  unconfirmed meal. Old or repeated buttons cannot change a newer submission
+  or save a duplicate. `/checkin` sends plan-specific buttons for `cooked`,
   `skipped`, and `swapped`. Old, draft, expired, malformed, and superseded
   overlapping-plan callbacks are rejected, even if the older plan still
   covers today.

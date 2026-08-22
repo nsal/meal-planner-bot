@@ -1,7 +1,10 @@
 """Telegram update message router."""
 
+import re
+from datetime import date, timedelta
 from enum import Enum
 from typing import Any
+from uuid import UUID
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
@@ -10,6 +13,9 @@ from meal_planner.models.schemas import (
     MealType,
     ProfileEditCategory,
     ProfileEditOperation,
+    MealLogDraft,
+    MealOutcome,
+    MealType,
 )
 from meal_planner.telegram.commands import BOT_COMMANDS
 
@@ -88,6 +94,130 @@ class ProfileCallback(BaseModel):
         if self.category is not None or self.operation is not None:
             raise ValueError("navigation callbacks cannot contain selections")
         return self
+
+
+class MealCallbackAction(str, Enum):
+    """Actions supported by the single-meal submission keyboard."""
+
+    CONFIRM = "confirm"
+    CANCEL = "cancel"
+    ADD = "add"
+    DONE = "done"
+
+
+class MealCallback(BaseModel):
+    """Validated callback payload for one staged meal submission."""
+
+    action: MealCallbackAction
+    submission_id: str
+
+
+class MealInputParseResult(BaseModel):
+    """Result of parsing one deterministic meal input message."""
+
+    draft: MealLogDraft | None = None
+    errors: tuple[str, ...] = ()
+
+    @property
+    def is_valid(self) -> bool:
+        """Return whether parsing produced a complete meal draft."""
+        return self.draft is not None and not self.errors
+
+
+_ISO_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def parse_meal_input(
+    text: str,
+    reference_date: date,
+) -> MealInputParseResult:
+    """Parse ``when, meal type, description`` without an LLM.
+
+    The first two commas delimit the fields. Any later commas belong to the
+    description. Date aliases are resolved against the supplied UTC calendar
+    date, and explicit dates may be no older than six days.
+    """
+    values = text.split(",", maxsplit=2)
+    if len(values) != 3:
+        return MealInputParseResult(
+            errors=(
+                "meal input must contain date, meal type, and description "
+                "separated by two commas",
+            )
+        )
+
+    when, meal_type_value, description = (value.strip() for value in values)
+    errors: list[str] = []
+
+    parsed_date: date | None = None
+    if not when:
+        errors.append("date is required")
+    elif when.casefold() == "today":
+        parsed_date = reference_date
+    elif when.casefold() == "yesterday":
+        parsed_date = reference_date - timedelta(days=1)
+    elif _ISO_DATE_PATTERN.fullmatch(when) is None:
+        errors.append("date must be YYYY-MM-DD")
+    else:
+        try:
+            parsed_date = date.fromisoformat(when)
+        except ValueError:
+            errors.append("date must be a real calendar date")
+
+    if parsed_date is not None:
+        if parsed_date > reference_date:
+            errors.append("date cannot be in the future")
+        elif parsed_date < reference_date - timedelta(days=6):
+            errors.append("date must be within the last 7 days")
+
+    parsed_meal_type: MealType | None = None
+    if not meal_type_value:
+        errors.append("meal type is required")
+    else:
+        try:
+            parsed_meal_type = MealType(meal_type_value.casefold())
+        except ValueError:
+            errors.append(
+                "meal type must be breakfast, lunch, snack, or dinner"
+            )
+
+    if not description:
+        errors.append("description is required")
+
+    if errors or parsed_date is None or parsed_meal_type is None:
+        return MealInputParseResult(errors=tuple(errors))
+
+    return MealInputParseResult(
+        draft=MealLogDraft(
+            date=parsed_date,
+            meal_type=parsed_meal_type,
+            description=description,
+        )
+    )
+
+
+def parse_meal_callback(data: str) -> MealCallback | None:
+    """Parse a meal action callback and enforce Telegram's byte limit."""
+    if len(data.encode("utf-8")) > MAX_CALLBACK_DATA_BYTES:
+        return None
+
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != "meal":
+        return None
+
+    try:
+        action = MealCallbackAction(parts[1])
+        submission_id = UUID(parts[2])
+    except TypeError, ValueError:
+        return None
+
+    if str(submission_id) != parts[2].lower():
+        return None
+
+    return MealCallback(
+        action=action,
+        submission_id=str(submission_id),
+    )
 
 
 def parse_checkin_callback(data: str) -> CheckinCallback | None:

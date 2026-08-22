@@ -1,5 +1,8 @@
 """Telegram update and callback routing tests."""
 
+from datetime import date
+from uuid import UUID
+
 import pytest
 
 from meal_planner.models.schemas import MealOutcome, MealType
@@ -8,6 +11,11 @@ from meal_planner.router import (
     RouteType,
     parse_checkin_callback,
     parse_profile_callback,
+    MealCallbackAction,
+    RouteType,
+    parse_checkin_callback,
+    parse_meal_callback,
+    parse_meal_input,
     route_update,
 )
 
@@ -153,6 +161,125 @@ def test_parse_plan_specific_checkin_callback() -> None:
     assert callback.day == 7
     assert callback.meal_type is MealType.DINNER
     assert callback.outcome is MealOutcome.SWAPPED
+
+
+@pytest.mark.parametrize(
+    ("submitted", "expected_date", "expected_type", "expected_description"),
+    [
+        (
+            "today, LUNCH, rice, beans, and salsa",
+            date(2026, 8, 22),
+            MealType.LUNCH,
+            "rice, beans, and salsa",
+        ),
+        (
+            "  YESTERDAY , breakfast , pancakes  ",
+            date(2026, 8, 21),
+            MealType.BREAKFAST,
+            "pancakes",
+        ),
+        (
+            "2026-08-16, Dinner, soup",
+            date(2026, 8, 16),
+            MealType.DINNER,
+            "soup",
+        ),
+    ],
+)
+def test_parse_meal_input_uses_first_two_commas_and_normalizes_values(
+    submitted: str,
+    expected_date: date,
+    expected_type: MealType,
+    expected_description: str,
+) -> None:
+    result = parse_meal_input(submitted, date(2026, 8, 22))
+
+    assert result.is_valid
+    assert result.draft is not None
+    assert result.draft.date == expected_date
+    assert result.draft.meal_type is expected_type
+    assert result.draft.description == expected_description
+    assert result.errors == ()
+
+
+@pytest.mark.parametrize(
+    "submitted",
+    [
+        "today, lunch",
+        "today lunch, lunch, soup",
+        "today, lunch,",
+        ", lunch, soup",
+        "today, , soup",
+        "today, lunch,   ",
+    ],
+)
+def test_parse_meal_input_reports_field_specific_errors(
+    submitted: str,
+) -> None:
+    result = parse_meal_input(submitted, date(2026, 8, 22))
+
+    assert not result.is_valid
+    assert result.draft is None
+    assert result.errors
+    assert all(isinstance(error, str) for error in result.errors)
+
+
+@pytest.mark.parametrize(
+    ("submitted", "expected_message"),
+    [
+        ("2026-08-22, lunch, soup", ""),
+        ("2026-08-16, lunch, soup", ""),
+        ("2026-08-15, lunch, soup", "date must be within the last 7 days"),
+        ("2026-08-23, lunch, soup", "date cannot be in the future"),
+        ("2026/08/22, lunch, soup", "date must be YYYY-MM-DD"),
+        ("2026-2-2, lunch, soup", "date must be YYYY-MM-DD"),
+        ("2026-02-30, lunch, soup", "date must be a real calendar date"),
+        (
+            "today, brunch, soup",
+            "meal type must be breakfast, lunch, snack, or dinner",
+        ),
+    ],
+)
+def test_parse_meal_input_validates_dates_and_meal_types(
+    submitted: str,
+    expected_message: str,
+) -> None:
+    result = parse_meal_input(submitted, date(2026, 8, 22))
+
+    if expected_message:
+        assert expected_message in result.errors
+    else:
+        assert result.is_valid
+
+
+@pytest.mark.parametrize("action", ["confirm", "cancel", "add", "done"])
+def test_parse_meal_callback_accepts_all_actions(action: str) -> None:
+    submission_id = "123e4567-e89b-12d3-a456-426614174000"
+
+    callback = parse_meal_callback(f"meal:{action}:{submission_id}")
+
+    assert callback is not None
+    assert callback.action is MealCallbackAction(action)
+    assert callback.submission_id == submission_id
+    assert UUID(callback.submission_id)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "meal:confirm:not-a-uuid",
+        "meal:unknown:123e4567-e89b-12d3-a456-426614174000",
+        "meal:confirm:123e4567-e89b-12d3-a456-426614174000:extra",
+        "checkin:2026-08-22:1:lunch:cooked",
+        "meal:confirm:",
+        "x" * 65,
+        "é" * 64,
+    ],
+)
+def test_parse_meal_callback_rejects_malformed_or_oversized_payload(
+    payload: str,
+) -> None:
+    assert parse_meal_callback(payload) is None
 
 
 @pytest.mark.parametrize(
