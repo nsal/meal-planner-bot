@@ -16,6 +16,7 @@ import tempfile
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, NoReturn, Self
 
@@ -819,7 +820,18 @@ def configure_telegram(
         warning = f"last_error_message={last_error_message!s}"
         last_error_date = result.get("last_error_date")
         if last_error_date is not None:
-            warning += f", last_error_date={last_error_date!s}"
+            if isinstance(last_error_date, int) and not isinstance(
+                last_error_date, bool
+            ):
+                try:
+                    formatted_error_date = datetime.fromtimestamp(
+                        last_error_date, tz=timezone.utc
+                    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+                except OverflowError, OSError, ValueError:
+                    formatted_error_date = str(last_error_date)
+            else:
+                formatted_error_date = str(last_error_date)
+            warning += f", last_error_date={formatted_error_date}"
         logger.warning(
             "Telegram webhook reports historical delivery metadata: %s",
             _redact(warning, settings.secret_values),
