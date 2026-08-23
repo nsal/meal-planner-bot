@@ -5,12 +5,17 @@ import json
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Generator
+from unittest.mock import call
 
 import boto3
 import pytest
 from moto import mock_aws
 
-from meal_planner.bot_handler import BotHandler, lambda_handler
+from meal_planner.bot_handler import (
+    MEAL_INPUT_PROMPT,
+    BotHandler,
+    lambda_handler,
+)
 from meal_planner.db.dynamo import ActivePlanSnapshot, DynamoRepository
 from meal_planner.models.schemas import (
     ConversationIntent,
@@ -20,7 +25,9 @@ from meal_planner.models.schemas import (
     FamilyMember,
     GroceryStatus,
     MealLogDraft,
+    MealLogEntry,
     MealOutcome,
+    MealType,
     PlanStatus,
     PreferenceRequirement,
     ProfileEditCategory,
@@ -229,7 +236,11 @@ def test_cancel_clears_active_profile_edit_state(
     ("command", "workflow_kind", "expected_text"),
     [
         ("plan", ConversationWorkflowKind.PLAN_REQUEST, "preference"),
-        ("submit_meals", ConversationWorkflowKind.MEAL_LOG, "what date"),
+        (
+            "submit_meals",
+            ConversationWorkflowKind.MEAL_LOG,
+            "submit one meal",
+        ),
     ],
 )
 def test_plan_and_submit_meals_replace_active_profile_edit(
@@ -1192,16 +1203,354 @@ def test_plan_command_collects_preference_before_generation(
 def test_submit_meals_starts_guided_logging_without_active_plan(
     handler: BotHandler,
 ) -> None:
-    """Actual meal logging is independent from planned check-in state."""
+    """Meal logging starts with history and one structured input prompt."""
     handler.repo.get_conversation_state.return_value = None
+    handler.repo.get_meal_history.return_value = []
+    handler.repo.save_conversation_state.return_value = True
 
     handler.handle_command(_command("submit_meals"))
 
     handler.repo.get_active_plan.assert_not_called()
+    handler.repo.get_meal_history.assert_called_once_with(
+        "user", days=2, on_date=date.today()
+    )
     saved = handler.repo.save_conversation_state.call_args.args[1]
     assert saved.workflow_kind is ConversationWorkflowKind.MEAL_LOG
-    assert saved.step is ConversationWorkflowStep.AWAITING_DATE
-    assert "What date" in handler.telegram_api.send_message.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_MEAL_INPUT
+    assert saved.meal_draft == MealLogDraft()
+    assert saved.request_id
+    assert handler.telegram_api.send_message.call_count == 2
+    messages = [
+        call.args[1]
+        for call in handler.telegram_api.send_message.call_args_list
+    ]
+    assert "Today" in messages[0]
+    assert "No meals submitted." in messages[0]
+    assert "Yesterday" in messages[0]
+    assert "YYYY-MM-DD" in messages[1]
+    assert "today" in messages[1].lower()
+    assert "yesterday" in messages[1].lower()
+    assert "breakfast" in messages[1].lower()
+    assert "lunch" in messages[1].lower()
+    assert "snack" in messages[1].lower()
+    assert "dinner" in messages[1].lower()
+
+
+def test_submit_meals_groups_history_in_recent_first_order(
+    handler: BotHandler,
+) -> None:
+    reference = date(2026, 8, 22)
+    handler.repo.get_conversation_state.return_value = None
+    handler.repo.save_conversation_state.return_value = True
+    handler.repo.get_meal_history.return_value = [
+        MealLogEntry(
+            date=reference - timedelta(days=1),
+            meal_type=MealType.DINNER,
+            description="Yesterday dinner",
+            created_at=datetime(2026, 8, 22, 1, tzinfo=timezone.utc),
+        ),
+        MealLogEntry(
+            date=reference,
+            meal_type=MealType.BREAKFAST,
+            description="Today breakfast",
+            created_at=datetime(2026, 8, 22, 2, tzinfo=timezone.utc),
+        ),
+        MealLogEntry(
+            date=reference,
+            meal_type=MealType.LUNCH,
+            description="Today lunch",
+            created_at=datetime(2026, 8, 22, 3, tzinfo=timezone.utc),
+        ),
+    ]
+    command = RouteResult(
+        route_type=RouteType.COMMAND,
+        chat_id=1,
+        user_id="user",
+        command="submit_meals",
+        raw_update={"message": {"date": 1787356800}},
+    )
+
+    handler.handle_command(command)
+
+    history = handler.telegram_api.send_message.call_args_list[0].args[1]
+    assert history.index("Today") < history.index("Yesterday")
+    assert history.index("Today lunch") < history.index("Today breakfast")
+    assert "Today dinner" not in history
+    assert "Yesterday dinner" in history
+    handler.repo.get_meal_history.assert_called_once_with(
+        "user", days=2, on_date=reference
+    )
+
+
+def test_submit_meals_uses_utc_date_at_midnight(
+    handler: BotHandler,
+) -> None:
+    handler.repo.get_conversation_state.return_value = None
+    handler.repo.get_meal_history.return_value = []
+    handler.repo.save_conversation_state.return_value = True
+    reference = datetime(2026, 8, 23, tzinfo=timezone.utc)
+    command = RouteResult(
+        route_type=RouteType.COMMAND,
+        chat_id=1,
+        user_id="user",
+        command="submit_meals",
+        raw_update={"message": {"date": int(reference.timestamp())}},
+    )
+
+    handler.handle_command(command)
+
+    handler.repo.get_meal_history.assert_called_once_with(
+        "user", days=2, on_date=date(2026, 8, 23)
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_update",
+    [
+        {"message": {}},
+        {"message": {"date": "not-a-timestamp"}},
+        {"message": {"date": None}},
+    ],
+)
+def test_submit_meals_uses_utc_processing_date_for_missing_or_invalid_timestamp(
+    handler: BotHandler, raw_update: dict[str, Any], mocker: Any
+) -> None:
+    handler.repo.get_conversation_state.return_value = None
+    handler.repo.get_meal_history.return_value = []
+    handler.repo.save_conversation_state.return_value = True
+    current = datetime(2026, 8, 22, 23, 30, tzinfo=timezone.utc)
+    handler_datetime = mocker.patch("meal_planner.bot_handler.datetime")
+    handler_datetime.now.return_value = current
+    handler_datetime.side_effect = datetime
+    command = RouteResult(
+        route_type=RouteType.COMMAND,
+        chat_id=1,
+        user_id="user",
+        command="submit_meals",
+        raw_update=raw_update,
+    )
+
+    handler.handle_command(command)
+
+    handler.repo.get_meal_history.assert_called_once_with(
+        "user", days=2, on_date=date(2026, 8, 22)
+    )
+
+
+def test_submit_meals_reports_replaced_workflow(
+    handler: BotHandler,
+) -> None:
+    handler.repo.get_conversation_state.return_value = handler._new_plan_state()
+    handler.repo.get_meal_history.return_value = []
+    handler.repo.save_conversation_state.return_value = True
+
+    handler.handle_command(_command("submit_meals"))
+
+    messages = [
+        call.args[1]
+        for call in handler.telegram_api.send_message.call_args_list
+    ]
+    assert len(messages) == 2
+    assert any("replaced" in message.lower() for message in messages)
+
+
+def test_submit_meals_reports_state_contention_without_sending_prompt(
+    handler: BotHandler,
+) -> None:
+    handler.repo.get_conversation_state.return_value = handler._new_plan_state()
+    handler.repo.save_conversation_state.return_value = False
+
+    handler.handle_command(_command("submit_meals"))
+
+    handler.repo.get_meal_history.assert_not_called()
+    handler.telegram_api.send_message.assert_called_once()
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "changed" in message.lower()
+    assert "try again" in message.lower()
+
+
+@pytest.mark.parametrize(
+    ("submitted", "expected_date", "expected_type"),
+    [
+        ("today, breakfast, oatmeal", date(2026, 8, 22), MealType.BREAKFAST),
+        ("YESTERDAY, Lunch, soup", date(2026, 8, 21), MealType.LUNCH),
+        (
+            "2026-08-16, SNACK, fruit, with yogurt",
+            date(2026, 8, 16),
+            MealType.SNACK,
+        ),
+        ("2026-08-22, dinner, pasta", date(2026, 8, 22), MealType.DINNER),
+    ],
+)
+def test_structured_meal_input_reviews_without_persisting(
+    handler: BotHandler,
+    submitted: str,
+    expected_date: date,
+    expected_type: MealType,
+) -> None:
+    state = handler._new_submission_state()
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.transition_conversation_state.return_value = True
+    reference = datetime(2026, 8, 22, 12, tzinfo=timezone.utc)
+    route = RouteResult(
+        route_type=RouteType.CONVERSATIONAL,
+        chat_id=1,
+        user_id="user",
+        text=submitted,
+        raw_update={"message": {"date": int(reference.timestamp())}},
+    )
+
+    handler.handle_conversational(route)
+
+    candidate = handler.repo.transition_conversation_state.call_args.args[1]
+    assert candidate.step is ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION
+    assert candidate.meal_draft is not None
+    assert candidate.meal_draft.date == expected_date
+    assert candidate.meal_draft.meal_type is expected_type
+    assert (
+        candidate.meal_draft.description == submitted.split(",", 2)[2].strip()
+    )
+    handler.repo.transition_conversation_state.assert_called_once_with(
+        "user", candidate, expected_revision=state.revision
+    )
+    handler.telegram_api.send_meal_review.assert_called_once_with(
+        1, submitted, state.request_id
+    )
+    handler.repo.log_meal.assert_not_called()
+    handler.repo.log_meal_and_transition.assert_not_called()
+    handler.repo.get_profile.assert_not_called()
+    handler.repo.get_profile_draft.assert_not_called()
+    handler.repo.get_latest_plan.assert_not_called()
+    handler.repo.get_meal_history.assert_not_called()
+    handler.llm_client.chat_sync.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("submitted", "explanation"),
+    [
+        ("today, lunch", "two commas"),
+        ("2026-08-23, lunch, soup", "future"),
+        ("2026-08-15, lunch, soup", "last 7 days"),
+        ("2026-99-01, lunch, soup", "real calendar date"),
+        ("today, brunch, soup", "meal type"),
+        ("today, lunch, ", "description is required"),
+    ],
+)
+def test_invalid_structured_meal_input_explains_error_and_repeats_prompt(
+    handler: BotHandler,
+    submitted: str,
+    explanation: str,
+) -> None:
+    state = handler._new_submission_state()
+    handler.repo.get_conversation_state.return_value = state
+    route = RouteResult(
+        route_type=RouteType.CONVERSATIONAL,
+        chat_id=1,
+        user_id="user",
+        text=submitted,
+        raw_update={
+            "message": {
+                "date": int(
+                    datetime(2026, 8, 22, tzinfo=timezone.utc).timestamp()
+                )
+            }
+        },
+    )
+
+    handler.handle_conversational(route)
+
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert explanation.lower() in message.lower()
+    assert "Submit one meal using this format:" in message
+    assert "today or yesterday" in message
+    assert "breakfast, lunch, snack, or dinner" in message
+    handler.repo.transition_conversation_state.assert_not_called()
+    handler.repo.log_meal.assert_not_called()
+    assert handler.repo.get_profile.call_count == 0
+    handler.repo.get_profile_draft.assert_not_called()
+    handler.repo.get_latest_plan.assert_not_called()
+    handler.repo.get_meal_history.assert_not_called()
+    handler.llm_client.chat_sync.assert_not_called()
+
+
+def test_overlong_structured_meal_input_reports_specific_error_and_prompt(
+    handler: BotHandler,
+) -> None:
+    state = handler._new_submission_state()
+    handler.repo.get_conversation_state.return_value = state
+    submitted = f"today, lunch, {'x' * 501}"
+    route = RouteResult(
+        route_type=RouteType.CONVERSATIONAL,
+        chat_id=1,
+        user_id="user",
+        text=submitted,
+        raw_update={
+            "message": {
+                "date": int(
+                    datetime(2026, 8, 22, tzinfo=timezone.utc).timestamp()
+                )
+            }
+        },
+    )
+
+    handler.handle_conversational(route)
+
+    message = handler.telegram_api.send_message.call_args.args[1]
+    error, prompt = message.split("\n\n", maxsplit=1)
+    assert error == "description must be 500 characters or fewer"
+    assert prompt == MEAL_INPUT_PROMPT
+    handler.repo.transition_conversation_state.assert_not_called()
+    handler.repo.log_meal.assert_not_called()
+    handler.repo.log_meal_and_transition.assert_not_called()
+    handler.llm_client.chat_sync.assert_not_called()
+
+
+def test_structured_input_uses_message_timestamp_for_utc_date_reference(
+    handler: BotHandler,
+) -> None:
+    state = handler._new_submission_state()
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.transition_conversation_state.return_value = True
+    reference = datetime(2026, 8, 22, 23, 59, tzinfo=timezone.utc)
+    route = RouteResult(
+        route_type=RouteType.CONVERSATIONAL,
+        chat_id=1,
+        user_id="user",
+        text="2026-08-16, lunch, soup",
+        raw_update={"message": {"date": int(reference.timestamp())}},
+    )
+
+    handler.handle_conversational(route)
+
+    candidate = handler.repo.transition_conversation_state.call_args.args[1]
+    assert candidate.meal_draft is not None
+    assert candidate.meal_draft.date == date(2026, 8, 16)
+
+
+def test_legacy_meal_state_is_conditionally_cleared_and_requires_restart(
+    handler: BotHandler,
+) -> None:
+    state = handler._new_meal_state()
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.delete_conversation_state.return_value = True
+    route = RouteResult(
+        route_type=RouteType.CONVERSATIONAL,
+        chat_id=1,
+        user_id="user",
+        text="lunch, soup",
+    )
+
+    handler.handle_conversational(route)
+
+    handler.repo.delete_conversation_state.assert_called_once_with(
+        "user", expected_revision=state.revision
+    )
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "/submit_meals" in message
+    assert "restart" in message.lower()
+    handler.repo.get_profile.assert_not_called()
+    handler.repo.get_meal_history.assert_not_called()
+    handler.llm_client.chat_sync.assert_not_called()
 
 
 def test_guided_meal_workflow_revalidates_draft_across_separate_updates(
@@ -2820,6 +3169,382 @@ def test_callback_rejects_old_missing_and_persistence_failure(
     handler.handle_callback(old_route)
     handler.repo.update_meal_outcome.assert_not_called()
     handler.telegram_api.answer_callback_query.assert_called_once()
+
+
+def _meal_callback_route(action: str, submission_id: str) -> RouteResult:
+    return RouteResult(
+        route_type=RouteType.CALLBACK,
+        chat_id=1,
+        user_id="user",
+        callback_query_id="meal-query",
+        callback_data=f"meal:{action}:{submission_id}",
+    )
+
+
+def _meal_confirmation_state(
+    handler: BotHandler,
+    *,
+    step: ConversationWorkflowStep = (
+        ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION
+    ),
+) -> ConversationState:
+    state = handler._new_submission_state()
+    return state.model_copy(
+        update={
+            "step": step,
+            "meal_draft": MealLogDraft(
+                date=date(2026, 8, 22),
+                meal_type=MealType.LUNCH,
+                description="vegetable soup",
+            ),
+        }
+    )
+
+
+def test_meal_confirm_saves_once_and_sends_continuation_keyboard(
+    handler: BotHandler,
+) -> None:
+    state = _meal_confirmation_state(handler)
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.confirm_meal_and_transition.return_value = True
+
+    handler.handle_callback(
+        _meal_callback_route("confirm", state.request_id or "")
+    )
+
+    confirm_call = handler.repo.confirm_meal_and_transition.call_args
+    assert confirm_call is not None
+    assert confirm_call.args[0] == "user"
+    assert confirm_call.kwargs == {
+        "expected_revision": state.revision,
+        "submission_id": state.request_id,
+    }
+    saved_state = confirm_call.args[2]
+    assert (
+        saved_state.step is ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+    )
+    assert saved_state.revision == state.revision + 1
+    handler.telegram_api.send_meal_saved.assert_called_once_with(
+        1, "vegetable soup", state.request_id
+    )
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "meal-query", "Meal saved"
+    )
+
+
+def test_meal_confirm_delivery_failure_keeps_saved_result_and_acknowledges(
+    handler: BotHandler,
+) -> None:
+    state = _meal_confirmation_state(handler)
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.confirm_meal_and_transition.return_value = True
+    handler.telegram_api.send_meal_saved.side_effect = TelegramAPIError(
+        "delivery failed"
+    )
+
+    handler.handle_callback(
+        _meal_callback_route("confirm", state.request_id or "")
+    )
+
+    handler.repo.confirm_meal_and_transition.assert_called_once()
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "meal-query", "Meal saved"
+    )
+
+
+def test_repeated_confirm_retries_continuation_after_delivery_failure(
+    handler: BotHandler,
+) -> None:
+    """A repeated Confirm restores controls without saving a second meal."""
+    state = _meal_confirmation_state(handler)
+    saved = state.model_copy(
+        update={
+            "step": ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+            "revision": state.revision + 1,
+        }
+    )
+    handler.repo.get_conversation_state.side_effect = [state, saved]
+    handler.repo.confirm_meal_and_transition.return_value = True
+    handler.telegram_api.send_meal_saved.side_effect = TelegramAPIError(
+        "delivery failed"
+    )
+
+    callback = _meal_callback_route("confirm", state.request_id or "")
+    handler.handle_callback(callback)
+    handler.handle_callback(callback)
+
+    handler.repo.confirm_meal_and_transition.assert_called_once()
+    assert handler.telegram_api.send_meal_saved.call_count == 2
+    handler.telegram_api.send_meal_saved.assert_any_call(
+        1, "vegetable soup", state.request_id
+    )
+    assert handler.telegram_api.answer_callback_query.call_args_list == [
+        call("meal-query", "Meal saved"),
+        call("meal-query", "Already saved"),
+    ]
+
+
+def test_conditional_confirm_loss_reemits_saved_continuation(
+    handler: BotHandler,
+) -> None:
+    """A matching state reloaded after contention gets its controls back."""
+    state = _meal_confirmation_state(handler)
+    saved = state.model_copy(
+        update={
+            "step": ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+            "revision": state.revision + 1,
+        }
+    )
+    handler.repo.get_conversation_state.side_effect = [state, saved]
+    handler.repo.confirm_meal_and_transition.return_value = False
+
+    handler.handle_callback(
+        _meal_callback_route("confirm", state.request_id or "")
+    )
+
+    handler.repo.confirm_meal_and_transition.assert_called_once()
+    handler.telegram_api.send_meal_saved.assert_called_once_with(
+        1, "vegetable soup", state.request_id
+    )
+    handler.telegram_api.send_message.assert_not_called()
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "meal-query", "Already saved"
+    )
+
+
+def test_repeated_meal_confirm_reports_already_saved_without_duplicate_write(
+    handler: BotHandler,
+) -> None:
+    state = _meal_confirmation_state(handler)
+    saved = state.model_copy(
+        update={
+            "step": ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+            "revision": state.revision + 1,
+        }
+    )
+    handler.repo.get_conversation_state.side_effect = [state, saved]
+    handler.repo.confirm_meal_and_transition.return_value = False
+
+    handler.handle_callback(
+        _meal_callback_route("confirm", state.request_id or "")
+    )
+
+    handler.repo.confirm_meal_and_transition.assert_called_once()
+    handler.telegram_api.send_meal_saved.assert_called_once_with(
+        1, "vegetable soup", state.request_id
+    )
+    handler.telegram_api.send_message.assert_not_called()
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "meal-query", "Already saved"
+    )
+
+
+def test_meal_confirm_persistence_failure_keeps_review_retryable(
+    handler: BotHandler,
+) -> None:
+    state = _meal_confirmation_state(handler)
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.confirm_meal_and_transition.side_effect = RuntimeError(
+        "database unavailable"
+    )
+
+    handler.handle_callback(
+        _meal_callback_route("confirm", state.request_id or "")
+    )
+
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "try again" in message.lower()
+    assert "review" in message.lower()
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "meal-query", "Unable to save meal"
+    )
+
+
+def test_meal_cancel_discards_unconfirmed_draft(handler: BotHandler) -> None:
+    state = _meal_confirmation_state(handler)
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.delete_conversation_state.return_value = True
+
+    handler.handle_callback(
+        _meal_callback_route("cancel", state.request_id or "")
+    )
+
+    handler.repo.delete_conversation_state.assert_called_once_with(
+        "user",
+        expected_revision=state.revision,
+        expected_request_id=state.request_id,
+        expected_step=ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+    )
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "not saved" in message.lower()
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "meal-query", "Meal cancelled"
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "step", "mutation"),
+    [
+        (
+            "cancel",
+            ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+            "delete_conversation_state",
+        ),
+        (
+            "add",
+            ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+            "transition_conversation_state",
+        ),
+        (
+            "done",
+            ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+            "delete_conversation_state",
+        ),
+    ],
+)
+def test_meal_callbacks_preserve_same_revision_replacement(
+    handler: BotHandler,
+    action: str,
+    step: ConversationWorkflowStep,
+    mutation: str,
+) -> None:
+    """A callback cannot mutate a replacement read at the same revision."""
+    original = _meal_confirmation_state(handler, step=step)
+    replacement = _meal_confirmation_state(handler, step=step).model_copy(
+        update={"revision": original.revision}
+    )
+    current: dict[str, ConversationState | None] = {"state": original}
+    handler.repo.get_conversation_state.return_value = original
+
+    def race(*args: Any, **kwargs: Any) -> bool:
+        del args
+        current["state"] = replacement
+        expected = {
+            "expected_revision": original.revision,
+            "expected_request_id": original.request_id,
+            "expected_step": step,
+        }
+        if kwargs == expected:
+            return False
+        current["state"] = None
+        return True
+
+    getattr(handler.repo, mutation).side_effect = race
+
+    handler.handle_callback(
+        _meal_callback_route(action, original.request_id or "")
+    )
+
+    assert current["state"] == replacement
+    handler.telegram_api.send_message.assert_called_once()
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "stale" in message.lower() or "outdated" in message.lower()
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "meal-query", "Stale meal action"
+    )
+
+
+def test_meal_add_more_creates_fresh_empty_submission_and_prompt(
+    handler: BotHandler,
+) -> None:
+    state = _meal_confirmation_state(
+        handler, step=ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.transition_conversation_state.return_value = True
+
+    handler.handle_callback(_meal_callback_route("add", state.request_id or ""))
+
+    transition = handler.repo.transition_conversation_state.call_args
+    assert transition is not None
+    next_state = transition.args[1]
+    assert next_state.step is ConversationWorkflowStep.AWAITING_MEAL_INPUT
+    assert next_state.meal_draft == MealLogDraft()
+    assert next_state.request_id != state.request_id
+    assert next_state.revision == state.revision + 1
+    assert transition.kwargs == {
+        "expected_revision": state.revision,
+        "expected_request_id": state.request_id,
+        "expected_step": ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+    }
+    handler.telegram_api.send_message.assert_called_once_with(
+        1, MEAL_INPUT_PROMPT
+    )
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "meal-query", "Add more"
+    )
+
+
+def test_meal_done_clears_completed_state(handler: BotHandler) -> None:
+    state = _meal_confirmation_state(
+        handler, step=ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.delete_conversation_state.return_value = True
+
+    handler.handle_callback(
+        _meal_callback_route("done", state.request_id or "")
+    )
+
+    handler.repo.delete_conversation_state.assert_called_once_with(
+        "user",
+        expected_revision=state.revision,
+        expected_request_id=state.request_id,
+        expected_step=ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+    )
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "complete" in message.lower()
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "meal-query", "Meal logging complete"
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "step"),
+    [
+        ("confirm", ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION),
+        ("cancel", ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION),
+        ("add", ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION),
+        ("done", ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION),
+    ],
+)
+def test_stale_meal_buttons_cannot_mutate_current_workflow(
+    handler: BotHandler,
+    action: str,
+    step: ConversationWorkflowStep,
+) -> None:
+    state = _meal_confirmation_state(handler, step=step)
+    handler.repo.get_conversation_state.return_value = state
+    old_id = "00000000-0000-4000-8000-000000000000"
+
+    handler.handle_callback(_meal_callback_route(action, old_id))
+
+    handler.repo.confirm_meal_and_transition.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
+    handler.repo.delete_conversation_state.assert_not_called()
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert any(
+        phrase in message.lower()
+        for phrase in ("already saved", "outdated", "stale")
+    )
+    handler.telegram_api.answer_callback_query.assert_called_once()
+
+
+def test_malformed_meal_callback_is_acknowledged_before_checkin_validation(
+    handler: BotHandler,
+) -> None:
+    route = _meal_callback_route(
+        "unknown", "00000000-0000-4000-8000-000000000000"
+    )
+
+    handler.handle_callback(route)
+
+    handler.repo.get_active_plan_snapshot.assert_not_called()
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "invalid" in message.lower()
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "meal-query", "Invalid meal action"
+    )
 
 
 def test_conversation_replaces_false_success_reply(handler: BotHandler) -> None:

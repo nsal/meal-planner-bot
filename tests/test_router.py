@@ -1,15 +1,53 @@
 """Telegram update and callback routing tests."""
 
+import os
+import subprocess
+import sys
+from datetime import date
+from pathlib import Path
+from uuid import UUID
+
 import pytest
 
 from meal_planner.models.schemas import MealOutcome, MealType
 from meal_planner.router import (
+    MealCallbackAction,
     ProfileCallbackAction,
     RouteType,
     parse_checkin_callback,
+    parse_meal_callback,
+    parse_meal_input,
     parse_profile_callback,
     route_update,
 )
+
+
+def test_router_imports_before_any_telegram_modules() -> None:
+    """Importing the router first works in a clean Python interpreter."""
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(source_root)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys\n"
+                "assert not any(\n"
+                "    name == 'meal_planner.telegram' or "
+                "name.startswith('meal_planner.telegram.')\n"
+                "    for name in sys.modules\n"
+                ")\n"
+                "import meal_planner.router\n"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_route_command_and_conversation() -> None:
@@ -153,6 +191,145 @@ def test_parse_plan_specific_checkin_callback() -> None:
     assert callback.day == 7
     assert callback.meal_type is MealType.DINNER
     assert callback.outcome is MealOutcome.SWAPPED
+
+
+@pytest.mark.parametrize(
+    ("submitted", "expected_date", "expected_type", "expected_description"),
+    [
+        (
+            "today, LUNCH, rice, beans, and salsa",
+            date(2026, 8, 22),
+            MealType.LUNCH,
+            "rice, beans, and salsa",
+        ),
+        (
+            "  YESTERDAY , breakfast , pancakes  ",
+            date(2026, 8, 21),
+            MealType.BREAKFAST,
+            "pancakes",
+        ),
+        (
+            "2026-08-16, Dinner, soup",
+            date(2026, 8, 16),
+            MealType.DINNER,
+            "soup",
+        ),
+    ],
+)
+def test_parse_meal_input_uses_first_two_commas_and_normalizes_values(
+    submitted: str,
+    expected_date: date,
+    expected_type: MealType,
+    expected_description: str,
+) -> None:
+    result = parse_meal_input(submitted, date(2026, 8, 22))
+
+    assert result.is_valid
+    assert result.draft is not None
+    assert result.draft.date == expected_date
+    assert result.draft.meal_type is expected_type
+    assert result.draft.description == expected_description
+    assert result.errors == ()
+
+
+@pytest.mark.parametrize(
+    "submitted",
+    [
+        "today, lunch",
+        "today lunch, lunch, soup",
+        "today, lunch,",
+        ", lunch, soup",
+        "today, , soup",
+        "today, lunch,   ",
+    ],
+)
+def test_parse_meal_input_reports_field_specific_errors(
+    submitted: str,
+) -> None:
+    result = parse_meal_input(submitted, date(2026, 8, 22))
+
+    assert not result.is_valid
+    assert result.draft is None
+    assert result.errors
+    assert all(isinstance(error, str) for error in result.errors)
+
+
+def test_parse_meal_input_accepts_maximum_description_length() -> None:
+    description = "x" * 500
+
+    result = parse_meal_input(f"today, lunch, {description}", date(2026, 8, 22))
+
+    assert result.is_valid
+    assert result.draft is not None
+    assert result.draft.description == description
+
+
+def test_parse_meal_input_reports_overlong_description_error() -> None:
+    description = "x" * 501
+
+    result = parse_meal_input(f"today, lunch, {description}", date(2026, 8, 22))
+
+    assert not result.is_valid
+    assert result.draft is None
+    assert result.errors == ("description must be 500 characters or fewer",)
+
+
+@pytest.mark.parametrize(
+    ("submitted", "expected_message"),
+    [
+        ("2026-08-22, lunch, soup", ""),
+        ("2026-08-16, lunch, soup", ""),
+        ("2026-08-15, lunch, soup", "date must be within the last 7 days"),
+        ("2026-08-23, lunch, soup", "date cannot be in the future"),
+        ("2026/08/22, lunch, soup", "date must be YYYY-MM-DD"),
+        ("2026-2-2, lunch, soup", "date must be YYYY-MM-DD"),
+        ("2026-02-30, lunch, soup", "date must be a real calendar date"),
+        (
+            "today, brunch, soup",
+            "meal type must be breakfast, lunch, snack, or dinner",
+        ),
+    ],
+)
+def test_parse_meal_input_validates_dates_and_meal_types(
+    submitted: str,
+    expected_message: str,
+) -> None:
+    result = parse_meal_input(submitted, date(2026, 8, 22))
+
+    if expected_message:
+        assert expected_message in result.errors
+    else:
+        assert result.is_valid
+
+
+@pytest.mark.parametrize("action", ["confirm", "cancel", "add", "done"])
+def test_parse_meal_callback_accepts_all_actions(action: str) -> None:
+    submission_id = "123e4567-e89b-12d3-a456-426614174000"
+
+    callback = parse_meal_callback(f"meal:{action}:{submission_id}")
+
+    assert callback is not None
+    assert callback.action is MealCallbackAction(action)
+    assert callback.submission_id == submission_id
+    assert UUID(callback.submission_id)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "meal:confirm:not-a-uuid",
+        "meal:unknown:123e4567-e89b-12d3-a456-426614174000",
+        "meal:confirm:123e4567-e89b-12d3-a456-426614174000:extra",
+        "checkin:2026-08-22:1:lunch:cooked",
+        "meal:confirm:",
+        "x" * 65,
+        "é" * 64,
+    ],
+)
+def test_parse_meal_callback_rejects_malformed_or_oversized_payload(
+    payload: str,
+) -> None:
+    assert parse_meal_callback(payload) is None
 
 
 @pytest.mark.parametrize(

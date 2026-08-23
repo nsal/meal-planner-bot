@@ -226,20 +226,22 @@ class DynamoRepository:
         state: ConversationState,
         *,
         expected_revision: int | None = None,
+        expected_request_id: str | None = None,
+        expected_step: ConversationWorkflowStep | None = None,
     ) -> bool:
         """Create or replace state only when its revision is current."""
         item = {
             **self._conversation_key(user_id),
             **state.model_dump(mode="json"),
         }
-        if expected_revision is None:
-            condition = "attribute_not_exists(#pk)"
-            names = {"#pk": "PK"}
-            values: dict[str, Any] = {}
-        else:
-            condition = "#revision = :expected_revision"
-            names = {"#revision": "revision"}
-            values = {":expected_revision": expected_revision}
+        condition, names, values = self._conversation_state_condition(
+            expected_revision=expected_revision,
+            expected_request_id=expected_request_id,
+            expected_step=expected_step,
+            require_absent=expected_revision is None
+            and expected_request_id is None
+            and expected_step is None,
+        )
         kwargs: dict[str, Any] = {
             "Item": item,
             "ConditionExpression": condition,
@@ -261,25 +263,44 @@ class DynamoRepository:
         state: ConversationState,
         *,
         expected_revision: int,
+        expected_request_id: str | None = None,
+        expected_step: ConversationWorkflowStep | None = None,
     ) -> bool:
         """Atomically persist a state transition from one revision."""
         return self.save_conversation_state(
-            user_id, state, expected_revision=expected_revision
+            user_id,
+            state,
+            expected_revision=expected_revision,
+            expected_request_id=expected_request_id,
+            expected_step=expected_step,
         )
 
     def delete_conversation_state(
-        self, user_id: str, *, expected_revision: int | None = None
+        self,
+        user_id: str,
+        *,
+        expected_revision: int | None = None,
+        expected_request_id: str | None = None,
+        expected_step: ConversationWorkflowStep | None = None,
     ) -> bool:
         """Delete state conditionally, preventing stale workflow cleanup."""
         kwargs: dict[str, Any] = {"Key": self._conversation_key(user_id)}
-        if expected_revision is not None:
+        if (
+            expected_revision is not None
+            or expected_request_id is not None
+            or expected_step is not None
+        ):
+            condition, names, values = self._conversation_state_condition(
+                expected_revision=expected_revision,
+                expected_request_id=expected_request_id,
+                expected_step=expected_step,
+                require_absent=False,
+            )
             kwargs.update(
                 {
-                    "ConditionExpression": "#revision = :revision",
-                    "ExpressionAttributeNames": {"#revision": "revision"},
-                    "ExpressionAttributeValues": {
-                        ":revision": expected_revision
-                    },
+                    "ConditionExpression": condition,
+                    "ExpressionAttributeNames": names,
+                    "ExpressionAttributeValues": values,
                 }
             )
         try:
@@ -289,6 +310,35 @@ class DynamoRepository:
                 return False
             raise
         return True
+
+    @staticmethod
+    def _conversation_state_condition(
+        *,
+        expected_revision: int | None,
+        expected_request_id: str | None,
+        expected_step: ConversationWorkflowStep | None,
+        require_absent: bool,
+    ) -> tuple[str, dict[str, str], dict[str, Any]]:
+        """Build one condition for the conversation-state mutation."""
+        if require_absent:
+            return "attribute_not_exists(#pk)", {"#pk": "PK"}, {}
+
+        conditions: list[str] = []
+        names: dict[str, str] = {}
+        values: dict[str, Any] = {}
+        if expected_revision is not None:
+            conditions.append("#revision = :expected_revision")
+            names["#revision"] = "revision"
+            values[":expected_revision"] = expected_revision
+        if expected_request_id is not None:
+            conditions.append("#request_id = :expected_request_id")
+            names["#request_id"] = "request_id"
+            values[":expected_request_id"] = expected_request_id
+        if expected_step is not None:
+            conditions.append("#step = :expected_step")
+            names["#step"] = "step"
+            values[":expected_step"] = expected_step.value
+        return " AND ".join(conditions), names, values
 
     def clear_conversation_state_if_matches(
         self,
@@ -521,6 +571,92 @@ class DynamoRepository:
         try:
             self.table.meta.client.transact_write_items(
                 TransactItems=transact_items
+            )
+        except ClientError as exc:
+            if self._is_transaction_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def confirm_meal_and_transition(
+        self,
+        user_id: str,
+        entry: MealLogEntry,
+        state: ConversationState,
+        *,
+        expected_revision: int,
+        submission_id: str,
+    ) -> bool:
+        """Save one reviewed meal and advance its workflow atomically.
+
+        ``state`` is the state that should exist after confirmation.  The
+        transaction conditions its replacement on the prior state still
+        being the matching review step, revision, and submission.  The meal
+        key is derived from the submission ID so a retry cannot overwrite a
+        different meal or create a second item.
+        """
+        draft = state.meal_draft
+        if (
+            state.workflow_kind is not ConversationWorkflowKind.MEAL_LOG
+            or state.step
+            is not ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+            or draft is None
+            or state.request_id != submission_id
+            or state.revision != expected_revision + 1
+            or draft.date != entry.date
+            or draft.meal_type != entry.meal_type
+            or draft.description != entry.description
+        ):
+            return False
+
+        meal_item = {
+            "PK": f"USER#{user_id}",
+            "SK": (f"MEAL#{entry.date_key}#SUBMISSION#{submission_id}"),
+            **entry.model_dump(mode="json"),
+        }
+        state_item = {
+            **self._conversation_key(user_id),
+            **state.model_dump(mode="json"),
+        }
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": meal_item,
+                            "ConditionExpression": "attribute_not_exists(PK)",
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": state_item,
+                            "ConditionExpression": (
+                                "#workflow_kind = :meal_log "
+                                "AND #step = :awaiting_confirmation "
+                                "AND #revision = :expected_revision "
+                                "AND #request_id = :request_id"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#workflow_kind": "workflow_kind",
+                                "#step": "step",
+                                "#revision": "revision",
+                                "#request_id": "request_id",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":meal_log": (
+                                    ConversationWorkflowKind.MEAL_LOG.value
+                                ),
+                                ":awaiting_confirmation": (
+                                    ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION.value
+                                ),
+                                ":expected_revision": expected_revision,
+                                ":request_id": submission_id,
+                            },
+                        }
+                    },
+                ]
             )
         except ClientError as exc:
             if self._is_transaction_conditional_failure(exc):

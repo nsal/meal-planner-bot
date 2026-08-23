@@ -4,12 +4,14 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from threading import Barrier
 from typing import Any, Generator
+from unittest.mock import MagicMock
 
 import boto3
 import pytest
 from botocore.exceptions import ClientError
 from moto import mock_aws
 
+from meal_planner.bot_handler import BotHandler
 from meal_planner.db.dynamo import (
     DynamoRepository,
     RepairPublicationOutcome,
@@ -29,6 +31,7 @@ from meal_planner.models.schemas import (
     ProfileUpdateEntities,
     UserProfile,
 )
+from meal_planner.router import RouteResult, RouteType
 from tests.factories import make_plan, make_profile
 
 
@@ -749,6 +752,426 @@ def _completed_meal_state(
         updated_at=current,
         expires_at=current + timedelta(hours=24),
     )
+
+
+def _review_meal_state(
+    *,
+    request_id: str = "123e4567-e89b-12d3-a456-426614174000",
+    revision: int = 0,
+    now: datetime | None = None,
+) -> ConversationState:
+    current = now or datetime.now(timezone.utc)
+    return ConversationState(
+        workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+        step=ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+        meal_draft=MealLogDraft(
+            date=date(2026, 8, 8),
+            meal_type="lunch",
+            description="Soup",
+        ),
+        request_id=request_id,
+        revision=revision,
+        created_at=current,
+        updated_at=current,
+        expires_at=current + timedelta(hours=24),
+    )
+
+
+def _continuation_meal_state(
+    review: ConversationState,
+) -> ConversationState:
+    return review.model_copy(
+        update={
+            "step": ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+            "revision": review.revision + 1,
+            "updated_at": review.updated_at + timedelta(seconds=1),
+        }
+    )
+
+
+def test_transition_rejects_stale_same_revision_request_id(
+    repo: DynamoRepository,
+) -> None:
+    original = _review_meal_state(request_id="original-request")
+    replacement = _review_meal_state(
+        request_id="replacement-request",
+        revision=original.revision,
+        now=original.updated_at + timedelta(seconds=1),
+    )
+    assert repo.save_conversation_state("user", original)
+    assert repo.save_conversation_state(
+        "user", replacement, expected_revision=original.revision
+    )
+
+    assert not repo.transition_conversation_state(
+        "user",
+        _continuation_meal_state(original),
+        expected_revision=original.revision,
+        expected_request_id=original.request_id,
+        expected_step=ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+    )
+    assert repo.get_conversation_state("user") == replacement
+
+
+def test_delete_rejects_stale_same_revision_request_id(
+    repo: DynamoRepository,
+) -> None:
+    original = _review_meal_state(request_id="original-request")
+    replacement = _review_meal_state(
+        request_id="replacement-request",
+        revision=original.revision,
+        now=original.updated_at + timedelta(seconds=1),
+    )
+    assert repo.save_conversation_state("user", original)
+    assert repo.save_conversation_state(
+        "user", replacement, expected_revision=original.revision
+    )
+
+    assert not repo.delete_conversation_state(
+        "user",
+        expected_revision=original.revision,
+        expected_request_id=original.request_id,
+        expected_step=ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+    )
+    assert repo.get_conversation_state("user") == replacement
+
+
+def test_transition_accepts_matching_state_preconditions(
+    repo: DynamoRepository,
+) -> None:
+    review = _review_meal_state()
+    continuation = _continuation_meal_state(review)
+    assert repo.save_conversation_state("user", review)
+
+    assert repo.transition_conversation_state(
+        "user",
+        continuation,
+        expected_revision=review.revision,
+        expected_request_id=review.request_id,
+        expected_step=review.step,
+    )
+    assert repo.get_conversation_state("user") == continuation
+
+
+def test_delete_accepts_matching_state_preconditions(
+    repo: DynamoRepository,
+) -> None:
+    review = _review_meal_state()
+    assert repo.save_conversation_state("user", review)
+
+    assert repo.delete_conversation_state(
+        "user",
+        expected_revision=review.revision,
+        expected_request_id=review.request_id,
+        expected_step=review.step,
+    )
+    assert repo.get_conversation_state("user") is None
+
+
+def test_handler_add_more_round_trip_preserves_state_invariants(
+    repo: DynamoRepository,
+) -> None:
+    """Add more writes a state that the repository can deserialize."""
+    telegram_api = MagicMock()
+    handler = BotHandler(repo, telegram_api)
+    review = _review_meal_state(
+        request_id="123e4567-e89b-12d3-a456-426614174000", revision=4
+    )
+    continuation = _continuation_meal_state(review)
+    assert repo.save_conversation_state("user", continuation)
+
+    route = RouteResult(
+        route_type=RouteType.CALLBACK,
+        chat_id=1,
+        user_id="user",
+        callback_query_id="meal-query",
+        callback_data=f"meal:add:{continuation.request_id}",
+    )
+
+    handler.handle_callback(route)
+
+    next_state = repo.get_conversation_state("user")
+    assert next_state is not None
+    assert next_state.created_at <= next_state.updated_at
+    assert next_state.request_id not in {
+        None,
+        continuation.request_id,
+    }
+    assert next_state.meal_draft == MealLogDraft()
+    assert next_state.step is ConversationWorkflowStep.AWAITING_MEAL_INPUT
+    assert next_state.revision == continuation.revision + 1
+    telegram_api.answer_callback_query.assert_called_once_with(
+        "meal-query", "Add more"
+    )
+
+
+@pytest.mark.parametrize(
+    "expected_request_id, expected_step",
+    [
+        (
+            "wrong-request",
+            ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+        ),
+        (
+            "123e4567-e89b-12d3-a456-426614174000",
+            ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+        ),
+    ],
+    ids=["request-id-mismatch", "step-mismatch"],
+)
+def test_transition_rejects_request_id_or_step_mismatch(
+    repo: DynamoRepository,
+    expected_request_id: str,
+    expected_step: ConversationWorkflowStep,
+) -> None:
+    review = _review_meal_state()
+    assert repo.save_conversation_state("user", review)
+
+    assert not repo.transition_conversation_state(
+        "user",
+        _continuation_meal_state(review),
+        expected_revision=review.revision,
+        expected_request_id=expected_request_id,
+        expected_step=expected_step,
+    )
+    assert repo.get_conversation_state("user") == review
+
+
+@pytest.mark.parametrize(
+    "expected_request_id, expected_step",
+    [
+        (
+            "wrong-request",
+            ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+        ),
+        (
+            "123e4567-e89b-12d3-a456-426614174000",
+            ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+        ),
+    ],
+    ids=["request-id-mismatch", "step-mismatch"],
+)
+def test_delete_rejects_request_id_or_step_mismatch(
+    repo: DynamoRepository,
+    expected_request_id: str,
+    expected_step: ConversationWorkflowStep,
+) -> None:
+    review = _review_meal_state()
+    assert repo.save_conversation_state("user", review)
+
+    assert not repo.delete_conversation_state(
+        "user",
+        expected_revision=review.revision,
+        expected_request_id=expected_request_id,
+        expected_step=expected_step,
+    )
+    assert repo.get_conversation_state("user") == review
+
+
+def test_transition_propagates_nonconditional_error(
+    repo: DynamoRepository, mocker: Any
+) -> None:
+    review = _review_meal_state()
+    error = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException"}},
+        "PutItem",
+    )
+    mocker.patch.object(repo.table, "put_item", side_effect=error)
+
+    with pytest.raises(ClientError) as raised:
+        repo.transition_conversation_state(
+            "user",
+            _continuation_meal_state(review),
+            expected_revision=review.revision,
+            expected_request_id=review.request_id,
+            expected_step=review.step,
+        )
+
+    assert raised.value is error
+
+
+def test_delete_propagates_nonconditional_error(
+    repo: DynamoRepository, mocker: Any
+) -> None:
+    error = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException"}},
+        "DeleteItem",
+    )
+    mocker.patch.object(repo.table, "delete_item", side_effect=error)
+
+    with pytest.raises(ClientError) as raised:
+        repo.delete_conversation_state(
+            "user",
+            expected_revision=0,
+            expected_request_id="request-id",
+            expected_step=ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+        )
+
+    assert raised.value is error
+
+
+def test_confirm_meal_atomically_writes_stable_key_and_continuation_state(
+    repo: DynamoRepository,
+) -> None:
+    review = _review_meal_state()
+    continuation = _continuation_meal_state(review)
+    assert repo.save_conversation_state("user", review)
+    entry = _meal(8, 12, "Soup")
+
+    assert repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        continuation,
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+    )
+
+    assert repo.get_conversation_state("user") == continuation
+    saved = repo.table.get_item(
+        Key={
+            "PK": "USER#user",
+            "SK": (
+                "MEAL#2026-08-08#SUBMISSION#"
+                "123e4567-e89b-12d3-a456-426614174000"
+            ),
+        }
+    )
+    assert saved["Item"]["description"] == "Soup"
+
+
+def test_confirm_meal_rejects_duplicate_submission_without_state_change(
+    repo: DynamoRepository,
+) -> None:
+    review = _review_meal_state()
+    continuation = _continuation_meal_state(review)
+    assert repo.save_conversation_state("user", review)
+    entry = _meal(8, 12, "Soup")
+    assert repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        continuation,
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+    )
+
+    duplicate_review = _review_meal_state(
+        request_id=review.request_id,
+        revision=2,
+    )
+    assert repo.save_conversation_state(
+        "user", duplicate_review, expected_revision=continuation.revision
+    )
+    duplicate_continuation = _continuation_meal_state(duplicate_review)
+
+    assert not repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        duplicate_continuation,
+        expected_revision=duplicate_review.revision,
+        submission_id=review.request_id,
+    )
+    assert repo.get_conversation_state("user") == duplicate_review
+    assert repo.get_meal_history("user", days=1, on_date=date(2026, 8, 8)) == [
+        entry
+    ]
+
+
+def test_confirm_meal_rejects_stale_revision_without_partial_write(
+    repo: DynamoRepository,
+) -> None:
+    review = _review_meal_state()
+    assert repo.save_conversation_state("user", review)
+    competing = review.model_copy(
+        update={
+            "revision": 1,
+            "updated_at": review.updated_at + timedelta(seconds=1),
+        }
+    )
+    assert repo.transition_conversation_state(
+        "user", competing, expected_revision=review.revision
+    )
+
+    assert not repo.confirm_meal_and_transition(
+        "user",
+        _meal(8, 12, "Stale meal"),
+        _continuation_meal_state(review),
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+    )
+    assert repo.get_conversation_state("user") == competing
+    assert repo.get_meal_history("user", days=1, on_date=date(2026, 8, 8)) == []
+
+
+@pytest.mark.parametrize(
+    "current_state, expected_revision, submission_id",
+    [
+        (
+            _review_meal_state(
+                request_id="123e4567-e89b-12d3-a456-426614174002"
+            ),
+            0,
+            "123e4567-e89b-12d3-a456-426614174000",
+        ),
+        (_completed_meal_state(), 0, "123e4567-e89b-12d3-a456-426614174000"),
+    ],
+)
+def test_confirm_meal_rejects_wrong_submission_or_step(
+    repo: DynamoRepository,
+    current_state: ConversationState,
+    expected_revision: int,
+    submission_id: str,
+) -> None:
+    assert repo.save_conversation_state("user", current_state)
+    continuation = _continuation_meal_state(
+        _review_meal_state(
+            request_id="123e4567-e89b-12d3-a456-426614174000",
+            revision=current_state.revision,
+            now=current_state.updated_at,
+        )
+    )
+
+    assert not repo.confirm_meal_and_transition(
+        "user",
+        _meal(8, 12, "Invalid confirmation"),
+        continuation,
+        expected_revision=expected_revision,
+        submission_id=submission_id,
+    )
+    assert repo.get_conversation_state("user") == current_state
+    assert repo.get_meal_history("user", days=1, on_date=date(2026, 8, 8)) == []
+
+
+def test_confirm_meal_propagates_transaction_contention(
+    repo: DynamoRepository, mocker: Any
+) -> None:
+    review = _review_meal_state()
+    assert repo.save_conversation_state("user", review)
+    error = ClientError(
+        {
+            "Error": {"Code": "TransactionCanceledException"},
+            "CancellationReasons": [
+                {"Code": "TransactionConflict"},
+                {"Code": "None"},
+            ],
+        },
+        "TransactWriteItems",
+    )
+    mocker.patch.object(
+        repo.table.meta.client, "transact_write_items", side_effect=error
+    )
+
+    with pytest.raises(ClientError) as raised:
+        repo.confirm_meal_and_transition(
+            "user",
+            _meal(8, 12, "Soup"),
+            _continuation_meal_state(review),
+            expected_revision=review.revision,
+            submission_id=review.request_id,
+        )
+
+    assert raised.value is error
+    assert repo.get_conversation_state("user") == review
+    assert repo.get_meal_history("user", days=1, on_date=date(2026, 8, 8)) == []
 
 
 def test_atomic_meal_and_state_transition_writes_one_meal_and_marker(

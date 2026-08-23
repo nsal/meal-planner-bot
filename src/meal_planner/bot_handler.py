@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
@@ -56,11 +57,14 @@ from meal_planner.planner_handler import (
     REVISE_PLAN,
 )
 from meal_planner.router import (
+    MealCallback,
     ProfileCallback,
     ProfileCallbackAction,
     RouteResult,
     RouteType,
     parse_checkin_callback,
+    parse_meal_callback,
+    parse_meal_input,
     parse_profile_callback,
     route_update,
 )
@@ -71,6 +75,19 @@ from meal_planner.telegram.commands import render_help
 logger = logging.getLogger(__name__)
 
 WEBHOOK_SECRET_HEADER = "x-telegram-bot-api-secret-token"
+MEAL_INPUT_PROMPT = (
+    "Submit one meal using this format:\n"
+    "when, meal type, what you ate\n\n"
+    "Use today or yesterday, or a strict YYYY-MM-DD date. Dates are "
+    "interpreted in UTC and must be within the last seven calendar days, "
+    "including today. Meal type must be breakfast, lunch, snack, or "
+    "dinner. Keep the description after the second comma.\n\n"
+    "Example: today, lunch, vegetable soup"
+)
+
+_COMMAND_REFERENCE_DATE: ContextVar[date | None] = ContextVar(
+    "command_reference_date", default=None
+)
 
 
 @dataclass(frozen=True)
@@ -161,7 +178,13 @@ class BotHandler:
         }
         handler = handlers.get(route.command or "")
         if handler:
-            handler(route.chat_id, route.user_id)
+            token = _COMMAND_REFERENCE_DATE.set(
+                self._reference_date_from_route(route)
+            )
+            try:
+                handler(route.chat_id, route.user_id)
+            finally:
+                _COMMAND_REFERENCE_DATE.reset(token)
         else:
             self.telegram_api.send_message(
                 route.chat_id,
@@ -278,8 +301,11 @@ class BotHandler:
         self.telegram_api.send_message(chat_id, "\n".join(lines))
 
     def _cmd_submit_meals(self, chat_id: int | str, user_id: str) -> None:
+        reference_date = (
+            _COMMAND_REFERENCE_DATE.get() or datetime.now(timezone.utc).date()
+        )
         state = self._get_conversation_state(user_id)
-        meal_state = self._new_meal_state()
+        meal_state = self._new_submission_state()
         if not self._replace_conversation_state(user_id, meal_state, state):
             self.telegram_api.send_message(
                 chat_id,
@@ -287,13 +313,15 @@ class BotHandler:
                 "Please try again.",
             )
             return
-        prefix = "I replaced your unfinished workflow. " if state else ""
+        history = self.repo.get_meal_history(
+            user_id, days=2, on_date=reference_date
+        )
+        prefix = "I replaced your unfinished workflow.\n\n" if state else ""
         self.telegram_api.send_message(
             chat_id,
-            prefix
-            + "What date was the meal? Use YYYY-MM-DD, from today through "
-            "the previous seven days.",
+            prefix + self._format_recent_meal_history(history, reference_date),
         )
+        self.telegram_api.send_message(chat_id, MEAL_INPUT_PROMPT)
 
     def _cmd_checkin(self, chat_id: int | str, user_id: str) -> None:
         """Show planned-meal outcome buttons for today's active plan."""
@@ -330,6 +358,76 @@ class BotHandler:
     def _get_conversation_state(self, user_id: str) -> ConversationState | None:
         state = self.repo.get_conversation_state(user_id, consistent_read=True)
         return state if isinstance(state, ConversationState) else None
+
+    @staticmethod
+    def _reference_date_from_route(route: RouteResult) -> date:
+        """Derive a UTC command date, falling back to processing time."""
+        message = route.raw_update.get("message")
+        timestamp = message.get("date") if isinstance(message, dict) else None
+        if isinstance(timestamp, int) and not isinstance(timestamp, bool):
+            try:
+                return datetime.fromtimestamp(timestamp, timezone.utc).date()
+            except OSError, OverflowError, TypeError, ValueError:
+                pass
+        return datetime.now(timezone.utc).date()
+
+    @staticmethod
+    def _format_recent_meal_history(
+        history: list[MealLogEntry], reference_date: date
+    ) -> str:
+        """Render the two calendar groups shown when meal logging starts."""
+        ordered = sorted(
+            history,
+            key=lambda entry: (
+                entry.date,
+                (
+                    entry.created_at.astimezone(timezone.utc)
+                    if entry.created_at.tzinfo is not None
+                    and entry.created_at.utcoffset() is not None
+                    else entry.created_at.replace(tzinfo=timezone.utc)
+                ),
+            ),
+            reverse=True,
+        )
+        groups = {
+            "Today": [
+                entry for entry in ordered if entry.date == reference_date
+            ],
+            "Yesterday": [
+                entry
+                for entry in ordered
+                if entry.date == reference_date - timedelta(days=1)
+            ],
+        }
+        lines = ["Recent meals", ""]
+        for index, (label, entries) in enumerate(groups.items()):
+            lines.append(label)
+            if entries:
+                lines.extend(
+                    f"- {entry.meal_type.value.capitalize()}: "
+                    f"{entry.description}"
+                    for entry in entries
+                )
+            else:
+                lines.append("No meals submitted.")
+            if index == 0:
+                lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _new_submission_state() -> ConversationState:
+        """Create an empty, request-identifiable meal input state."""
+        now = datetime.now(timezone.utc)
+        return ConversationState(
+            workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+            step=ConversationWorkflowStep.AWAITING_MEAL_INPUT,
+            meal_draft=MealLogDraft(),
+            request_id=str(uuid4()),
+            revision=0,
+            created_at=now,
+            updated_at=now,
+            expires_at=int((now + timedelta(hours=24)).timestamp()),
+        )
 
     @staticmethod
     def _new_meal_state() -> ConversationState:
@@ -403,6 +501,19 @@ class BotHandler:
                 or not route.user_id
                 or not route.callback_data
             ):
+                return
+            if route.callback_data.startswith("meal:"):
+                meal_callback = parse_meal_callback(route.callback_data)
+                if meal_callback is None:
+                    acknowledgement = "Invalid meal action"
+                    self._send_meal_message(
+                        route.chat_id,
+                        "That meal button is invalid or outdated.",
+                    )
+                    return
+                acknowledgement = self._handle_meal_callback(
+                    route, meal_callback
+                )
                 return
             callback = parse_checkin_callback(route.callback_data)
             if callback is None:
@@ -622,12 +733,320 @@ class BotHandler:
                         "Failed to deliver profile callback error message"
                     )
 
+    def _handle_meal_callback(
+        self, route: RouteResult, callback: MealCallback
+    ) -> str:
+        """Apply one revision- and submission-checked meal action."""
+        if route.chat_id is None or route.user_id is None:
+            return "Invalid meal action"
+
+        try:
+            state = self._get_conversation_state(route.user_id)
+            if not self._meal_callback_matches(state, callback.submission_id):
+                self._send_stale_meal_action(route.chat_id)
+                return "Stale meal action"
+            assert state is not None
+
+            if callback.action.value == "confirm":
+                return self._confirm_meal_callback(
+                    route.chat_id, route.user_id, state, callback.submission_id
+                )
+            if callback.action.value == "cancel":
+                return self._cancel_meal_callback(
+                    route.chat_id,
+                    route.user_id,
+                    state,
+                    callback.submission_id,
+                )
+            if callback.action.value == "add":
+                return self._add_meal_callback(
+                    route.chat_id,
+                    route.user_id,
+                    state,
+                    callback.submission_id,
+                )
+            if callback.action.value == "done":
+                return self._done_meal_callback(
+                    route.chat_id,
+                    route.user_id,
+                    state,
+                    callback.submission_id,
+                )
+        except Exception:
+            logger.exception("Error handling meal callback")
+            self._send_meal_message(
+                route.chat_id,
+                "Sorry, I couldn't update that meal. Please try again.",
+            )
+            return "Unable to update meal"
+        return "Invalid meal action"
+
+    @staticmethod
+    def _meal_callback_matches(
+        state: ConversationState | None, submission_id: str
+    ) -> bool:
+        return (
+            state is not None
+            and state.workflow_kind is ConversationWorkflowKind.MEAL_LOG
+            and state.request_id == submission_id
+        )
+
+    def _confirm_meal_callback(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        state: ConversationState,
+        submission_id: str,
+    ) -> str:
+        """Atomically save a reviewed meal and show continuation actions."""
+        if (
+            state.step
+            is not ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION
+        ):
+            if (
+                state.step
+                is ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+            ):
+                self._send_saved_meal_continuation(
+                    chat_id, state, submission_id
+                )
+                return "Already saved"
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        draft = state.meal_draft
+        if draft is None or not draft.date or not draft.meal_type:
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        if not draft.description:
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+
+        now = datetime.now(timezone.utc)
+        entry = MealLogEntry(
+            date=draft.date,
+            meal_type=draft.meal_type,
+            description=draft.description,
+            created_at=now,
+        )
+        continuation = state.model_copy(
+            update={
+                "step": ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+                "revision": state.revision + 1,
+                "updated_at": now,
+            }
+        )
+        try:
+            confirmed = self.repo.confirm_meal_and_transition(
+                user_id,
+                entry,
+                continuation,
+                expected_revision=state.revision,
+                submission_id=submission_id,
+            )
+        except Exception:
+            logger.exception("Meal confirmation persistence failed")
+            self._send_meal_message(
+                chat_id,
+                "I couldn't save that meal. Your review is still available; "
+                "please try again.",
+            )
+            return "Unable to save meal"
+
+        if confirmed:
+            try:
+                self.telegram_api.send_meal_saved(
+                    chat_id, entry.description, submission_id
+                )
+            except TelegramAPIError:
+                logger.error("Meal saved delivery failed")
+            return "Meal saved"
+
+        current = self._get_conversation_state(user_id)
+        if (
+            current is not None
+            and current.workflow_kind is ConversationWorkflowKind.MEAL_LOG
+            and current.step
+            is ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+            and current.request_id == submission_id
+        ):
+            self._send_saved_meal_continuation(chat_id, current, submission_id)
+            return "Already saved"
+        self._send_stale_meal_action(chat_id)
+        return "Stale meal action"
+
+    def _send_saved_meal_continuation(
+        self,
+        chat_id: int | str,
+        state: ConversationState,
+        submission_id: str,
+    ) -> None:
+        """Retry saved-meal delivery with its continuation controls."""
+        if state.meal_draft is None or state.meal_draft.description is None:
+            self._send_stale_meal_action(chat_id)
+            return
+        try:
+            self.telegram_api.send_meal_saved(
+                chat_id, state.meal_draft.description, submission_id
+            )
+        except TelegramAPIError:
+            logger.error("Already-saved meal delivery failed")
+
+    def _cancel_meal_callback(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        state: ConversationState,
+        submission_id: str,
+    ) -> str:
+        """Discard an unconfirmed meal only at its observed revision."""
+        if (
+            state.step
+            is not ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION
+        ):
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        try:
+            deleted = self.repo.delete_conversation_state(
+                user_id,
+                expected_revision=state.revision,
+                expected_request_id=submission_id,
+                expected_step=(
+                    ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION
+                ),
+            )
+        except Exception:
+            logger.exception("Meal cancellation persistence failed")
+            self._send_meal_message(
+                chat_id,
+                "I couldn't cancel that meal. Please try again.",
+            )
+            return "Unable to cancel meal"
+        if not deleted:
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        self._send_meal_message(chat_id, "Cancelled. This meal was not saved.")
+        return "Meal cancelled"
+
+    def _add_meal_callback(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        state: ConversationState,
+        submission_id: str,
+    ) -> str:
+        """Start another empty submission after a confirmed meal."""
+        if (
+            state.step
+            is not ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+        ):
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        next_state = self._new_submission_state().model_copy(
+            update={
+                "revision": state.revision + 1,
+            }
+        )
+        try:
+            transitioned = self.repo.transition_conversation_state(
+                user_id,
+                next_state,
+                expected_revision=state.revision,
+                expected_request_id=submission_id,
+                expected_step=(
+                    ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+                ),
+            )
+        except Exception:
+            logger.exception("Starting another meal persistence failed")
+            self._send_meal_message(
+                chat_id,
+                "I couldn't start another meal. Please try again.",
+            )
+            return "Unable to add meal"
+        if not transitioned:
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        self._send_meal_message(chat_id, MEAL_INPUT_PROMPT)
+        return "Add more"
+
+    def _done_meal_callback(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        state: ConversationState,
+        submission_id: str,
+    ) -> str:
+        """Finish meal logging after the current meal has been saved."""
+        if (
+            state.step
+            is not ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+        ):
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        try:
+            deleted = self.repo.delete_conversation_state(
+                user_id,
+                expected_revision=state.revision,
+                expected_request_id=submission_id,
+                expected_step=(
+                    ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+                ),
+            )
+        except Exception:
+            logger.exception("Completing meal workflow persistence failed")
+            self._send_meal_message(
+                chat_id,
+                "I couldn't finish meal logging. Please try again.",
+            )
+            return "Unable to finish meal logging"
+        if not deleted:
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        self._send_meal_message(chat_id, "Done. Meal logging is complete.")
+        return "Meal logging complete"
+
+    def _send_stale_meal_action(self, chat_id: int | str) -> None:
+        """Tell the user that a meal button no longer applies."""
+        self._send_meal_message(
+            chat_id,
+            "That meal action is stale or outdated. Nothing was changed.",
+        )
+
+    def _send_meal_message(self, chat_id: int | str, text: str) -> None:
+        """Deliver a response without losing its callback acknowledgement."""
+        try:
+            self.telegram_api.send_message(chat_id, text)
+        except TelegramAPIError:
+            logger.error("Meal callback delivery failed")
+
     def handle_conversational(self, route: RouteResult) -> None:
         if route.chat_id is None or not route.user_id or not route.text:
             return
         try:
             source_update_id = self._get_source_update_id(route)
             state = self._get_conversation_state(route.user_id)
+            if (
+                state
+                and state.workflow_kind is ConversationWorkflowKind.MEAL_LOG
+            ):
+                if state.step is ConversationWorkflowStep.AWAITING_MEAL_INPUT:
+                    self._handle_structured_meal_input(
+                        route.chat_id,
+                        route.user_id,
+                        route.text,
+                        route,
+                        state,
+                    )
+                elif state.step in {
+                    ConversationWorkflowStep.AWAITING_DATE,
+                    ConversationWorkflowStep.AWAITING_MEAL_TYPE,
+                    ConversationWorkflowStep.AWAITING_DESCRIPTION,
+                    ConversationWorkflowStep.AWAITING_ANOTHER_MEAL,
+                }:
+                    self._restart_legacy_meal_workflow(
+                        route.chat_id, route.user_id, state
+                    )
+                return
             if (
                 state
                 and state.workflow_kind is ConversationWorkflowKind.PLAN_REQUEST
@@ -1002,6 +1421,69 @@ class BotHandler:
         return (
             BotHandler._profile_with_updates(profile, {category.value: items}),
             f"Removed {removed}.",
+        )
+
+    def _handle_structured_meal_input(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        text: str,
+        route: RouteResult,
+        state: ConversationState,
+    ) -> None:
+        """Validate one meal locally and stage it for explicit review."""
+        result = parse_meal_input(text, self._reference_date_from_route(route))
+        if not result.is_valid:
+            explanation = "\n".join(result.errors)
+            self.telegram_api.send_message(
+                chat_id, f"{explanation}\n\n{MEAL_INPUT_PROMPT}"
+            )
+            return
+
+        assert result.draft is not None
+        now = datetime.now(timezone.utc)
+        review_state = state.model_copy(
+            update={
+                "step": ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+                "meal_draft": result.draft,
+                "revision": state.revision + 1,
+                "updated_at": now,
+            }
+        )
+        if not self.repo.transition_conversation_state(
+            user_id, review_state, expected_revision=state.revision
+        ):
+            self.telegram_api.send_message(
+                chat_id,
+                "That meal workflow changed. Please use /submit_meals.",
+            )
+            return
+        if review_state.request_id is None:
+            raise ValueError("meal review state requires a request ID")
+        self.telegram_api.send_meal_review(
+            chat_id, text, review_state.request_id
+        )
+
+    def _restart_legacy_meal_workflow(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        state: ConversationState,
+    ) -> None:
+        """Remove an old field-by-field meal workflow before restarting."""
+        if not self.repo.delete_conversation_state(
+            user_id, expected_revision=state.revision
+        ):
+            self.telegram_api.send_message(
+                chat_id,
+                "That meal workflow changed. Please use /submit_meals "
+                "to restart.",
+            )
+            return
+        self.telegram_api.send_message(
+            chat_id,
+            "Your older meal logging workflow was cleared. Please use "
+            "/submit_meals to restart.",
         )
 
     def _handle_meal_workflow(

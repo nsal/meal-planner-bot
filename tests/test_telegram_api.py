@@ -3,6 +3,7 @@
 import json
 from io import BytesIO
 from urllib.error import HTTPError, URLError
+from uuid import UUID
 
 import pytest
 from pytest_mock import MockerFixture
@@ -16,6 +17,8 @@ from meal_planner.models.schemas import (
 from meal_planner.telegram.api import (
     TelegramAPI,
     TelegramAPIError,
+    meal_continuation_keyboard,
+    meal_review_keyboard,
     split_text,
 )
 from meal_planner.telegram.commands import TelegramCommand
@@ -370,3 +373,89 @@ def test_profile_operation_renders_guidance_and_compact_navigation(
     for row in payload["reply_markup"]["inline_keyboard"]:
         for button in row:
             assert len(button["callback_data"].encode()) <= 64
+
+
+def test_send_meal_review_renders_exact_text_and_review_buttons(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch("urllib.request.urlopen", return_value=_response())
+    submission_id = UUID("12345678-1234-5678-1234-567812345678")
+
+    TelegramAPI("token").send_meal_review(
+        1,
+        "today, lunch, rice, beans, and salsa",
+        submission_id,
+    )
+
+    payload = json.loads(urlopen.call_args.args[0].data.decode())
+    assert payload["text"] == (
+        "Review this meal submission:\n"
+        "today, lunch, rice, beans, and salsa\n\n"
+        "Confirm to save it or cancel."
+    )
+    assert payload["reply_markup"] == {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "✅ Confirm",
+                    "callback_data": (
+                        "meal:confirm:12345678-1234-5678-1234-567812345678"
+                    ),
+                    "style": "success",
+                },
+                {
+                    "text": "❌ Cancel",
+                    "callback_data": (
+                        "meal:cancel:12345678-1234-5678-1234-567812345678"
+                    ),
+                    "style": "danger",
+                },
+            ]
+        ]
+    }
+
+
+def test_send_meal_saved_renders_continuation_buttons(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch("urllib.request.urlopen", return_value=_response())
+    submission_id = "12345678-1234-5678-1234-567812345678"
+
+    TelegramAPI("token").send_meal_saved(1, "rice and beans", submission_id)
+
+    payload = json.loads(urlopen.call_args.args[0].data.decode())
+    assert payload["text"] == "✅ Meal saved: rice and beans"
+    assert payload["reply_markup"] == {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "➕ Add more",
+                    "callback_data": (
+                        "meal:add:12345678-1234-5678-1234-567812345678"
+                    ),
+                    "style": "primary",
+                },
+                {
+                    "text": "✅ Done",
+                    "callback_data": (
+                        "meal:done:12345678-1234-5678-1234-567812345678"
+                    ),
+                    "style": "success",
+                },
+            ]
+        ]
+    }
+
+
+def test_meal_keyboard_callbacks_fit_telegram_byte_limit() -> None:
+    submission_id = UUID("12345678-1234-5678-1234-567812345678")
+
+    keyboards = (
+        meal_review_keyboard(submission_id),
+        meal_continuation_keyboard(submission_id),
+    )
+    for keyboard in keyboards:
+        for row in keyboard["inline_keyboard"]:
+            assert len(row) == 2
+            for button in row:
+                assert len(button["callback_data"].encode("utf-8")) <= 64

@@ -194,7 +194,7 @@ def test_configure_telegram_tolerates_historical_error(
     ]
     assert len(warnings) == 1
     assert "503 Service Unavailable" in warnings[0].message
-    assert "last_error_date=1755683212" in warnings[0].message
+    assert "last_error_date=2025-08-20 10:06:52 UTC" in warnings[0].message
     assert all(
         secret not in warnings[0].message for secret in settings.secret_values
     )

@@ -299,6 +299,16 @@ def test_conversation_state_validates_workflow_shape_and_expiry() -> None:
         )
 
 
+def _conversation_state_values() -> dict[str, object]:
+    """Return valid common values for conversation-state tests."""
+    now = datetime.now(timezone.utc)
+    return {
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": now + timedelta(hours=24),
+    }
+
+
 def test_profile_edit_menu_state_has_no_selected_operation() -> None:
     """A profile edit menu records no category or operation selection."""
     now = datetime.now(timezone.utc)
@@ -469,6 +479,189 @@ def test_plan_preference_can_be_retained_while_awaiting_clarification() -> None:
     )
 
     assert state.preference == "eggs three times, make it healthy"
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        ConversationWorkflowStep.AWAITING_MEAL_INPUT,
+        ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+        ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+    ],
+)
+def test_single_meal_workflow_steps_round_trip(
+    step: ConversationWorkflowStep,
+) -> None:
+    """New meal states require a submission ID and matching draft shape."""
+    draft = (
+        MealLogDraft()
+        if step is ConversationWorkflowStep.AWAITING_MEAL_INPUT
+        else MealLogDraft(
+            date=date(2026, 8, 22),
+            meal_type="lunch",
+            description="Salad",
+        )
+    )
+    state = ConversationState(
+        **_conversation_state_values(),
+        workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+        step=step,
+        meal_draft=draft,
+        request_id="submission-1",
+    )
+
+    assert state.step is step
+    assert state.request_id == "submission-1"
+    assert state.meal_draft == draft
+
+
+@pytest.mark.parametrize(
+    ("step", "draft", "request_id"),
+    [
+        (
+            ConversationWorkflowStep.AWAITING_MEAL_INPUT,
+            MealLogDraft(
+                date=date(2026, 8, 22),
+                meal_type="lunch",
+                description="Salad",
+            ),
+            "submission-1",
+        ),
+        (
+            ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+            MealLogDraft(),
+            "submission-1",
+        ),
+        (
+            ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+            MealLogDraft(),
+            "submission-1",
+        ),
+        (
+            ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+            MealLogDraft(
+                date=date(2026, 8, 22),
+                meal_type="lunch",
+                description="Salad",
+            ),
+            None,
+        ),
+    ],
+)
+def test_single_meal_workflow_rejects_wrong_draft_or_submission_id(
+    step: ConversationWorkflowStep,
+    draft: MealLogDraft,
+    request_id: str | None,
+) -> None:
+    """Input and post-input states reject incomplete contracts."""
+    with pytest.raises(ValidationError):
+        ConversationState(
+            **_conversation_state_values(),
+            workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+            step=step,
+            meal_draft=draft,
+            request_id=request_id,
+        )
+
+
+@pytest.mark.parametrize(
+    ("step", "draft"),
+    [
+        (
+            ConversationWorkflowStep.AWAITING_DATE,
+            MealLogDraft(),
+        ),
+        (
+            ConversationWorkflowStep.AWAITING_MEAL_TYPE,
+            MealLogDraft(date=date(2026, 8, 22)),
+        ),
+        (
+            ConversationWorkflowStep.AWAITING_DESCRIPTION,
+            MealLogDraft(date=date(2026, 8, 22), meal_type="lunch"),
+        ),
+        (
+            ConversationWorkflowStep.AWAITING_ANOTHER_MEAL,
+            MealLogDraft(
+                date=date(2026, 8, 22),
+                meal_type="lunch",
+                description="Salad",
+            ),
+        ),
+    ],
+)
+def test_legacy_meal_workflow_states_remain_compatible(
+    step: ConversationWorkflowStep,
+    draft: MealLogDraft,
+) -> None:
+    """Old field-by-field meal states remain deserializable."""
+    state = ConversationState(
+        **_conversation_state_values(),
+        workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+        step=step,
+        meal_draft=draft,
+    )
+
+    restored = ConversationState.model_validate_json(state.model_dump_json())
+    assert restored.step is step
+    assert restored.request_id is None
+
+
+@pytest.mark.parametrize(
+    ("workflow_kind", "step", "fields"),
+    [
+        (
+            ConversationWorkflowKind.PLAN_REQUEST,
+            ConversationWorkflowStep.AWAITING_PREFERENCE,
+            {"request_id": "plan-1"},
+        ),
+        (
+            ConversationWorkflowKind.PLAN_REQUEST,
+            ConversationWorkflowStep.GENERATING,
+            {"request_id": "plan-1"},
+        ),
+        (
+            ConversationWorkflowKind.PLAN_REQUEST,
+            ConversationWorkflowStep.RETRY_READY,
+            {"request_id": "plan-1"},
+        ),
+        (
+            ConversationWorkflowKind.PLAN_REVISION,
+            ConversationWorkflowStep.GENERATING,
+            {
+                "request_id": "revision-1",
+                "amendment": "Avoid cauliflower",
+                "target_week": date(2026, 8, 17),
+                "expected_plan_revision": 2,
+            },
+        ),
+        (
+            ConversationWorkflowKind.PLAN_REVISION,
+            ConversationWorkflowStep.RETRY_READY,
+            {
+                "request_id": "revision-1",
+                "amendment": "Avoid cauliflower",
+                "target_week": date(2026, 8, 17),
+                "expected_plan_revision": 2,
+            },
+        ),
+    ],
+)
+def test_plan_workflow_states_remain_deserializable(
+    workflow_kind: ConversationWorkflowKind,
+    step: ConversationWorkflowStep,
+    fields: dict[str, object],
+) -> None:
+    """All existing plan workflow states keep their validation contract."""
+    state = ConversationState(
+        **_conversation_state_values(),
+        workflow_kind=workflow_kind,
+        step=step,
+        **fields,
+    )
+
+    restored = ConversationState.model_validate_json(state.model_dump_json())
+    assert restored.workflow_kind is workflow_kind
+    assert restored.step is step
 
 
 def test_family_member_valid() -> None:
