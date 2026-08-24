@@ -1198,6 +1198,53 @@ class BotHandler:
         return name, target
 
     @staticmethod
+    def _parse_profile_member_suffix(
+        text: str,
+        members: list[FamilyMember],
+        *,
+        allow_none: bool,
+        maximum: int,
+    ) -> tuple[str, int | None] | None:
+        """Parse a final target suffix for an existing member edit.
+
+        Unlike the add-member parser, this parser permits numeric name tokens.
+        A stored identity prefix is used to reject extra suffix fields before
+        the caller resolves the complete parsed name.
+        """
+        if "\n" in text or "\r" in text:
+            return None
+        stripped = text.strip()
+        try:
+            name, target_text = stripped.rsplit(maxsplit=1)
+        except ValueError:
+            return None
+        target: int | None
+        if target_text.casefold() == "none":
+            if not allow_none:
+                return None
+            target = None
+        elif target_text.isdecimal():
+            target = int(target_text)
+            if not 1 <= target <= maximum:
+                return None
+        else:
+            return None
+
+        name_identity = BotHandler._member_identity(name)
+        if not name_identity:
+            return None
+        if any(
+            name_identity == BotHandler._member_identity(member.name)
+            for member in members
+        ):
+            return name, target
+        for member in members:
+            stored_name = member.name.strip()
+            if name.casefold().startswith(stored_name.casefold() + " "):
+                return None
+        return name, target
+
+    @staticmethod
     def _parse_profile_member_name(text: str) -> str | None:
         """Parse one exact, non-empty family member name."""
         if "\n" in text or "\r" in text:
@@ -1375,7 +1422,9 @@ class BotHandler:
             ProfileEditOperation.CHANGE_PROTEIN,
             ProfileEditOperation.CHANGE_FIBRE,
         }:
-            parsed_target = BotHandler._parse_profile_target_change(text)
+            parsed_target = BotHandler._parse_profile_member_suffix(
+                text, members, allow_none=True, maximum=1_000
+            )
             if parsed_target is None:
                 return None, "Use the format: name grams, or name none."
             name, target = parsed_target
@@ -1418,14 +1467,30 @@ class BotHandler:
                 "target.",
             )
 
-        parsed = BotHandler._parse_profile_name_calories(text)
-        if parsed is None:
-            return (
-                None,
-                "Use the format: name calories, or name calories protein "
-                "fibre.",
+        if operation is ProfileEditOperation.CHANGE_CALORIES:
+            parsed_target = BotHandler._parse_profile_member_suffix(
+                text, members, allow_none=False, maximum=10_000
             )
-        name, calories, protein, fibre = parsed
+            if parsed_target is None or parsed_target[1] is None:
+                return (
+                    None,
+                    "Use the format: name calories, or name calories "
+                    "protein fibre.",
+                )
+            name = parsed_target[0]
+            calories = parsed_target[1]
+            assert calories is not None
+            protein = None
+            fibre = None
+        else:
+            parsed = BotHandler._parse_profile_name_calories(text)
+            if parsed is None:
+                return (
+                    None,
+                    "Use the format: name calories, or name calories "
+                    "protein fibre.",
+                )
+            name, calories, protein, fibre = parsed
         if operation is ProfileEditOperation.CHANGE_CALORIES and (
             protein is not None or fibre is not None
         ):
@@ -1992,6 +2057,64 @@ class BotHandler:
                 False, "I couldn't save that change. Please try again."
             )
 
+    def _merge_omitted_member_targets(
+        self,
+        incoming_members: list[FamilyMember],
+        draft_members: list[FamilyMember] | None,
+        saved_members: list[FamilyMember] | None,
+    ) -> list[FamilyMember] | None:
+        """Inherit only omitted targets from an unambiguous member source."""
+        if all(
+            {
+                "protein_target",
+                "fibre_target",
+            }.issubset(member.model_fields_set)
+            for member in incoming_members
+        ):
+            return list(incoming_members)
+
+        draft_by_identity: dict[str, list[FamilyMember]] = {}
+        for member in draft_members or []:
+            identity = self._member_identity(member.name)
+            draft_by_identity.setdefault(identity, []).append(member)
+
+        saved_by_identity: dict[str, list[FamilyMember]] = {}
+        for member in saved_members or []:
+            identity = self._member_identity(member.name)
+            saved_by_identity.setdefault(identity, []).append(member)
+
+        merged_members: list[FamilyMember] = []
+        for incoming in incoming_members:
+            if {
+                "protein_target",
+                "fibre_target",
+            }.issubset(incoming.model_fields_set):
+                merged_members.append(incoming)
+                continue
+            identity = self._member_identity(incoming.name)
+            draft_matches = draft_by_identity.get(identity, [])
+            source: FamilyMember | None
+            if len(draft_matches) > 1:
+                return None
+            if len(draft_matches) == 1:
+                source = draft_matches[0]
+            else:
+                saved_matches = saved_by_identity.get(identity, [])
+                if len(saved_matches) > 1:
+                    return None
+                source = saved_matches[0] if saved_matches else None
+
+            updates: dict[str, int | None] = {}
+            if source is not None:
+                if "protein_target" not in incoming.model_fields_set:
+                    updates["protein_target"] = source.protein_target
+                if "fibre_target" not in incoming.model_fields_set:
+                    updates["fibre_target"] = source.fibre_target
+            merged_members.append(
+                incoming.model_copy(update=updates) if updates else incoming
+            )
+        return merged_members
+
     def _update_profile(
         self,
         user_id: str,
@@ -2000,6 +2123,11 @@ class BotHandler:
     ) -> MutationResult:
         update = ProfileUpdateEntities.model_validate(entities)
         persisted_draft = self.repo.get_profile_draft(user_id)
+        draft_members = (
+            persisted_draft.family_members
+            if isinstance(persisted_draft, ProfileUpdateEntities)
+            else None
+        )
         if isinstance(persisted_draft, ProfileUpdateEntities):
             data = persisted_draft.model_dump(mode="json")
         elif existing:
@@ -2013,7 +2141,20 @@ class BotHandler:
         ):
             data["family_members"] = None
         for field in update.model_fields_set:
-            data[field] = getattr(update, field)
+            value = getattr(update, field)
+            if field == "family_members" and value is not None:
+                value = self._merge_omitted_member_targets(
+                    value,
+                    draft_members,
+                    existing.family_members if existing else None,
+                )
+                if value is None:
+                    return MutationResult(
+                        False,
+                        "Family member names must be unique, ignoring "
+                        "capitalization and surrounding spaces.",
+                    )
+            data[field] = value
         draft = ProfileUpdateEntities.model_validate(data)
         if (
             "family_members" in update.model_fields_set
