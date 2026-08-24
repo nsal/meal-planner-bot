@@ -370,9 +370,9 @@ member's name and other targets.
   test commands, and final results
 - [x] rerun documentation tests followed by `uv run pytest`
 - [x] move the fully checked plan into `docs/plans/completed/`
-- [ ] use a Conventional Commit containing the associated issue number; never
+- [x] use a Conventional Commit containing the associated issue number; never
   push or merge directly to `master`
-- [ ] comment on the associated GitHub issue with the completed work and a link
+- [x] comment on the associated GitHub issue with the completed work and a link
   to the commit or pull request
 
 **Task 8 implementation record:**
@@ -396,9 +396,9 @@ member's name and other targets.
   - `uv run ruff check .` — passed.
   - `uv run mypy` — passed.
   - `git diff --check` — passed.
-- Parent-owned finalization remains outstanding: the associated issue commit
-  and GitHub issue comment are intentionally unchecked until the parent
-  executor performs them.
+- Parent finalization completed: commit `ed8da93` uses the Conventional Commit
+  format with issue `#58`, and the completed work was posted to GitHub issue
+  `#58` with a link to that commit.
 
 ## Post-Completion
 
