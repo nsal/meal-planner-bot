@@ -6,6 +6,7 @@ from typing import Optional
 
 from meal_planner.models.schemas import (
     ConversationState,
+    FamilyMember,
     MealLogEntry,
     MealOutcome,
     PreferenceRequirement,
@@ -15,13 +16,33 @@ from meal_planner.models.schemas import (
 )
 
 
+def _render_member_targets(
+    member: FamilyMember, calorie_unit: str = "kcal"
+) -> str:
+    """Render one member's calorie and optional nutrient targets."""
+    protein_target = (
+        f"{member.protein_target} g/day"
+        if member.protein_target is not None
+        else "not set"
+    )
+    fibre_target = (
+        f"{member.fibre_target} g/day"
+        if member.fibre_target is not None
+        else "not set"
+    )
+    return (
+        f"{member.name} ({member.calorie_target} {calorie_unit}) "
+        f"[protein target: {protein_target}; fibre target: {fibre_target}]"
+    )
+
+
 def _profile_text(profile: UserProfile | None) -> str:
     """Render the trusted household profile for planner prompts."""
     if profile is None:
         return "No user profile established yet."
     members = (
         ", ".join(
-            f"{member.name} ({member.calorie_target} kcal/day)"
+            _render_member_targets(member, "kcal/day")
             for member in profile.family_members
         )
         or "None specified"
@@ -50,10 +71,7 @@ def build_conversational_prompt(
     profile_text = "No user profile established yet."
     if profile:
         members_str = (
-            ", ".join(
-                f"{m.name} ({m.calorie_target} kcal)"
-                for m in profile.family_members
-            )
+            ", ".join(_render_member_targets(m) for m in profile.family_members)
             or "None specified"
         )
         dietary_str = ", ".join(profile.dietary_preferences) or "None"
@@ -93,8 +111,7 @@ def build_conversational_prompt(
             elif field == "family_members":
                 rendered = (
                     ", ".join(
-                        f"{member.name} ({member.calorie_target} kcal)"
-                        for member in value
+                        _render_member_targets(member) for member in value
                     )
                     or "None specified"
                 )
@@ -160,10 +177,17 @@ def build_conversational_prompt(
         "updates may include 'name', 'people_count', and 'family_members'. "
         "The top-level 'name' field means the household's family "
         "name, and must be collected separately from each individual "
-        "member's name. Use family_members with each member's name and "
-        "calorie_target, plus dietary_constraints, dietary_preferences, "
-        "and goals. Never use an individual member's name as the family "
-        "name unless the user explicitly provides it. Meal dates must use "
+        "member's name. Use family_members with one object per person. "
+        "Each object must include the member's name and calorie_target, "
+        "and may include protein_target and fibre_target as integer "
+        "grams/day only when the user explicitly provides them. Keep "
+        "each optional target on the correct member, omit absent optional "
+        "fields, and never invent, infer, or default their values. Protein "
+        "and fibre targets are optional and must never be treated as "
+        "profile completion or planning prerequisites. Also extract "
+        "dietary_constraints, dietary_preferences, and goals. Never use "
+        "an individual member's name as the family name unless the user "
+        "explicitly provides it. Meal dates must use "
         "YYYY-MM-DD. Today's date is "
         f"{today_text}. For a pending meal workflow, extract only fields "
         "explicitly present in the user's message; never invent a date, "
@@ -196,7 +220,7 @@ def build_plan_prompt(
     if profile:
         members_str = (
             ", ".join(
-                f"{m.name} ({m.calorie_target} kcal/day)"
+                _render_member_targets(m, "kcal/day")
                 for m in profile.family_members
             )
             or f"1 person ({profile.name})"
@@ -278,8 +302,16 @@ def build_plan_prompt(
         "=== REQUEST-SPECIFIC PREFERENCE (HIGH PRIORITY) ===\n"
         f"{preference.strip() if preference else 'No additional preference.'}\n"
         "Use this request preference when compatible with the permanent "
-        "profile constraints below. Dietary constraints, calorie "
-        "targets, and safety requirements always take precedence.\n\n"
+        "profile constraints below. Dietary constraints and safety "
+        "requirements always take precedence over calorie, protein, "
+        "fibre, and request-specific preferences.\n\n"
+        "=== PER-MEMBER NUTRITION TARGET GUIDANCE ===\n"
+        "Use every supplied per-member calorie, protein, and fibre target "
+        "to guide meal choices and portions. This is best-effort guidance; "
+        "do not invent missing targets. The application does not calculate, "
+        "validate, detect, or repair target compliance. Keep the returned "
+        "plan JSON schema unchanged; do not add nutrient totals or "
+        "per-member portions.\n\n"
         "=== INTERPRETED PREFERENCE RULES (EXACT COMPLIANCE) ===\n"
         f"{requirement_text}\n"
         "Treat each exact_count as an exact weekly count. Do not omit, "
@@ -437,9 +469,15 @@ def build_plan_revision_prompt(
         "=== LATEST USER AMENDMENT (HIGHEST REQUEST PRIORITY) ===\n"
         f"{amendment}\n\n"
         "Satisfy all compatible instructions and preserve sensible "
-        "unaffected choices. Permanent dietary constraints, "
-        "calorie targets, and safety rules take precedence over every "
-        "request-specific instruction. Use the same week and return all "
+        "unaffected choices. Use every supplied per-member calorie, "
+        "protein, and fibre target to guide meal choices and portions. "
+        "This is best-effort guidance; do not invent missing targets. "
+        "Permanent dietary constraints and safety rules take precedence "
+        "over target adjustment and every request-specific instruction. "
+        "The application does not calculate, validate, detect, or repair "
+        "target compliance. Keep the returned plan JSON schema unchanged; "
+        "do not add nutrient totals or per-member portions. Use the same "
+        "week and return all "
         f"seven days for week start {target_week}. Do not return a patch.\n\n"
         "=== OUTPUT JSON SCHEMA ===\n"
         "Return strictly valid JSON matching this schema:\n"

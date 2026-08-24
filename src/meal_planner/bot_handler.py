@@ -208,9 +208,12 @@ class BotHandler:
         else:
             message = (
                 "Welcome to Meal Planner Bot! Tell me your family name, "
-                "household size, each household member's name and calorie "
-                "target, dietary constraints, dietary preferences, and "
-                "goals. "
+                "household size, and each household member's name and "
+                "required calorie target. You may also provide optional "
+                "protein and fibre targets in grams/day for each member; "
+                "these are not required to complete setup or generate a "
+                "plan. Tell me your dietary constraints, dietary "
+                "preferences, and goals. "
                 "After setup, use /plan, /submit_meals, /checkin, or "
                 "/cancel."
             )
@@ -1139,18 +1142,107 @@ class BotHandler:
     @staticmethod
     def _parse_profile_name_calories(
         text: str,
-    ) -> tuple[str, int] | None:
-        """Parse one member name followed by a positive calorie target."""
+    ) -> tuple[str, int, int | None, int | None] | None:
+        """Parse a member name followed by two or four target fields."""
         if "\n" in text or "\r" in text:
             return None
-        match = re.fullmatch(r"(.+?)\s+([0-9]+)", text.strip())
+        parts = text.strip().split()
+        if len(parts) < 2:
+            return None
+        if len(parts) >= 4 and all(part.isdecimal() for part in parts[-3:]):
+            name_parts = parts[:-3]
+            calorie_text, protein_text, fibre_text = parts[-3:]
+            if not name_parts or any(part.isdecimal() for part in name_parts):
+                return None
+            name = " ".join(name_parts)
+            calories = int(calorie_text)
+            protein = int(protein_text)
+            fibre = int(fibre_text)
+            if (
+                not 1 <= calories <= 10_000
+                or not 1 <= protein <= 1_000
+                or not 1 <= fibre <= 1_000
+            ):
+                return None
+            return name, calories, protein, fibre
+        if not parts[-1].isdecimal():
+            return None
+        name_parts = parts[:-1]
+        if not name_parts or any(part.isdecimal() for part in name_parts):
+            return None
+        name = " ".join(name_parts)
+        calories = int(parts[-1])
+        if not 1 <= calories <= 10_000:
+            return None
+        return name, calories, None, None
+
+    @staticmethod
+    def _parse_profile_target_change(
+        text: str,
+    ) -> tuple[str, int | None] | None:
+        """Parse a member name followed by one nutrient target or ``none``."""
+        if "\n" in text or "\r" in text:
+            return None
+        match = re.fullmatch(r"(.+?)\s+(none|[0-9]+)", text.strip(), re.I)
         if match is None:
             return None
         name = match.group(1).strip()
-        calories = int(match.group(2))
-        if not name or not 1 <= calories <= 10_000:
+        target_text = match.group(2)
+        if not name or any(part.isdecimal() for part in name.split()):
             return None
-        return name, calories
+        if target_text.casefold() == "none":
+            return name, None
+        target = int(target_text)
+        if not 1 <= target <= 1_000:
+            return None
+        return name, target
+
+    @staticmethod
+    def _parse_profile_member_suffix(
+        text: str,
+        members: list[FamilyMember],
+        *,
+        allow_none: bool,
+        maximum: int,
+    ) -> tuple[str, int | None] | None:
+        """Parse a final target suffix for an existing member edit.
+
+        Unlike the add-member parser, this parser permits numeric name tokens.
+        A stored identity prefix is used to reject extra suffix fields before
+        the caller resolves the complete parsed name.
+        """
+        if "\n" in text or "\r" in text:
+            return None
+        stripped = text.strip()
+        try:
+            name, target_text = stripped.rsplit(maxsplit=1)
+        except ValueError:
+            return None
+        target: int | None
+        if target_text.casefold() == "none":
+            if not allow_none:
+                return None
+            target = None
+        elif target_text.isdecimal():
+            target = int(target_text)
+            if not 1 <= target <= maximum:
+                return None
+        else:
+            return None
+
+        name_identity = BotHandler._member_identity(name)
+        if not name_identity:
+            return None
+        if any(
+            name_identity == BotHandler._member_identity(member.name)
+            for member in members
+        ):
+            return name, target
+        for member in members:
+            stored_name = member.name.strip()
+            if name.casefold().startswith(stored_name.casefold() + " "):
+                return None
+        return name, target
 
     @staticmethod
     def _parse_profile_member_name(text: str) -> str | None:
@@ -1277,6 +1369,8 @@ class BotHandler:
         text: str,
     ) -> tuple[UserProfile | None, str]:
         """Validate and apply one immutable profile amendment."""
+        if not operation.is_valid_for(category):
+            return None, "That profile operation is not available here."
         if category is ProfileEditCategory.FAMILY:
             return self._apply_family_amendment(profile, operation, text)
         return self._apply_item_amendment(profile, category, operation, text)
@@ -1287,7 +1381,7 @@ class BotHandler:
         operation: ProfileEditOperation,
         text: str,
     ) -> tuple[UserProfile | None, str]:
-        """Apply a family member add, remove, or calorie change."""
+        """Apply one deterministic family-member amendment."""
         members = list(profile.family_members)
         if operation is ProfileEditOperation.REMOVE:
             name = BotHandler._parse_profile_member_name(text)
@@ -1324,10 +1418,83 @@ class BotHandler:
                 f"Removed {removed.name}.",
             )
 
-        parsed = BotHandler._parse_profile_name_calories(text)
-        if parsed is None:
-            return None, "Use the format: name calories, for example John 1500."
-        name, calories = parsed
+        if operation in {
+            ProfileEditOperation.CHANGE_PROTEIN,
+            ProfileEditOperation.CHANGE_FIBRE,
+        }:
+            parsed_target = BotHandler._parse_profile_member_suffix(
+                text, members, allow_none=True, maximum=1_000
+            )
+            if parsed_target is None:
+                return None, "Use the format: name grams, or name none."
+            name, target = parsed_target
+            matching_indices = [
+                index
+                for index, member in enumerate(members)
+                if BotHandler._member_identity(member.name)
+                == BotHandler._member_identity(name)
+            ]
+            if len(matching_indices) > 1:
+                return (
+                    None,
+                    "That family member name is ambiguous in this legacy "
+                    "profile. Please update the names before trying again.",
+                )
+            if not matching_indices:
+                return None, "I couldn't find that family member."
+            index = matching_indices[0]
+            field_name = (
+                "protein_target"
+                if operation is ProfileEditOperation.CHANGE_PROTEIN
+                else "fibre_target"
+            )
+            members[index] = members[index].model_copy(
+                update={field_name: target}
+            )
+            label = "protein" if field_name == "protein_target" else "fibre"
+            action = "cleared" if target is None else "updated"
+            return (
+                BotHandler._profile_with_updates(
+                    profile,
+                    {
+                        "family_members": [
+                            member.model_dump(mode="json") for member in members
+                        ],
+                        "people_count": len(members),
+                    },
+                ),
+                f"{action.capitalize()} {members[index].name}'s {label} "
+                "target.",
+            )
+
+        if operation is ProfileEditOperation.CHANGE_CALORIES:
+            parsed_target = BotHandler._parse_profile_member_suffix(
+                text, members, allow_none=False, maximum=10_000
+            )
+            if parsed_target is None or parsed_target[1] is None:
+                return (
+                    None,
+                    "Use the format: name calories, or name calories "
+                    "protein fibre.",
+                )
+            name = parsed_target[0]
+            calories = parsed_target[1]
+            assert calories is not None
+            protein = None
+            fibre = None
+        else:
+            parsed = BotHandler._parse_profile_name_calories(text)
+            if parsed is None:
+                return (
+                    None,
+                    "Use the format: name calories, or name calories "
+                    "protein fibre.",
+                )
+            name, calories, protein, fibre = parsed
+        if operation is ProfileEditOperation.CHANGE_CALORIES and (
+            protein is not None or fibre is not None
+        ):
+            return None, "Use the format: name calories."
         matching_indices = [
             index
             for index, member in enumerate(members)
@@ -1345,7 +1512,12 @@ class BotHandler:
                 return None, "That family member already exists."
             if len(members) >= 20:
                 return None, "A profile can have at most 20 family members."
-            member = FamilyMember(name=name, calorie_target=calories)
+            member = FamilyMember(
+                name=name,
+                calorie_target=calories,
+                protein_target=protein,
+                fibre_target=fibre,
+            )
             members.append(member)
             return (
                 BotHandler._profile_with_updates(
@@ -1368,8 +1540,8 @@ class BotHandler:
         if not matching_indices:
             return None, "I couldn't find that family member."
         index = matching_indices[0]
-        members[index] = FamilyMember(
-            name=members[index].name, calorie_target=calories
+        members[index] = members[index].model_copy(
+            update={"calorie_target": calories}
         )
         return (
             BotHandler._profile_with_updates(
@@ -1885,6 +2057,64 @@ class BotHandler:
                 False, "I couldn't save that change. Please try again."
             )
 
+    def _merge_omitted_member_targets(
+        self,
+        incoming_members: list[FamilyMember],
+        draft_members: list[FamilyMember] | None,
+        saved_members: list[FamilyMember] | None,
+    ) -> list[FamilyMember] | None:
+        """Inherit only omitted targets from an unambiguous member source."""
+        if all(
+            {
+                "protein_target",
+                "fibre_target",
+            }.issubset(member.model_fields_set)
+            for member in incoming_members
+        ):
+            return list(incoming_members)
+
+        draft_by_identity: dict[str, list[FamilyMember]] = {}
+        for member in draft_members or []:
+            identity = self._member_identity(member.name)
+            draft_by_identity.setdefault(identity, []).append(member)
+
+        saved_by_identity: dict[str, list[FamilyMember]] = {}
+        for member in saved_members or []:
+            identity = self._member_identity(member.name)
+            saved_by_identity.setdefault(identity, []).append(member)
+
+        merged_members: list[FamilyMember] = []
+        for incoming in incoming_members:
+            if {
+                "protein_target",
+                "fibre_target",
+            }.issubset(incoming.model_fields_set):
+                merged_members.append(incoming)
+                continue
+            identity = self._member_identity(incoming.name)
+            draft_matches = draft_by_identity.get(identity, [])
+            source: FamilyMember | None
+            if len(draft_matches) > 1:
+                return None
+            if len(draft_matches) == 1:
+                source = draft_matches[0]
+            else:
+                saved_matches = saved_by_identity.get(identity, [])
+                if len(saved_matches) > 1:
+                    return None
+                source = saved_matches[0] if saved_matches else None
+
+            updates: dict[str, int | None] = {}
+            if source is not None:
+                if "protein_target" not in incoming.model_fields_set:
+                    updates["protein_target"] = source.protein_target
+                if "fibre_target" not in incoming.model_fields_set:
+                    updates["fibre_target"] = source.fibre_target
+            merged_members.append(
+                incoming.model_copy(update=updates) if updates else incoming
+            )
+        return merged_members
+
     def _update_profile(
         self,
         user_id: str,
@@ -1893,6 +2123,11 @@ class BotHandler:
     ) -> MutationResult:
         update = ProfileUpdateEntities.model_validate(entities)
         persisted_draft = self.repo.get_profile_draft(user_id)
+        draft_members = (
+            persisted_draft.family_members
+            if isinstance(persisted_draft, ProfileUpdateEntities)
+            else None
+        )
         if isinstance(persisted_draft, ProfileUpdateEntities):
             data = persisted_draft.model_dump(mode="json")
         elif existing:
@@ -1906,7 +2141,20 @@ class BotHandler:
         ):
             data["family_members"] = None
         for field in update.model_fields_set:
-            data[field] = getattr(update, field)
+            value = getattr(update, field)
+            if field == "family_members" and value is not None:
+                value = self._merge_omitted_member_targets(
+                    value,
+                    draft_members,
+                    existing.family_members if existing else None,
+                )
+                if value is None:
+                    return MutationResult(
+                        False,
+                        "Family member names must be unique, ignoring "
+                        "capitalization and surrounding spaces.",
+                    )
+            data[field] = value
         draft = ProfileUpdateEntities.model_validate(data)
         if (
             "family_members" in update.model_fields_set

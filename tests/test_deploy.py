@@ -21,9 +21,7 @@ def _settings(**overrides: Any) -> deploy.DeploymentSettings:
         "TELEGRAM_WEBHOOK_SECRET": "webhook-secret",
         "LLM_API_KEY": "llm-secret",
         "TELEGRAM_ALLOWED_USER_IDS": "123456789,987654321",
-        "TELEGRAM_BOT_TOKEN_SECRET_NAME": "meal-planner/bot-token",
-        "TELEGRAM_WEBHOOK_SECRET_NAME": "meal-planner/webhook-secret",
-        "LLM_API_KEY_SECRET_NAME": "meal-planner/llm-key",
+        "APP_SECRETS_SECRET_NAME": "meal-planner/app-secrets",
     }
     values.update(overrides)
     return deploy.DeploymentSettings(**values)
@@ -41,6 +39,7 @@ class FakeRunner(deploy.CommandRunner):
         self.commands: list[tuple[str, ...]] = []
         self.environments: list[dict[str, str] | None] = []
         self.interactive: list[bool] = []
+        self.secret_file_contents: list[str] = []
         self.missing_secret = missing_secret
         self.failed_stage = failed_stage
 
@@ -49,6 +48,13 @@ class FakeRunner(deploy.CommandRunner):
         self.commands.append(command)
         self.environments.append(kwargs.get("env"))
         self.interactive.append(bool(kwargs.get("interactive", False)))
+        for argument in command:
+            if argument.startswith("file://"):
+                self.secret_file_contents.append(
+                    Path(argument.removeprefix("file://")).read_text(
+                        encoding="utf-8"
+                    )
+                )
         if kwargs.get("stage") == self.failed_stage:
             raise deploy.CommandExecutionError(
                 command,
@@ -194,7 +200,7 @@ def test_configure_telegram_tolerates_historical_error(
     ]
     assert len(warnings) == 1
     assert "503 Service Unavailable" in warnings[0].message
-    assert "last_error_date=2025-08-20 10:06:52 UTC" in warnings[0].message
+    assert "last_error_date=2025-08-20 09:46:52 UTC" in warnings[0].message
     assert all(
         secret not in warnings[0].message for secret in settings.secret_values
     )
@@ -264,9 +270,7 @@ def test_settings_load_env_file_and_environment_override(
         "TELEGRAM_WEBHOOK_SECRET=file-webhook\n"
         "LLM_API_KEY=file-key\n"
         "TELEGRAM_ALLOWED_USER_IDS=123\n"
-        "TELEGRAM_BOT_TOKEN_SECRET_NAME=file/bot\n"
-        "TELEGRAM_WEBHOOK_SECRET_NAME=file/webhook\n"
-        "LLM_API_KEY_SECRET_NAME=file/llm\n",
+        "APP_SECRETS_SECRET_NAME=file/app-secrets\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("STACK_NAME", "from-environment")
@@ -288,6 +292,7 @@ def test_settings_load_env_file_and_environment_override(
         ("ENVIRONMENT", "test"),
         ("CONVERSATIONAL_LLM_REASONING_EFFORT", "invalid"),
         ("PLANNER_LLM_REASONING_EFFORT", "invalid"),
+        ("APP_SECRETS_SECRET_NAME", "   "),
     ],
 )
 def test_invalid_settings_are_safe(
@@ -301,9 +306,7 @@ def test_invalid_settings_are_safe(
         "TELEGRAM_WEBHOOK_SECRET": "webhook-secret",
         "LLM_API_KEY": "llm-secret",
         "TELEGRAM_ALLOWED_USER_IDS": "123",
-        "TELEGRAM_BOT_TOKEN_SECRET_NAME": "bot",
-        "TELEGRAM_WEBHOOK_SECRET_NAME": "webhook",
-        "LLM_API_KEY_SECRET_NAME": "llm",
+        "APP_SECRETS_SECRET_NAME": "app-secrets",
     }
     values[field] = value
     for name, item in values.items():
@@ -313,6 +316,33 @@ def test_invalid_settings_are_safe(
         deploy.DeploymentSettings.load()
     assert "secret-token" not in str(error.value)
     assert "llm-secret" not in str(error.value)
+
+
+def test_settings_require_one_secret_name_and_ignore_legacy_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values: dict[str, str] = {
+        "AWS_PROFILE": "meal-planner",
+        "AWS_REGION": "eu-west-1",
+        "STACK_NAME": "stack",
+        "TELEGRAM_BOT_TOKEN": "secret-token",
+        "TELEGRAM_WEBHOOK_SECRET": "webhook-secret",
+        "LLM_API_KEY": "llm-secret",
+        "TELEGRAM_ALLOWED_USER_IDS": "123",
+        "TELEGRAM_BOT_TOKEN_SECRET_NAME": "legacy-bot",
+        "TELEGRAM_WEBHOOK_SECRET_NAME": "legacy-webhook",
+        "LLM_API_KEY_SECRET_NAME": "legacy-llm",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("APP_SECRETS_SECRET_NAME", raising=False)
+
+    with pytest.raises(deploy.DeploymentConfigurationError) as error:
+        deploy.DeploymentSettings.load()
+
+    assert "APP_SECRETS_SECRET_NAME" in str(error.value)
+    assert "secret-token" not in str(error.value)
+    assert "legacy-bot" not in str(error.value)
 
 
 def test_cli_modes_are_independent_and_composable() -> None:
@@ -389,7 +419,7 @@ def test_command_runner_bounds_verbose_diagnostics(
 
 def test_secret_sync_is_double_opt_in_and_uses_no_secret_arguments() -> None:
     settings = _settings(SYNC_SECRETS=True)
-    runner = FakeRunner(missing_secret="meal-planner/llm-key")
+    runner = FakeRunner(missing_secret="meal-planner/app-secrets")
 
     deploy.synchronize_secrets(runner, settings, requested=True)
 
@@ -399,7 +429,107 @@ def test_secret_sync_is_double_opt_in_and_uses_no_secret_arguments() -> None:
     assert "bot-secret" not in secret_args
     assert "webhook-secret" not in secret_args
     assert "llm-secret" not in secret_args
-    assert any("create-secret" in command for command in runner.commands)
+    assert settings.secret_string not in secret_args
+    assert sum("describe-secret" in command for command in runner.commands) == 1
+    assert sum("create-secret" in command for command in runner.commands) == 1
+    assert (
+        sum("put-secret-value" in command for command in runner.commands) == 0
+    )
+    assert runner.secret_file_contents == [settings.secret_string]
+
+
+def test_secret_payload_has_stable_keys_and_serialization() -> None:
+    settings = _settings()
+
+    assert settings.secret_payload == {
+        "telegram_bot_token": "bot-secret",
+        "telegram_webhook_secret": "webhook-secret",
+        "llm_api_key": "llm-secret",
+    }
+    assert settings.secret_string == (
+        '{"llm_api_key":"llm-secret",'
+        '"telegram_bot_token":"bot-secret",'
+        '"telegram_webhook_secret":"webhook-secret"}'
+    )
+
+
+def test_secret_sync_updates_existing_secret_once() -> None:
+    settings = _settings(SYNC_SECRETS=True)
+    runner = FakeRunner()
+
+    deploy.synchronize_secrets(runner, settings, requested=True)
+
+    assert sum("describe-secret" in command for command in runner.commands) == 1
+    assert sum("create-secret" in command for command in runner.commands) == 0
+    assert (
+        sum("put-secret-value" in command for command in runner.commands) == 1
+    )
+    assert runner.secret_file_contents == [settings.secret_string]
+
+
+def test_missing_secret_without_opt_in_fails_safely() -> None:
+    settings = _settings(SYNC_SECRETS=False)
+    runner = FakeRunner(missing_secret=settings.app_secrets_secret_name)
+
+    with pytest.raises(deploy.DeploymentError) as error:
+        deploy.synchronize_secrets(runner, settings, requested=False)
+
+    message = str(error.value)
+    assert "secret check failed" in message
+    assert settings.secret_string not in message
+    assert all(value not in message for value in settings.secret_values)
+    assert sum("describe-secret" in command for command in runner.commands) == 1
+    assert not any(
+        "create-secret" in command or "put-secret-value" in command
+        for command in runner.commands
+    )
+
+
+@pytest.mark.parametrize("missing_secret", [False, True])
+def test_secret_sync_write_failures_redact_payload_and_values(
+    missing_secret: bool,
+    mocker: MockerFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = _settings(SYNC_SECRETS=True)
+    calls: list[tuple[str, ...]] = []
+
+    def run_command(
+        args: list[str], **_: Any
+    ) -> subprocess.CompletedProcess[str]:
+        command = tuple(args)
+        calls.append(command)
+        if "describe-secret" in command and missing_secret:
+            return subprocess.CompletedProcess(
+                args, 254, "", "ResourceNotFoundException"
+            )
+        if "create-secret" in command or "put-secret-value" in command:
+            return subprocess.CompletedProcess(
+                args, 1, "", settings.secret_string
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    mocker.patch("subprocess.run", side_effect=run_command)
+
+    with pytest.raises(deploy.CommandExecutionError) as error:
+        deploy.synchronize_secrets(
+            deploy.CommandRunner(), settings, requested=True
+        )
+
+    message = str(error.value)
+    command_output = capsys.readouterr().out
+    assert settings.secret_string not in message
+    assert settings.secret_string not in command_output
+    assert all(value not in message for value in settings.secret_values)
+    assert all(value not in command_output for value in settings.secret_values)
+    assert sum("describe-secret" in command for command in calls) == 1
+    assert (
+        sum(
+            "create-secret" in command or "put-secret-value" in command
+            for command in calls
+        )
+        == 1
+    )
 
 
 def test_secret_sync_flag_without_env_opt_in_fails_before_aws() -> None:
@@ -434,6 +564,11 @@ def test_routine_sam_deploy_resolves_an_artifact_bucket() -> None:
     assert "--no-fail-on-empty-changeset" in command
     assert "PlannerLlmModel=gpt-5.6-luna" in command
     assert "PlannerLlmReasoningEffort=high" in command
+    assert "AppSecretsSecretName=meal-planner/app-secrets" in command
+    assert not any(
+        "SecretName=" in argument and "AppSecretsSecretName=" not in argument
+        for argument in command
+    )
 
 
 def test_sam_preflight_runs_exact_sam_only_sequence() -> None:
