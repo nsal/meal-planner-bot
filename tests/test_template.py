@@ -250,20 +250,28 @@ def _assert_built_template_is_current() -> None:
     built_globals = built_template["Globals"]["Function"]
 
     built_global_variables = built_globals["Environment"]["Variables"]
-    for variable_name, parameter_name in (
-        ("TELEGRAM_BOT_TOKEN", "TelegramBotTokenSecretName"),
-        ("LLM_API_KEY", "LlmApiKeySecretName"),
+    for variable_name in (
+        "TELEGRAM_BOT_TOKEN",
+        "LLM_API_KEY",
     ):
         dynamic_reference = built_global_variables[variable_name]
         assert _contains_text(dynamic_reference, "secretsmanager")
-        assert _contains_text(dynamic_reference, parameter_name)
+        assert _contains_text(dynamic_reference, "AppSecretsSecretName")
 
     built_bot_variables = built_template["Resources"]["BotFunction"][
         "Properties"
     ]["Environment"]["Variables"]
     webhook_reference = built_bot_variables["TELEGRAM_WEBHOOK_SECRET"]
     assert _contains_text(webhook_reference, "secretsmanager")
-    assert _contains_text(webhook_reference, "TelegramWebhookSecretName")
+    assert _contains_text(webhook_reference, "AppSecretsSecretName")
+
+    for logical_id in ("BotFunction", "PlannerFunction"):
+        variables = built_template["Resources"][logical_id]["Properties"][
+            "Environment"
+        ]["Variables"]
+        assert variables["SECRET_REFRESH_TOKEN"] == {
+            "Ref": "SecretRefreshToken"
+        }
 
 
 def _assert_source_files_match_artifact(artifact: Path) -> None:
@@ -525,15 +533,22 @@ def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
     """Secrets enter Lambda through Secrets Manager references."""
     template = _load_template()
     parameters = template["Parameters"]
-    secret_parameters = {
-        "TelegramBotTokenSecretName",
-        "TelegramWebhookSecretName",
-        "LlmApiKeySecretName",
-    }
     assert parameters["SecretRefreshToken"]["Type"] == "String"
     assert "Default" not in parameters["SecretRefreshToken"]
 
-    assert secret_parameters <= parameters.keys()
+    assert "AppSecretsSecretName" in parameters
+    secret_name_parameters = {
+        name for name in parameters if name.endswith("SecretName")
+    }
+    assert secret_name_parameters == {"AppSecretsSecretName"}
+    assert (
+        not {
+            "TelegramBotTokenSecretName",
+            "TelegramWebhookSecretName",
+            "LlmApiKeySecretName",
+        }
+        & parameters.keys()
+    )
     assert (
         not {
             "TelegramBotTokenParameter",
@@ -542,25 +557,30 @@ def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
         }
         & parameters.keys()
     )
-    for parameter_name in secret_parameters:
-        assert parameters[parameter_name]["Type"] == "String"
-        assert "NoEcho" not in parameters[parameter_name]
-        assert "Default" not in parameters[parameter_name]
+    assert parameters["AppSecretsSecretName"]["Type"] == "String"
+    assert "NoEcho" not in parameters["AppSecretsSecretName"]
+    assert "Default" not in parameters["AppSecretsSecretName"]
 
     variables = template["Globals"]["Function"]["Environment"]["Variables"]
     assert variables["SECRET_REFRESH_TOKEN"] == {"Ref": "SecretRefreshToken"}
-    for variable_name in (
-        "TELEGRAM_BOT_TOKEN",
-        "LLM_API_KEY",
-    ):
+    expected_references = {
+        "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
+        "LLM_API_KEY": "llm_api_key",
+    }
+    for variable_name, json_key in expected_references.items():
         dynamic_reference = variables[variable_name]
         assert isinstance(dynamic_reference, dict)
         dynamic_reference = dynamic_reference["Fn::Sub"]
         assert isinstance(dynamic_reference, list)
         assert (
             dynamic_reference[0]
-            == "{{resolve:secretsmanager:${SecretName}:SecretString}}"
+            == "{{resolve:secretsmanager:${SecretName}:SecretString:"
+            + json_key
+            + "}}"
         )
+        assert dynamic_reference[1] == {
+            "SecretName": {"Ref": "AppSecretsSecretName"}
+        }
 
     assert "TELEGRAM_WEBHOOK_SECRET" not in variables
     bot_variables = template["Resources"]["BotFunction"]["Properties"]
@@ -571,8 +591,53 @@ def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
     assert isinstance(webhook_reference, list)
     assert (
         webhook_reference[0]
-        == "{{resolve:secretsmanager:${SecretName}:SecretString}}"
+        == "{{resolve:secretsmanager:${SecretName}:SecretString:"
+        "telegram_webhook_secret}}"
     )
+    assert webhook_reference[1] == {
+        "SecretName": {"Ref": "AppSecretsSecretName"}
+    }
+
+
+def test_secret_refresh_updates_both_lambda_configurations() -> None:
+    """Both functions use the deployment refresh marker."""
+    template = _load_template()
+    for logical_id in ("BotFunction", "PlannerFunction"):
+        variables = template["Resources"][logical_id]["Properties"][
+            "Environment"
+        ]["Variables"]
+        assert variables["SECRET_REFRESH_TOKEN"] == {
+            "Ref": "SecretRefreshToken"
+        }
+
+
+def test_secret_values_are_not_runtime_retrieved_or_whole_secret_injected() -> (
+    None
+):
+    """The template resolves fields during deployment without runtime access."""
+    template = _load_template()
+    serialized_template = repr(template)
+    assert "GetSecretValue" not in serialized_template
+    assert "secretsmanager:GetSecretValue" not in serialized_template
+
+    global_variables = template["Globals"]["Function"]["Environment"][
+        "Variables"
+    ]
+    bot_variables = template["Resources"]["BotFunction"]["Properties"][
+        "Environment"
+    ]["Variables"]
+    all_variables = {**global_variables, **bot_variables}
+    for variable_name, json_key in (
+        ("TELEGRAM_BOT_TOKEN", "telegram_bot_token"),
+        ("TELEGRAM_WEBHOOK_SECRET", "telegram_webhook_secret"),
+        ("LLM_API_KEY", "llm_api_key"),
+    ):
+        reference = all_variables[variable_name]
+        assert isinstance(reference, dict)
+        substitution = reference["Fn::Sub"]
+        assert isinstance(substitution, list)
+        assert substitution[0].endswith(f":{json_key}}}}}")
+        assert ":SecretString}}" not in substitution[0]
 
 
 def test_telegram_allowlist_is_required_and_bot_scoped() -> None:

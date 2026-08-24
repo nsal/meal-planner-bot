@@ -230,15 +230,13 @@ TELEGRAM_BOT_TOKEN=replace-with-token
 TELEGRAM_WEBHOOK_SECRET=replace-with-webhook-secret
 LLM_API_KEY=replace-with-llm-key
 TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
-TELEGRAM_BOT_TOKEN_SECRET_NAME=meal-planner/bot-token
-TELEGRAM_WEBHOOK_SECRET_NAME=meal-planner/webhook-secret
-LLM_API_KEY_SECRET_NAME=meal-planner/llm-key
+APP_SECRETS_SECRET_NAME=meal-planner/app-secrets
 SYNC_SECRETS=false
 ```
 
 The routine workflow prints numbered stage headings as it checks prerequisites,
-authenticates and confirms the AWS identity, checks that all three named
-Secrets Manager secrets exist, runs `sam validate --lint` and
+authenticates and confirms the AWS identity, checks that the configured JSON
+Secrets Manager secret exists, runs `sam validate --lint` and
 `sam build --beta-features`, deploys with a generated refresh token, resolves
 the required stack outputs, registers the canonical Telegram command menu,
 sets the webhook, and verifies the webhook:
@@ -277,8 +275,10 @@ uv run python scripts/deploy.py --guided
 
 Secret synchronization is a deliberate external mutation and requires both
 `SYNC_SECRETS=true` in `.env` and the command-line `--sync-secrets` flag. The
-orchestrator creates missing secrets or updates existing ones, but never puts
-secret values in command arguments, logs, errors, or summaries:
+orchestrator creates or replaces one JSON secret containing the stable fields
+`telegram_bot_token`, `telegram_webhook_secret`, and `llm_api_key`. Secret
+updates replace the complete object; individual field updates are not merged.
+Secret values never appear in command arguments, logs, errors, or summaries:
 
 ```bash
 uv run python scripts/deploy.py --sync-secrets
@@ -341,28 +341,37 @@ plan confirmation and a meal check-in callback to exercise the other Bot
 transaction paths. Remove the webhook and delete the test stack only after
 preserving any data needed for investigation.
 
-To rotate a secret, update one secret at a time, then deploy with a new unique
-`SecretRefreshToken`. The marker changes both Lambda resources, forcing
-CloudFormation to re-resolve the versionless Secrets Manager references. For
-an LLM key or bot token:
+To rotate a credential, write the complete JSON object to a restricted local
+file, publish it, and deploy with a new unique `SecretRefreshToken`. The
+deployment script generates that refresh token and changes both Lambda
+resources, forcing CloudFormation to re-resolve the versionless field
+references:
 
 ```bash
-aws secretsmanager put-secret-value --secret-id meal-planner/llm-key \
-  --secret-string "$NEW_LLM_API_KEY"
-uvx --from aws-sam-cli sam deploy --parameter-overrides \
-  TelegramBotTokenSecretName=meal-planner/bot-token \
-  TelegramWebhookSecretName=meal-planner/webhook-secret \
-  LlmApiKeySecretName=meal-planner/llm-key \
-  SecretRefreshToken="$(date +%s)"
+umask 077
+cat > /tmp/meal-planner-app-secrets.json <<'JSON'
+{"telegram_bot_token":"replace-with-token","telegram_webhook_secret":"replace-with-webhook-secret","llm_api_key":"replace-with-llm-key"}
+JSON
+aws secretsmanager put-secret-value \
+  --secret-id "$APP_SECRETS_SECRET_NAME" \
+  --secret-string file:///tmp/meal-planner-app-secrets.json \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION"
+uv run python scripts/deploy.py
+rm -f /tmp/meal-planner-app-secrets.json
 ```
 
-For webhook-secret rotation, update the secret and deploy the Lambda before
-registering the new Telegram webhook secret, then verify the webhook. A single
-accepted secret necessarily has a brief coordinated transition window; dual
-secret acceptance is outside this remediation. CloudFormation resolves
-dynamic references on resource updates, while a secret-value-only change does
-not refresh an existing Lambda environment ([dynamic reference rotation
-behavior](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/dynamic-references-secretsmanager.html)).
+For webhook-secret rotation, publish the complete JSON object first, deploy the
+Lambda with the new refresh token second, then register and verify the Telegram
+webhook with the new webhook-secret field. A single accepted secret necessarily
+has a brief coordinated transition window; dual-secret acceptance is outside
+this remediation. CloudFormation resolves dynamic references on resource
+updates, while a secret-value-only change does not refresh an existing Lambda
+environment ([dynamic reference rotation behavior](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/dynamic-references-secretsmanager.html)).
+
+Keep the three legacy Secrets Manager secrets until the new deployment and
+webhook have passed live verification. Remove or schedule deletion of those
+legacy secrets manually through the approved AWS process; this repository does
+not automate that destructive cleanup.
 
 For rollback, identify the last known-good commit, rebuild it, and redeploy the
 same stack parameters. DynamoDB uses on-demand billing and is retained only as
