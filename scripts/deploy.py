@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, NoReturn, Self
+from typing import Annotated, NoReturn, Self, TypedDict
 
 from pydantic import (
     Field,
@@ -48,6 +48,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MAX_COMMAND_DIAGNOSTIC_CHARS = 8_000
 
 logger = logging.getLogger(__name__)
+
+
+class SecretPayload(TypedDict):
+    """Stable JSON fields stored in the application Secrets Manager secret."""
+
+    telegram_bot_token: str
+    telegram_webhook_secret: str
+    llm_api_key: str
+
+
+def serialize_secret_payload(payload: SecretPayload) -> str:
+    """Serialize the application secret payload deterministically."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 class DeploymentError(RuntimeError):
@@ -85,13 +98,7 @@ class DeploymentSettings(BaseSettings):
     telegram_allowed_user_ids: Annotated[tuple[str, ...], NoDecode] = Field(
         ..., alias="TELEGRAM_ALLOWED_USER_IDS"
     )
-    telegram_bot_token_secret_name: str = Field(
-        ..., alias="TELEGRAM_BOT_TOKEN_SECRET_NAME"
-    )
-    telegram_webhook_secret_name: str = Field(
-        ..., alias="TELEGRAM_WEBHOOK_SECRET_NAME"
-    )
-    llm_api_key_secret_name: str = Field(..., alias="LLM_API_KEY_SECRET_NAME")
+    app_secrets_secret_name: str = Field(..., alias="APP_SECRETS_SECRET_NAME")
     sync_secrets: bool = Field(default=False, alias="SYNC_SECRETS")
     conversational_llm_model: str = Field(
         default="gpt-5.6-luna", alias="CONVERSATIONAL_LLM_MODEL"
@@ -114,9 +121,7 @@ class DeploymentSettings(BaseSettings):
         "telegram_bot_token",
         "telegram_webhook_secret",
         "llm_api_key",
-        "telegram_bot_token_secret_name",
-        "telegram_webhook_secret_name",
-        "llm_api_key_secret_name",
+        "app_secrets_secret_name",
         "conversational_llm_model",
         "conversational_llm_reasoning_effort",
         "planner_llm_model",
@@ -211,19 +216,23 @@ class DeploymentSettings(BaseSettings):
         )
 
     @property
-    def secret_specs(self) -> tuple[tuple[str, str], ...]:
-        """Return secret name/value pairs in stable template order."""
-        return (
-            (
-                self.telegram_bot_token_secret_name,
-                self.telegram_bot_token,
-            ),
-            (
-                self.telegram_webhook_secret_name,
-                self.telegram_webhook_secret,
-            ),
-            (self.llm_api_key_secret_name, self.llm_api_key),
-        )
+    def secret_payload(self) -> SecretPayload:
+        """Return the stable JSON object for the application secret."""
+        return {
+            "telegram_bot_token": self.telegram_bot_token,
+            "telegram_webhook_secret": self.telegram_webhook_secret,
+            "llm_api_key": self.llm_api_key,
+        }
+
+    @property
+    def secret_string(self) -> str:
+        """Return the deterministic JSON representation of the secret."""
+        return serialize_secret_payload(self.secret_payload)
+
+    @property
+    def secret_sensitive_values(self) -> tuple[str, ...]:
+        """Return individual values and the complete JSON for redaction."""
+        return (self.secret_string, *self.secret_values)
 
     def child_environment(self) -> dict[str, str]:
         """Return an environment pinned to the deployment account target."""
@@ -418,7 +427,7 @@ def _aws_command(
 
 def _safe_error(exc: Exception, settings: DeploymentSettings) -> str:
     """Convert an exception to a credential-safe message."""
-    return _redact(str(exc), settings.secret_values)
+    return _redact(str(exc), settings.secret_sensitive_values)
 
 
 def _announce(number: int, title: str) -> None:
@@ -583,62 +592,60 @@ def synchronize_secrets(
             "--sync-secrets requires SYNC_SECRETS=true; no secrets were changed"
         )
 
-    for name, value in settings.secret_specs:
-        try:
+    name = settings.app_secrets_secret_name
+    secret_string = settings.secret_string
+    sensitive_values = settings.secret_sensitive_values
+    try:
+        runner.run(
+            _aws_command(
+                settings,
+                "secretsmanager",
+                "describe-secret",
+                "--secret-id",
+                name,
+            ),
+            stage=f"check secret {name}",
+            env=settings.child_environment(),
+            sensitive_values=sensitive_values,
+        )
+    except CommandExecutionError as exc:
+        if not requested or not settings.sync_secrets or not exc.is_not_found:
+            raise DeploymentError(
+                f"secret check failed for configured secret {name}"
+            ) from None
+        with _secret_file(secret_string) as secret_path:
             runner.run(
                 _aws_command(
                     settings,
                     "secretsmanager",
-                    "describe-secret",
+                    "create-secret",
+                    "--name",
+                    name,
+                    "--secret-string",
+                    f"file://{secret_path}",
+                ),
+                stage=f"create secret {name}",
+                env=settings.child_environment(),
+                sensitive_values=sensitive_values,
+            )
+        return
+
+    if requested and settings.sync_secrets:
+        with _secret_file(secret_string) as secret_path:
+            runner.run(
+                _aws_command(
+                    settings,
+                    "secretsmanager",
+                    "put-secret-value",
                     "--secret-id",
                     name,
+                    "--secret-string",
+                    f"file://{secret_path}",
                 ),
-                stage=f"check secret {name}",
+                stage=f"update secret {name}",
                 env=settings.child_environment(),
-                sensitive_values=settings.secret_values,
+                sensitive_values=sensitive_values,
             )
-        except CommandExecutionError as exc:
-            if (
-                not requested
-                or not settings.sync_secrets
-                or not exc.is_not_found
-            ):
-                raise DeploymentError(
-                    f"secret check failed for configured secret {name}"
-                ) from None
-            with _secret_file(value) as secret_path:
-                runner.run(
-                    _aws_command(
-                        settings,
-                        "secretsmanager",
-                        "create-secret",
-                        "--name",
-                        name,
-                        "--secret-string",
-                        f"file://{secret_path}",
-                    ),
-                    stage=f"create secret {name}",
-                    env=settings.child_environment(),
-                    sensitive_values=settings.secret_values,
-                )
-            continue
-
-        if requested and settings.sync_secrets:
-            with _secret_file(value) as secret_path:
-                runner.run(
-                    _aws_command(
-                        settings,
-                        "secretsmanager",
-                        "put-secret-value",
-                        "--secret-id",
-                        name,
-                        "--secret-string",
-                        f"file://{secret_path}",
-                    ),
-                    stage=f"update secret {name}",
-                    env=settings.child_environment(),
-                    sensitive_values=settings.secret_values,
-                )
 
 
 def run_sam_preflight(
@@ -694,9 +701,7 @@ def deploy_sam(
     parameter_overrides = [
         "--parameter-overrides",
         f"Environment={settings.environment}",
-        f"TelegramBotTokenSecretName={settings.telegram_bot_token_secret_name}",
-        f"TelegramWebhookSecretName={settings.telegram_webhook_secret_name}",
-        f"LlmApiKeySecretName={settings.llm_api_key_secret_name}",
+        f"AppSecretsSecretName={settings.app_secrets_secret_name}",
         f"TelegramAllowedUserIds={settings.allowed_user_ids_value}",
         f"ConversationalLlmModel={settings.conversational_llm_model}",
         f"ConversationalLlmReasoningEffort={settings.conversational_llm_reasoning_effort}",
