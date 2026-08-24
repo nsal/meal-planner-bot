@@ -16,14 +16,24 @@ from meal_planner.models.schemas import (
 )
 
 
-def make_profile() -> UserProfile:
-    """Return a complete two-person profile."""
+def make_profile(*, with_nutrient_targets: bool = False) -> UserProfile:
+    """Return a complete two-person profile.
+
+    By default, members use the legacy calorie-only shape. Tests that need
+    nutrient targets can opt into representative values explicitly.
+    """
+    alex_targets = (
+        {"protein_target": 120, "fibre_target": 30}
+        if with_nutrient_targets
+        else {}
+    )
+    sam_targets = {"protein_target": 100} if with_nutrient_targets else {}
     return UserProfile(
         name="Alex",
         people_count=2,
         family_members=[
-            FamilyMember(name="Alex", calorie_target=2000),
-            FamilyMember(name="Sam", calorie_target=1800),
+            FamilyMember(name="Alex", calorie_target=2000, **alex_targets),
+            FamilyMember(name="Sam", calorie_target=1800, **sam_targets),
         ],
         dietary_constraints=[],
         dietary_preferences=["balanced"],

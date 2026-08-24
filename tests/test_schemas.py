@@ -33,6 +33,7 @@ from meal_planner.models.schemas import (
     UserProfile,
     WeeklyPlan,
 )
+from tests.factories import make_profile
 
 
 def test_preference_requirement_valid_exact_count_and_optional_scope() -> None:
@@ -331,6 +332,14 @@ def test_profile_edit_menu_state_has_no_selected_operation() -> None:
         (ProfileEditCategory.FAMILY, ProfileEditOperation.REMOVE),
         (ProfileEditCategory.FAMILY, ProfileEditOperation.CHANGE_CALORIES),
         (
+            ProfileEditCategory.FAMILY,
+            ProfileEditOperation.CHANGE_PROTEIN,
+        ),
+        (
+            ProfileEditCategory.FAMILY,
+            ProfileEditOperation.CHANGE_FIBRE,
+        ),
+        (
             ProfileEditCategory.DIETARY_CONSTRAINTS,
             ProfileEditOperation.ADD,
         ),
@@ -365,6 +374,44 @@ def test_profile_edit_awaiting_input_accepts_valid_operation(
 
     assert state.profile_category is category
     assert state.profile_operation is operation
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_value"),
+    [
+        (ProfileEditOperation.CHANGE_PROTEIN, "change_protein"),
+        (ProfileEditOperation.CHANGE_FIBRE, "change_fibre"),
+    ],
+)
+def test_nutrient_operations_have_stable_values_and_are_family_only(
+    operation: ProfileEditOperation, expected_value: str
+) -> None:
+    """Nutrient changes use stable values and belong only to Family."""
+    assert operation.value == expected_value
+    assert operation.is_valid_for(ProfileEditCategory.FAMILY)
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        ProfileEditCategory.DIETARY_CONSTRAINTS,
+        ProfileEditCategory.DIETARY_PREFERENCES,
+        ProfileEditCategory.GOALS,
+    ],
+)
+@pytest.mark.parametrize(
+    "operation",
+    [
+        ProfileEditOperation.CHANGE_PROTEIN,
+        ProfileEditOperation.CHANGE_FIBRE,
+    ],
+)
+def test_nutrient_operations_are_invalid_for_non_family_categories(
+    category: ProfileEditCategory,
+    operation: ProfileEditOperation,
+) -> None:
+    """Nutrient changes cannot be selected for unrelated categories."""
+    assert not operation.is_valid_for(category)
 
 
 @pytest.mark.parametrize(
@@ -675,6 +722,97 @@ def test_family_member_invalid_calories() -> None:
     """Test FamilyMember model with negative calorie target."""
     with pytest.raises(ValidationError):
         FamilyMember(name="Alice", calorie_target=-100)
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [
+        {},
+        {"protein_target": 120},
+        {"fibre_target": 30},
+        {"protein_target": 120, "fibre_target": 30},
+    ],
+)
+def test_family_member_optional_nutrient_targets(
+    targets: dict[str, int],
+) -> None:
+    """Allow either optional target to be supplied independently."""
+    member = FamilyMember(name="Alice", calorie_target=2000, **targets)
+
+    assert member.protein_target == targets.get("protein_target")
+    assert member.fibre_target == targets.get("fibre_target")
+
+
+@pytest.mark.parametrize("target", [1, 1_000])
+@pytest.mark.parametrize("field_name", ["protein_target", "fibre_target"])
+def test_family_member_accepts_nutrient_target_boundaries(
+    field_name: str, target: int
+) -> None:
+    """Accept inclusive lower and upper bounds for nutrient targets."""
+    member = FamilyMember(
+        name="Alice", calorie_target=2000, **{field_name: target}
+    )
+
+    assert getattr(member, field_name) == target
+
+
+@pytest.mark.parametrize("target", [-1, 0, 1_001])
+@pytest.mark.parametrize("field_name", ["protein_target", "fibre_target"])
+def test_family_member_rejects_invalid_nutrient_targets(
+    field_name: str, target: int
+) -> None:
+    """Reject nutrient targets outside the inclusive gram bounds."""
+    with pytest.raises(ValidationError):
+        FamilyMember(
+            name="Alice",
+            calorie_target=2000,
+            **{field_name: target},
+        )
+
+
+def test_family_member_targets_serialize_and_load_from_legacy_profile() -> None:
+    """Serialize targets and load profiles that predate those fields."""
+    profile = make_profile(with_nutrient_targets=True)
+
+    serialized_members = profile.model_dump()["family_members"]
+    assert serialized_members[0]["protein_target"] == 120
+    assert serialized_members[0]["fibre_target"] == 30
+
+    legacy_profile = UserProfile.model_validate(
+        {
+            "name": "Legacy",
+            "people_count": 1,
+            "family_members": [{"name": "Legacy", "calorie_target": 2000}],
+        }
+    )
+    assert legacy_profile.family_members[0].protein_target is None
+    assert legacy_profile.family_members[0].fibre_target is None
+
+
+def test_family_member_targets_do_not_change_profile_completeness() -> None:
+    """Completeness remains based on member count and calorie targets."""
+    legacy_complete = UserProfile(
+        name="Legacy",
+        people_count=1,
+        family_members=[FamilyMember(name="Legacy", calorie_target=2000)],
+    )
+    targeted_complete = UserProfile(
+        name="Targeted",
+        people_count=1,
+        family_members=[
+            FamilyMember(
+                name="Targeted",
+                calorie_target=2000,
+                protein_target=120,
+                fibre_target=30,
+            )
+        ],
+    )
+    incomplete = UserProfile(name="Incomplete", people_count=2)
+
+    assert legacy_complete.is_complete
+    assert targeted_complete.is_complete
+    assert not incomplete.is_complete
 
 
 def test_user_profile_defaults() -> None:

@@ -459,6 +459,26 @@ The Telegram command menu and `/help` show the same command reference:
   overlapping-plan callbacks are rejected, even if the older plan still
   covers today.
 
+### Per-member nutrition targets
+
+Protein and fibre targets are optional grams/day values per member. Calories
+remain required for profile completion; the absence of optional targets does
+not block profile completion or plan generation. Add a family member with
+either `name calories` or `name calories protein fibre`, for example
+`John Smith 2000 120 30`.
+
+The Family profile menu changes protein and fibre independently. For either
+action, send `name grams`, such as `John Smith 120`. To clear an optional
+target, send `name none`; clearing is case-insensitive. Calorie, protein, and
+fibre changes preserve the other saved targets, and omitted targets remain
+`not set` rather than being inferred.
+
+Target adjustment is prompt-guided and best-effort. The generated plan keeps
+the existing calorie estimate schema; this phase does not calculate daily
+calorie, protein, or fibre totals or automatically repair them. Missed
+calorie, protein, or fibre targets are not automatically detected in this
+phase.
+
 Conversational metadata supports `log_meal`, `update_profile`, `edit_plan`,
 `confirm_plan`, `suggestion`, and `chitchat`. Mutations are validated before
 success is reported to the user.

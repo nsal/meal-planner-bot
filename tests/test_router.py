@@ -9,7 +9,12 @@ from uuid import UUID
 
 import pytest
 
-from meal_planner.models.schemas import MealOutcome, MealType
+from meal_planner.models.schemas import (
+    MealOutcome,
+    MealType,
+    ProfileEditCategory,
+    ProfileEditOperation,
+)
 from meal_planner.router import (
     MealCallbackAction,
     ProfileCallbackAction,
@@ -346,6 +351,8 @@ def test_parse_meal_callback_rejects_malformed_or_oversized_payload(
         "profile:operation:family:add",
         "profile:operation:family:remove",
         "profile:operation:family:change_calories",
+        "profile:operation:family:change_protein",
+        "profile:operation:family:change_fibre",
         "profile:operation:dietary_constraints:add",
         "profile:operation:dietary_constraints:remove",
         "profile:operation:dietary_preferences:add",
@@ -358,6 +365,7 @@ def test_parse_every_accepted_profile_callback(payload: str) -> None:
     """Accept only the documented profile navigation and operation actions."""
     callback = parse_profile_callback(payload)
 
+    assert len(payload.encode("utf-8")) <= 64
     assert callback is not None
     assert callback.action in {
         ProfileCallbackAction.ROOT,
@@ -367,6 +375,32 @@ def test_parse_every_accepted_profile_callback(payload: str) -> None:
         ProfileCallbackAction.CATEGORY,
         ProfileCallbackAction.OPERATION,
     }
+
+
+@pytest.mark.parametrize(
+    ("payload", "operation"),
+    [
+        (
+            "profile:operation:family:change_protein",
+            ProfileEditOperation.CHANGE_PROTEIN,
+        ),
+        (
+            "profile:operation:family:change_fibre",
+            ProfileEditOperation.CHANGE_FIBRE,
+        ),
+    ],
+)
+def test_parse_family_nutrient_operation_callbacks(
+    payload: str,
+    operation: ProfileEditOperation,
+) -> None:
+    """Round-trip the exact Family nutrient operation payloads."""
+    callback = parse_profile_callback(payload)
+
+    assert callback is not None
+    assert callback.action is ProfileCallbackAction.OPERATION
+    assert callback.category is ProfileEditCategory.FAMILY
+    assert callback.operation is operation
 
 
 @pytest.mark.parametrize(
@@ -382,6 +416,13 @@ def test_parse_every_accepted_profile_callback(payload: str) -> None:
         "profile:operation",
         "profile:operation:family",
         "profile:operation:family:unknown",
+        "profile:operation:family:change_protein:extra",
+        "profile:operation:dietary_constraints:change_protein",
+        "profile:operation:dietary_constraints:change_fibre",
+        "profile:operation:dietary_preferences:change_protein",
+        "profile:operation:dietary_preferences:change_fibre",
+        "profile:operation:goals:change_protein",
+        "profile:operation:goals:change_fibre",
         "profile:operation:unknown:add",
         "profile:operation:dietary_constraints:change_calories",
         "profile:operation:family:add:extra",
@@ -393,6 +434,14 @@ def test_parse_profile_callback_rejects_malformed_or_wrong_operations(
     payload: str,
 ) -> None:
     """Reject malformed payloads and operations for unrelated categories."""
+    assert parse_profile_callback(payload) is None
+
+
+def test_parse_profile_callback_rejects_oversized_nutrient_operation() -> None:
+    """Keep the Telegram byte limit for nutrient operation callbacks."""
+    payload = "profile:operation:family:change_fibre:" + "é" * 14
+
+    assert len(payload.encode("utf-8")) > 64
     assert parse_profile_callback(payload) is None
 
 

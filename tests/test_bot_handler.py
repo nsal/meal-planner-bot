@@ -136,6 +136,23 @@ def test_start_requests_family_name_separately_from_member_names(
     assert "tell me your name" not in message
 
 
+def test_start_explains_optional_nutrient_targets(
+    handler: BotHandler,
+) -> None:
+    """Onboarding makes calories required and nutrient targets optional."""
+    handler.repo.get_profile.return_value = None
+
+    handler.handle_command(_command("start"))
+
+    message = handler.telegram_api.send_message.call_args.args[1].lower()
+    assert "calorie target" in message
+    assert "protein" in message
+    assert "fibre" in message
+    assert "grams/day" in message
+    assert "optional" in message
+    assert "not required" in message
+
+
 def test_help_renders_catalogue_without_repository_interaction(
     handler: BotHandler,
 ) -> None:
@@ -585,6 +602,76 @@ def _profile_text(text: str) -> RouteResult:
 
 
 @pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("John 1500", ("John", 1500, None, None)),
+        ("John Smith 2000 1 1000", ("John Smith", 2000, 1, 1000)),
+    ],
+)
+def test_profile_member_parser_accepts_legacy_and_full_target_forms(
+    text: str, expected: tuple[str, int, int | None, int | None]
+) -> None:
+    """Member creation parses both supported suffix shapes safely."""
+    assert BotHandler._parse_profile_name_calories(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "John 2000 1",
+        "John 2000 protein 30",
+        "John 2000 1 fibre",
+        "John 2000 1 2 3",
+        "John 2000 0 30",
+        "John 2000 -1 30",
+        "John 2000 1001 30",
+        "John 2000 1 0",
+        "John 2000 1 -1",
+        "John 2000 1 1001",
+    ],
+)
+def test_profile_member_parser_rejects_malformed_target_forms(
+    text: str,
+) -> None:
+    """Partial, non-integer, and out-of-range targets are rejected."""
+    assert BotHandler._parse_profile_name_calories(text) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Sam 1", ("Sam", 1)),
+        ("Sam 1000", ("Sam", 1000)),
+        ("Sam none", ("Sam", None)),
+        ("Sam NONE", ("Sam", None)),
+    ],
+)
+def test_profile_target_parser_accepts_integer_or_case_insensitive_none(
+    text: str, expected: tuple[str, int | None]
+) -> None:
+    """Single nutrient edits support bounded integers and exact ``none``."""
+    assert BotHandler._parse_profile_target_change(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Sam none now",
+        "Sam 1 2",
+        "Sam protein",
+        "Sam 0",
+        "Sam -1",
+        "Sam 1001",
+    ],
+)
+def test_profile_target_parser_rejects_malformed_clear_and_values(
+    text: str,
+) -> None:
+    """Malformed clear phrases and invalid target values are rejected."""
+    assert BotHandler._parse_profile_target_change(text) is None
+
+
+@pytest.mark.parametrize(
     ("category", "operation", "text", "expected"),
     [
         (
@@ -604,6 +691,18 @@ def _profile_text(text: str) -> RouteResult:
             ProfileEditOperation.CHANGE_CALORIES,
             "sam 2100",
             [2000, 2100],
+        ),
+        (
+            ProfileEditCategory.FAMILY,
+            ProfileEditOperation.CHANGE_PROTEIN,
+            "sam 1",
+            [120, 1],
+        ),
+        (
+            ProfileEditCategory.FAMILY,
+            ProfileEditOperation.CHANGE_FIBRE,
+            "alex NONE",
+            [None, None],
         ),
         (
             ProfileEditCategory.DIETARY_CONSTRAINTS,
@@ -651,7 +750,13 @@ def test_profile_amendment_successes_return_to_category_menu(
     expected: list[Any],
 ) -> None:
     """Successful deterministic amendments save and render the category."""
-    profile = make_profile()
+    profile = make_profile(
+        with_nutrient_targets=operation
+        in {
+            ProfileEditOperation.CHANGE_PROTEIN,
+            ProfileEditOperation.CHANGE_FIBRE,
+        }
+    )
     if (
         operation is ProfileEditOperation.REMOVE
         and category is not ProfileEditCategory.FAMILY
@@ -674,6 +779,14 @@ def test_profile_amendment_successes_return_to_category_menu(
         if operation is ProfileEditOperation.CHANGE_CALORIES:
             assert [
                 member.calorie_target for member in saved.family_members
+            ] == expected
+        elif operation is ProfileEditOperation.CHANGE_PROTEIN:
+            assert [
+                member.protein_target for member in saved.family_members
+            ] == expected
+        elif operation is ProfileEditOperation.CHANGE_FIBRE:
+            assert [
+                member.fibre_target for member in saved.family_members
             ] == expected
         else:
             assert [member.name for member in saved.family_members] == expected
@@ -699,6 +812,10 @@ def test_profile_amendment_successes_return_to_category_menu(
     [
         (ProfileEditOperation.ADD, "Sam 1800", "already"),
         (ProfileEditOperation.CHANGE_CALORIES, "Unknown 1800", "find"),
+        (ProfileEditOperation.CHANGE_PROTEIN, "Unknown 100", "find"),
+        (ProfileEditOperation.CHANGE_FIBRE, "Unknown 100", "find"),
+        (ProfileEditOperation.CHANGE_PROTEIN, "Sam none now", "format"),
+        (ProfileEditOperation.CHANGE_FIBRE, "Sam 0", "format"),
         (ProfileEditOperation.REMOVE, "Unknown", "find"),
     ],
 )
@@ -717,9 +834,167 @@ def test_family_profile_amendment_errors_do_not_write(
 
     handler.repo.save_profile.assert_not_called()
     handler.repo.transition_conversation_state.assert_not_called()
+    handler.repo.save_profile_and_transition_state.assert_not_called()
     message = handler.telegram_api.send_message.call_args.args[1].lower()
     assert message_part in message
     handler.llm_client.chat_sync.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("operation", "text"),
+    [
+        (ProfileEditOperation.CHANGE_PROTEIN, "Sam 101"),
+        (ProfileEditOperation.CHANGE_FIBRE, "Sam 20"),
+    ],
+)
+def test_family_target_amendments_preserve_other_member_targets(
+    handler: BotHandler,
+    operation: ProfileEditOperation,
+    text: str,
+) -> None:
+    """Each nutrient edit changes only its selected target."""
+    state = _profile_input_state(handler, ProfileEditCategory.FAMILY, operation)
+    profile = make_profile(
+        with_nutrient_targets=operation
+        in {
+            ProfileEditOperation.CHANGE_PROTEIN,
+            ProfileEditOperation.CHANGE_FIBRE,
+        }
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = profile
+    handler.repo.save_profile_and_transition_state.return_value = True
+
+    handler.handle_conversational(_profile_text(text))
+
+    saved = handler.repo.save_profile_and_transition_state.call_args.args[1]
+    alex, sam = saved.family_members
+    assert alex.calorie_target == 2000
+    assert alex.protein_target == 120
+    assert alex.fibre_target == 30
+    assert sam.calorie_target == 1800
+    assert sam.protein_target == (
+        101 if operation is ProfileEditOperation.CHANGE_PROTEIN else 100
+    )
+    assert sam.fibre_target == (
+        20 if operation is ProfileEditOperation.CHANGE_FIBRE else None
+    )
+
+
+def test_calorie_amendment_preserves_nutrient_targets(
+    handler: BotHandler,
+) -> None:
+    """Changing calories does not reconstruct away optional targets."""
+    state = _profile_input_state(
+        handler,
+        ProfileEditCategory.FAMILY,
+        ProfileEditOperation.CHANGE_CALORIES,
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = make_profile(
+        with_nutrient_targets=True
+    )
+    handler.repo.save_profile_and_transition_state.return_value = True
+
+    handler.handle_conversational(_profile_text("Alex 2100"))
+
+    saved = handler.repo.save_profile_and_transition_state.call_args.args[1]
+    alex = saved.family_members[0]
+    assert alex.calorie_target == 2100
+    assert alex.protein_target == 120
+    assert alex.fibre_target == 30
+
+
+def test_family_removal_and_addition_preserve_other_members(
+    handler: BotHandler,
+) -> None:
+    """Removing or adding a member leaves existing member data unchanged."""
+    profile = make_profile(with_nutrient_targets=True)
+    for operation, text in [
+        (ProfileEditOperation.REMOVE, "Sam"),
+        (ProfileEditOperation.ADD, "John Smith 1900 1 1000"),
+    ]:
+        state = _profile_input_state(
+            handler, ProfileEditCategory.FAMILY, operation
+        )
+        handler.repo.reset_mock()
+        handler.telegram_api.reset_mock()
+        handler.repo.get_conversation_state.return_value = state
+        handler.repo.get_profile.return_value = profile
+        handler.repo.save_profile_and_transition_state.return_value = True
+
+        handler.handle_conversational(_profile_text(text))
+
+        saved = handler.repo.save_profile_and_transition_state.call_args.args[1]
+        alex = saved.family_members[0]
+        assert alex.model_dump() == profile.family_members[0].model_dump()
+
+
+def test_family_addition_with_full_targets_persists_all_values(
+    handler: BotHandler,
+) -> None:
+    """The four-field add form stores calorie and nutrient targets."""
+    state = _profile_input_state(
+        handler, ProfileEditCategory.FAMILY, ProfileEditOperation.ADD
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.save_profile_and_transition_state.return_value = True
+
+    handler.handle_conversational(_profile_text("John Smith 2000 120 30"))
+
+    saved = handler.repo.save_profile_and_transition_state.call_args.args[1]
+    member = saved.family_members[-1]
+    assert member.name == "John Smith"
+    assert member.calorie_target == 2000
+    assert member.protein_target == 120
+    assert member.fibre_target == 30
+
+
+def test_ambiguous_legacy_member_target_edit_does_not_write(
+    handler: BotHandler,
+) -> None:
+    """Case-folded duplicate legacy names remain an explicit error."""
+    profile = make_profile().model_copy(
+        update={
+            "family_members": [
+                FamilyMember(name="Sam", calorie_target=1800),
+                FamilyMember(name=" sam ", calorie_target=1900),
+            ]
+        }
+    )
+    state = _profile_input_state(
+        handler,
+        ProfileEditCategory.FAMILY,
+        ProfileEditOperation.CHANGE_PROTEIN,
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = profile
+
+    handler.handle_conversational(_profile_text("Sam 100"))
+
+    handler.repo.save_profile_and_transition_state.assert_not_called()
+    message = handler.telegram_api.send_message.call_args.args[1].lower()
+    assert "ambiguous" in message
+
+
+def test_family_nutrient_operation_in_invalid_category_does_not_write(
+    handler: BotHandler,
+) -> None:
+    """Family-only nutrient operations cannot mutate item categories."""
+    state = _profile_input_state(
+        handler,
+        ProfileEditCategory.GOALS,
+        ProfileEditOperation.CHANGE_PROTEIN,
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = make_profile()
+
+    handler.handle_conversational(_profile_text("Sam 100"))
+
+    handler.repo.save_profile_and_transition_state.assert_not_called()
+    message = handler.telegram_api.send_message.call_args.args[1].lower()
+    assert "not available" in message
 
 
 @pytest.mark.parametrize(
@@ -2610,6 +2885,67 @@ def test_profile_onboarding_two_turn_no_value_answers_complete_profile(
     assert saved_profile.dietary_constraints == []
     assert saved_profile.dietary_preferences == []
     assert saved_profile.goals == ["eat well"]
+    handler.repo.delete_profile_draft.assert_called_once_with("user")
+
+
+def test_profile_onboarding_preserves_mixed_legacy_and_extended_members(
+    handler: BotHandler,
+) -> None:
+    """Generic draft merging retains every explicitly supplied member field."""
+    handler.repo.get_profile_draft.return_value = ProfileUpdateEntities()
+    first_turn = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.UPDATE_PROFILE,
+        {
+            "people_count": 3,
+            "family_members": [
+                {"name": "Alex", "calorie_target": 2000},
+                {
+                    "name": "Sam",
+                    "calorie_target": 1800,
+                    "protein_target": 120,
+                },
+                {
+                    "name": "Lee",
+                    "calorie_target": 1600,
+                    "protein_target": 100,
+                    "fibre_target": 30,
+                },
+            ],
+            "dietary_constraints": [],
+            "dietary_preferences": [],
+            "goals": [],
+        },
+        None,
+    )
+
+    assert first_turn.success
+    assert first_turn.message and "family name" in first_turn.message
+    saved_draft = handler.repo.save_profile_draft.call_args.args[1]
+    handler.repo.get_profile_draft.return_value = saved_draft
+
+    second_turn = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.UPDATE_PROFILE,
+        {"name": "Alex"},
+        None,
+    )
+
+    assert second_turn.success
+    saved_profile = handler.repo.save_profile.call_args.args[1]
+    assert [member.name for member in saved_profile.family_members] == [
+        "Alex",
+        "Sam",
+        "Lee",
+    ]
+    assert saved_profile.family_members[0].protein_target is None
+    assert saved_profile.family_members[0].fibre_target is None
+    assert saved_profile.family_members[1].protein_target == 120
+    assert saved_profile.family_members[1].fibre_target is None
+    assert saved_profile.family_members[2].protein_target == 100
+    assert saved_profile.family_members[2].fibre_target == 30
     handler.repo.delete_profile_draft.assert_called_once_with("user")
 
 

@@ -9,10 +9,12 @@ import pytest
 from pytest_mock import MockerFixture
 
 from meal_planner.models.schemas import (
+    FamilyMember,
     MealOutcome,
     MealType,
     ProfileEditCategory,
     ProfileEditOperation,
+    UserProfile,
 )
 from meal_planner.telegram.api import (
     TelegramAPI,
@@ -244,6 +246,44 @@ def test_profile_summary_renders_canonical_text_and_root_controls(
     }
 
 
+@pytest.mark.parametrize(
+    ("protein_target", "fibre_target", "expected_targets"),
+    [
+        (None, None, "protein: not set, fibre: not set"),
+        (120, None, "protein: 120 g/day, fibre: not set"),
+        (120, 30, "protein: 120 g/day, fibre: 30 g/day"),
+    ],
+)
+def test_profile_summary_renders_optional_targets_and_not_set_copy(
+    mocker: MockerFixture,
+    protein_target: int | None,
+    fibre_target: int | None,
+    expected_targets: str,
+) -> None:
+    """Show each member's supplied and absent nutrient targets."""
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+    profile = UserProfile(
+        name="Alex",
+        people_count=1,
+        family_members=[
+            FamilyMember(
+                name="Alex",
+                calorie_target=2000,
+                protein_target=protein_target,
+                fibre_target=fibre_target,
+            )
+        ],
+    )
+
+    TelegramAPI("token").send_profile(1, profile)
+
+    payload = _last_payload(urlopen)
+    assert "- Alex (2000 kcal/day, " + expected_targets + ")" in payload["text"]
+
+
 def test_profile_root_renders_all_categories_and_close(
     mocker: MockerFixture,
 ) -> None:
@@ -291,6 +331,8 @@ def test_profile_root_renders_all_categories_and_close(
                 (ProfileEditOperation.ADD, "Add member"),
                 (ProfileEditOperation.REMOVE, "Remove member"),
                 (ProfileEditOperation.CHANGE_CALORIES, "Change calories"),
+                (ProfileEditOperation.CHANGE_PROTEIN, "Change protein"),
+                (ProfileEditOperation.CHANGE_FIBRE, "Change fibre"),
             ],
         ),
         (
@@ -373,6 +415,43 @@ def test_profile_operation_renders_guidance_and_compact_navigation(
     for row in payload["reply_markup"]["inline_keyboard"]:
         for button in row:
             assert len(button["callback_data"].encode()) <= 64
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_fragments"),
+    [
+        (
+            ProfileEditOperation.ADD,
+            ["John 1500", "John 2000 120 30"],
+        ),
+        (
+            ProfileEditOperation.CHANGE_PROTEIN,
+            ["John 120", "John none"],
+        ),
+        (
+            ProfileEditOperation.CHANGE_FIBRE,
+            ["John 30", "John none"],
+        ),
+    ],
+)
+def test_profile_operations_render_target_guidance(
+    mocker: MockerFixture,
+    operation: ProfileEditOperation,
+    expected_fragments: list[str],
+) -> None:
+    """Document nutrient updates, clearing, and both member-add forms."""
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+
+    TelegramAPI("token").send_profile_operation(
+        1, ProfileEditCategory.FAMILY, operation
+    )
+
+    payload = _last_payload(urlopen)
+    for fragment in expected_fragments:
+        assert fragment in payload["text"]
 
 
 def test_send_meal_review_renders_exact_text_and_review_buttons(

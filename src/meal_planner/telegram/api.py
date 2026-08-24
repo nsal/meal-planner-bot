@@ -36,6 +36,13 @@ class TelegramAPIError(RuntimeError):
 InlineKeyboard = dict[str, list[list[dict[str, str]]]]
 
 
+def _format_nutrient_target(label: str, target: int | None) -> str:
+    """Format an optional daily nutrient target for profile display."""
+    if target is None:
+        return f"{label}: not set"
+    return f"{label}: {target} g/day"
+
+
 def _meal_callback_data(
     action: MealCallbackAction,
     submission_id: UUID | str,
@@ -239,7 +246,9 @@ class TelegramAPI:
             f"People count: {profile.people_count}",
             "Family members:",
             *(
-                f"- {member.name} ({member.calorie_target} kcal/day)"
+                f"- {member.name} ({member.calorie_target} kcal/day, "
+                f"{_format_nutrient_target('protein', member.protein_target)}, "
+                f"{_format_nutrient_target('fibre', member.fibre_target)})"
                 for member in profile.family_members
             ),
             "Dietary constraints: "
@@ -312,6 +321,12 @@ class TelegramAPI:
             ProfileEditOperation.CHANGE_CALORIES: {
                 ProfileEditCategory.FAMILY: "Change calories",
             },
+            ProfileEditOperation.CHANGE_PROTEIN: {
+                ProfileEditCategory.FAMILY: "Change protein",
+            },
+            ProfileEditOperation.CHANGE_FIBRE: {
+                ProfileEditCategory.FAMILY: "Change fibre",
+            },
         }
         operations = [
             operation
@@ -354,8 +369,10 @@ class TelegramAPI:
             (
                 ProfileEditCategory.FAMILY,
                 ProfileEditOperation.ADD,
-            ): "Send the member's name and calorie target, for example: "
-            "John 1500.",
+            ): "Send the member's name and calorie target. Use "
+            "name calories (for example: John 1500) or include both "
+            "optional targets as name calories protein fibre (for example: "
+            "John 2000 120 30).",
             (
                 ProfileEditCategory.FAMILY,
                 ProfileEditOperation.REMOVE,
@@ -365,6 +382,16 @@ class TelegramAPI:
                 ProfileEditOperation.CHANGE_CALORIES,
             ): "Send the member's name and new calorie target, for example: "
             "John 1500.",
+            (
+                ProfileEditCategory.FAMILY,
+                ProfileEditOperation.CHANGE_PROTEIN,
+            ): "Send the member's name and new protein target in grams, or "
+            "use 'none' to clear it, for example: John 120 or John none.",
+            (
+                ProfileEditCategory.FAMILY,
+                ProfileEditOperation.CHANGE_FIBRE,
+            ): "Send the member's name and new fibre target in grams, or "
+            "use 'none' to clear it, for example: John 30 or John none.",
         }
         item_name = {
             ProfileEditCategory.DIETARY_CONSTRAINTS: "constraint",

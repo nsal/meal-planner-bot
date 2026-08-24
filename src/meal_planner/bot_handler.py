@@ -208,9 +208,12 @@ class BotHandler:
         else:
             message = (
                 "Welcome to Meal Planner Bot! Tell me your family name, "
-                "household size, each household member's name and calorie "
-                "target, dietary constraints, dietary preferences, and "
-                "goals. "
+                "household size, and each household member's name and "
+                "required calorie target. You may also provide optional "
+                "protein and fibre targets in grams/day for each member; "
+                "these are not required to complete setup or generate a "
+                "plan. Tell me your dietary constraints, dietary "
+                "preferences, and goals. "
                 "After setup, use /plan, /submit_meals, /checkin, or "
                 "/cancel."
             )
@@ -1139,18 +1142,60 @@ class BotHandler:
     @staticmethod
     def _parse_profile_name_calories(
         text: str,
-    ) -> tuple[str, int] | None:
-        """Parse one member name followed by a positive calorie target."""
+    ) -> tuple[str, int, int | None, int | None] | None:
+        """Parse a member name followed by two or four target fields."""
         if "\n" in text or "\r" in text:
             return None
-        match = re.fullmatch(r"(.+?)\s+([0-9]+)", text.strip())
+        parts = text.strip().split()
+        if len(parts) < 2:
+            return None
+        if len(parts) >= 4 and all(part.isdecimal() for part in parts[-3:]):
+            name_parts = parts[:-3]
+            calorie_text, protein_text, fibre_text = parts[-3:]
+            if not name_parts or any(part.isdecimal() for part in name_parts):
+                return None
+            name = " ".join(name_parts)
+            calories = int(calorie_text)
+            protein = int(protein_text)
+            fibre = int(fibre_text)
+            if (
+                not 1 <= calories <= 10_000
+                or not 1 <= protein <= 1_000
+                or not 1 <= fibre <= 1_000
+            ):
+                return None
+            return name, calories, protein, fibre
+        if not parts[-1].isdecimal():
+            return None
+        name_parts = parts[:-1]
+        if not name_parts or any(part.isdecimal() for part in name_parts):
+            return None
+        name = " ".join(name_parts)
+        calories = int(parts[-1])
+        if not 1 <= calories <= 10_000:
+            return None
+        return name, calories, None, None
+
+    @staticmethod
+    def _parse_profile_target_change(
+        text: str,
+    ) -> tuple[str, int | None] | None:
+        """Parse a member name followed by one nutrient target or ``none``."""
+        if "\n" in text or "\r" in text:
+            return None
+        match = re.fullmatch(r"(.+?)\s+(none|[0-9]+)", text.strip(), re.I)
         if match is None:
             return None
         name = match.group(1).strip()
-        calories = int(match.group(2))
-        if not name or not 1 <= calories <= 10_000:
+        target_text = match.group(2)
+        if not name or any(part.isdecimal() for part in name.split()):
             return None
-        return name, calories
+        if target_text.casefold() == "none":
+            return name, None
+        target = int(target_text)
+        if not 1 <= target <= 1_000:
+            return None
+        return name, target
 
     @staticmethod
     def _parse_profile_member_name(text: str) -> str | None:
@@ -1277,6 +1322,8 @@ class BotHandler:
         text: str,
     ) -> tuple[UserProfile | None, str]:
         """Validate and apply one immutable profile amendment."""
+        if not operation.is_valid_for(category):
+            return None, "That profile operation is not available here."
         if category is ProfileEditCategory.FAMILY:
             return self._apply_family_amendment(profile, operation, text)
         return self._apply_item_amendment(profile, category, operation, text)
@@ -1287,7 +1334,7 @@ class BotHandler:
         operation: ProfileEditOperation,
         text: str,
     ) -> tuple[UserProfile | None, str]:
-        """Apply a family member add, remove, or calorie change."""
+        """Apply one deterministic family-member amendment."""
         members = list(profile.family_members)
         if operation is ProfileEditOperation.REMOVE:
             name = BotHandler._parse_profile_member_name(text)
@@ -1324,10 +1371,65 @@ class BotHandler:
                 f"Removed {removed.name}.",
             )
 
+        if operation in {
+            ProfileEditOperation.CHANGE_PROTEIN,
+            ProfileEditOperation.CHANGE_FIBRE,
+        }:
+            parsed_target = BotHandler._parse_profile_target_change(text)
+            if parsed_target is None:
+                return None, "Use the format: name grams, or name none."
+            name, target = parsed_target
+            matching_indices = [
+                index
+                for index, member in enumerate(members)
+                if BotHandler._member_identity(member.name)
+                == BotHandler._member_identity(name)
+            ]
+            if len(matching_indices) > 1:
+                return (
+                    None,
+                    "That family member name is ambiguous in this legacy "
+                    "profile. Please update the names before trying again.",
+                )
+            if not matching_indices:
+                return None, "I couldn't find that family member."
+            index = matching_indices[0]
+            field_name = (
+                "protein_target"
+                if operation is ProfileEditOperation.CHANGE_PROTEIN
+                else "fibre_target"
+            )
+            members[index] = members[index].model_copy(
+                update={field_name: target}
+            )
+            label = "protein" if field_name == "protein_target" else "fibre"
+            action = "cleared" if target is None else "updated"
+            return (
+                BotHandler._profile_with_updates(
+                    profile,
+                    {
+                        "family_members": [
+                            member.model_dump(mode="json") for member in members
+                        ],
+                        "people_count": len(members),
+                    },
+                ),
+                f"{action.capitalize()} {members[index].name}'s {label} "
+                "target.",
+            )
+
         parsed = BotHandler._parse_profile_name_calories(text)
         if parsed is None:
-            return None, "Use the format: name calories, for example John 1500."
-        name, calories = parsed
+            return (
+                None,
+                "Use the format: name calories, or name calories protein "
+                "fibre.",
+            )
+        name, calories, protein, fibre = parsed
+        if operation is ProfileEditOperation.CHANGE_CALORIES and (
+            protein is not None or fibre is not None
+        ):
+            return None, "Use the format: name calories."
         matching_indices = [
             index
             for index, member in enumerate(members)
@@ -1345,7 +1447,12 @@ class BotHandler:
                 return None, "That family member already exists."
             if len(members) >= 20:
                 return None, "A profile can have at most 20 family members."
-            member = FamilyMember(name=name, calorie_target=calories)
+            member = FamilyMember(
+                name=name,
+                calorie_target=calories,
+                protein_target=protein,
+                fibre_target=fibre,
+            )
             members.append(member)
             return (
                 BotHandler._profile_with_updates(
@@ -1368,8 +1475,8 @@ class BotHandler:
         if not matching_indices:
             return None, "I couldn't find that family member."
         index = matching_indices[0]
-        members[index] = FamilyMember(
-            name=members[index].name, calorie_target=calories
+        members[index] = members[index].model_copy(
+            update={"calorie_target": calories}
         )
         return (
             BotHandler._profile_with_updates(

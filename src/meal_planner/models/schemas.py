@@ -204,6 +204,8 @@ class ProfileEditOperation(str, Enum):
     ADD = "add"
     REMOVE = "remove"
     CHANGE_CALORIES = "change_calories"
+    CHANGE_PROTEIN = "change_protein"
+    CHANGE_FIBRE = "change_fibre"
 
     def is_valid_for(self, category: ProfileEditCategory) -> bool:
         """Return whether this operation belongs to the category."""
@@ -212,6 +214,8 @@ class ProfileEditOperation(str, Enum):
                 ProfileEditOperation.ADD,
                 ProfileEditOperation.REMOVE,
                 ProfileEditOperation.CHANGE_CALORIES,
+                ProfileEditOperation.CHANGE_PROTEIN,
+                ProfileEditOperation.CHANGE_FIBRE,
             }
         return self in {
             ProfileEditOperation.ADD,
@@ -583,10 +587,12 @@ class LLMResponseMetadata(BaseModel):
 
 
 class FamilyMember(BaseModel):
-    """Family member with an explicit daily calorie target."""
+    """Family member with optional daily nutrition targets."""
 
     name: ShortText
     calorie_target: int = Field(ge=1, le=10_000)
+    protein_target: int | None = Field(default=None, ge=1, le=1_000)
+    fibre_target: int | None = Field(default=None, ge=1, le=1_000)
 
 
 class UserProfile(BaseModel):

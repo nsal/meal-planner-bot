@@ -2,6 +2,8 @@
 
 from datetime import date, datetime, timedelta, timezone
 
+import pytest
+
 from meal_planner.llm.prompts import (
     build_conversational_prompt,
     build_grocery_prompt,
@@ -128,6 +130,56 @@ def test_conversational_prompt_distinguishes_family_and_member_names() -> None:
     assert "people_count" in prompt
 
 
+def test_conversational_prompt_contracts_optional_member_targets() -> None:
+    """Profile extraction keeps optional targets on each member."""
+    prompt = build_conversational_prompt()
+    normalized = prompt.casefold()
+
+    assert "family_members" in normalized
+    assert "protein_target" in normalized
+    assert "fibre_target" in normalized
+    assert "optional" in normalized
+    assert "grams/day" in normalized
+    assert "only when the user explicitly provides" in normalized
+    assert "never invent" in normalized
+    assert "top-level 'protein_target'" not in normalized
+    assert "top-level 'fibre_target'" not in normalized
+
+
+def test_conversational_prompt_keeps_targets_with_correct_member() -> None:
+    """Different optional targets remain attached to their source member."""
+    prompt = build_conversational_prompt(
+        profile_draft=ProfileUpdateEntities(
+            family_members=[
+                {"name": "Alex", "calorie_target": 2000},
+                {
+                    "name": "Sam",
+                    "calorie_target": 1800,
+                    "protein_target": 120,
+                },
+                {
+                    "name": "Lee",
+                    "calorie_target": 1600,
+                    "fibre_target": 30,
+                },
+            ]
+        )
+    )
+
+    assert (
+        "Alex (2000 kcal) [protein target: not set; fibre target: not set]"
+        in prompt
+    )
+    assert (
+        "Sam (1800 kcal) [protein target: 120 g/day; fibre target: not set]"
+        in prompt
+    )
+    assert (
+        "Lee (1600 kcal) [protein target: not set; fibre target: 30 g/day]"
+        in prompt
+    )
+
+
 def test_prompt_separates_saved_and_pending_values() -> None:
     profile = UserProfile(name="Alex", dietary_constraints=["shellfish"])
     draft = ProfileUpdateEntities(dietary_constraints=["peanuts"])
@@ -153,6 +205,43 @@ def test_build_conversational_prompt_renders_pending_family_members() -> None:
     )
 
     assert "Family Members: Sam (1800 kcal)" in prompt
+
+
+@pytest.mark.parametrize(
+    ("protein_target", "fibre_target", "protein_text", "fibre_text"),
+    [
+        (None, None, "not set", "not set"),
+        (120, None, "120 g/day", "not set"),
+        (None, 30, "not set", "30 g/day"),
+        (120, 30, "120 g/day", "30 g/day"),
+    ],
+)
+def test_conversational_prompts_render_all_member_targets(
+    protein_target: int | None,
+    fibre_target: int | None,
+    protein_text: str,
+    fibre_text: str,
+) -> None:
+    """Saved and pending members expose every target without defaults."""
+    member = FamilyMember(
+        name="Sam",
+        calorie_target=1800,
+        protein_target=protein_target,
+        fibre_target=fibre_target,
+    )
+    profile = UserProfile(name="Household", family_members=[member])
+
+    saved_prompt = build_conversational_prompt(profile=profile)
+    pending_prompt = build_conversational_prompt(
+        profile_draft=ProfileUpdateEntities(family_members=[member])
+    )
+
+    for prompt in (saved_prompt, pending_prompt):
+        assert "Sam (1800 kcal)" in prompt
+        assert f"protein target: {protein_text}" in prompt
+        assert f"fibre target: {fibre_text}" in prompt
+    assert "protein target: 0" not in saved_prompt
+    assert "fibre target: 0" not in pending_prompt
 
 
 def test_build_plan_prompt_empty() -> None:
@@ -248,6 +337,67 @@ def test_build_plan_prompt_with_context() -> None:
     assert "Skipped: Soup" in prompt
     assert "Swapped: Pasta" in prompt
     assert "Fruit" not in prompt
+
+
+@pytest.mark.parametrize(
+    ("protein_target", "fibre_target", "protein_text", "fibre_text"),
+    [
+        (None, None, "not set", "not set"),
+        (120, None, "120 g/day", "not set"),
+        (None, 30, "not set", "30 g/day"),
+        (120, 30, "120 g/day", "30 g/day"),
+    ],
+)
+def test_plan_prompt_renders_all_member_targets(
+    protein_target: int | None,
+    fibre_target: int | None,
+    protein_text: str,
+    fibre_text: str,
+) -> None:
+    """Initial generation receives saved targets without inferred values."""
+    profile = UserProfile(
+        name="Household",
+        family_members=[
+            FamilyMember(
+                name="Sam",
+                calorie_target=1800,
+                protein_target=protein_target,
+                fibre_target=fibre_target,
+            )
+        ],
+    )
+
+    prompt = build_plan_prompt(profile=profile)
+
+    assert "Sam (1800 kcal/day)" in prompt
+    assert f"protein target: {protein_text}" in prompt
+    assert f"fibre target: {fibre_text}" in prompt
+
+
+def test_plan_prompt_guides_best_effort_adjustment_and_priority() -> None:
+    """Generation explains target adjustment and safety precedence."""
+    prompt = build_plan_prompt(
+        profile=UserProfile(
+            name="Household",
+            family_members=[
+                FamilyMember(
+                    name="Sam",
+                    calorie_target=1800,
+                    protein_target=120,
+                    fibre_target=30,
+                )
+            ],
+        )
+    )
+
+    assert "best-effort" in prompt
+    assert "meal choices and portions" in prompt
+    assert "protein" in prompt and "fibre" in prompt
+    assert "Dietary constraints" in prompt
+    assert "safety" in prompt
+    assert "does not calculate, validate, detect, or repair" in prompt
+    assert '"est_calories"' in prompt
+    assert "protein_total" not in prompt
 
 
 def test_plan_prompt_renders_preference_and_constraints() -> None:
@@ -420,6 +570,74 @@ def test_build_plan_revision_prompt_contains_trusted_full_context() -> None:
     assert "2026-08-10" in prompt
     assert "seven days" in prompt
     assert "Do not return a patch" in prompt
+
+
+@pytest.mark.parametrize(
+    ("protein_target", "fibre_target", "protein_text", "fibre_text"),
+    [
+        (None, None, "not set", "not set"),
+        (120, None, "120 g/day", "not set"),
+        (None, 30, "not set", "30 g/day"),
+        (120, 30, "120 g/day", "30 g/day"),
+    ],
+)
+def test_revision_prompt_renders_all_member_targets(
+    protein_target: int | None,
+    fibre_target: int | None,
+    protein_text: str,
+    fibre_text: str,
+) -> None:
+    """Whole-plan revision receives every saved target."""
+    profile = UserProfile(
+        name="Household",
+        family_members=[
+            FamilyMember(
+                name="Sam",
+                calorie_target=1800,
+                protein_target=protein_target,
+                fibre_target=fibre_target,
+            )
+        ],
+    )
+    plan = WeeklyPlan(
+        week_start="2026-08-10",
+        days=[PlanDay(day=value) for value in range(1, 8)],
+    )
+
+    prompt = build_plan_revision_prompt(profile, plan, "Keep the plan simple")
+
+    assert "Sam (1800 kcal/day)" in prompt
+    assert f"protein target: {protein_text}" in prompt
+    assert f"fibre target: {fibre_text}" in prompt
+
+
+def test_revision_prompt_guides_best_effort_adjustment_and_priority() -> None:
+    """Revision explains target adjustment without changing output schema."""
+    profile = UserProfile(
+        name="Household",
+        family_members=[
+            FamilyMember(
+                name="Sam",
+                calorie_target=1800,
+                protein_target=120,
+                fibre_target=30,
+            )
+        ],
+    )
+    plan = WeeklyPlan(
+        week_start="2026-08-10",
+        days=[PlanDay(day=value) for value in range(1, 8)],
+    )
+
+    prompt = build_plan_revision_prompt(profile, plan, "Keep the plan simple")
+
+    assert "best-effort" in prompt
+    assert "meal choices and portions" in prompt
+    assert "Dietary constraints" in prompt
+    assert "safety" in prompt
+    assert "does not calculate, validate, detect, or repair" in prompt
+    assert '"est_calories"' in prompt
+    assert "protein_total" not in prompt
 
 
 def test_build_grocery_prompt() -> None:

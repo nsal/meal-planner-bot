@@ -56,6 +56,24 @@ def test_readme_documents_preference_clarification_contract() -> None:
     assert "your next reply is combined with it" in readme
 
 
+def test_readme_documents_optional_member_nutrient_targets() -> None:
+    """Document optional targets and their deterministic amendment grammar."""
+    readme = _normalized_readme().lower()
+
+    assert (
+        "protein and fibre targets are optional grams/day values per member"
+    ) in readme
+    assert "name calories" in readme
+    assert "name calories protein fibre" in readme
+    assert "name grams" in readme
+    assert "send `name none`" in readme
+    assert "does not block profile completion" in readme
+    assert (
+        "missed calorie, protein, or fibre targets are not automatically "
+        "detected" in readme
+    )
+
+
 def test_readme_documents_validation_and_repair_contract() -> None:
     """Document evidence validation, repair, and manual retry behavior."""
     readme = _normalized_readme()
