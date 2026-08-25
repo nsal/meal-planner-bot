@@ -107,3 +107,30 @@ def test_readme_documents_three_planner_success_sends_and_budget() -> None:
     assert "three sequential 10-second Telegram allowances" in readme
     assert "plan, bounded summary, and review follow-up" in readme
     assert "290 seconds" in readme
+
+
+def test_readme_documents_single_json_secret_configuration() -> None:
+    """Document the one-secret environment and synchronization contract."""
+    readme = _normalized_readme()
+
+    assert "APP_SECRETS_SECRET_NAME=meal-planner/app-secrets" in readme
+    assert "TELEGRAM_BOT_TOKEN_SECRET_NAME" not in readme
+    assert "TELEGRAM_WEBHOOK_SECRET_NAME" not in readme
+    assert "LLM_API_KEY_SECRET_NAME" not in readme
+    assert "one JSON secret" in readme
+    assert "complete object" in readme
+    assert "individual field updates are not merged" in readme
+
+
+def test_readme_documents_safe_rotation_and_legacy_cleanup() -> None:
+    """Document refresh, webhook ordering, and manual legacy cleanup."""
+    readme = _normalized_readme()
+
+    assert "restricted local" in readme
+    assert "new unique `SecretRefreshToken`" in readme
+    assert "publish the complete JSON object first" in readme
+    assert "deploy the Lambda with the new refresh token second" in readme
+    assert "register and verify the Telegram webhook" in readme
+    assert "legacy Secrets Manager secrets" in readme
+    assert "does not automate that destructive cleanup" in readme
+    assert "real secret values" not in readme

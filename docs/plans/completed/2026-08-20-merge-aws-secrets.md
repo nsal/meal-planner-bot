@@ -131,21 +131,20 @@ the previously resolved Lambda environment.
 - Modify: `template.yaml`
 - Modify: `tests/test_template.py`
 
-- [ ] Add failing template tests for exactly one `AppSecretsSecretName`
+- [x] Add failing template tests for exactly one `AppSecretsSecretName`
   parameter and no legacy individual secret-name parameters.
-- [ ] Add failing template tests for the three JSON-key references while
+- [x] Add failing template tests for the three JSON-key references while
   preserving the existing Lambda environment variable names and
   `SECRET_REFRESH_TOKEN` references.
-- [ ] Replace the three parameters and direct `SecretString` references in
+- [x] Replace the three parameters and direct `SecretString` references in
   `template.yaml` with field-level references to the single secret.
-- [ ] Confirm both Lambda resources still receive a configuration change when
+- [x] Confirm both Lambda resources still receive a configuration change when
   `SecretRefreshToken` changes and that no runtime `GetSecretValue` policy or
   application JSON parsing is introduced.
-- [ ] Add/finish structural assertions covering both generated Lambda
+- [x] Add/finish structural assertions covering both generated Lambda
   configurations and the absence of a whole-secret environment value.
-- [ ] Run `uv run pytest tests/test_template.py` and
-  `uvx --from aws-sam-cli sam validate --lint --profile meal-planner --region eu-west-1`;
-  require both to pass before task 3.
+- [x] Run `uv run pytest tests/test_template.py` and
+  `uvx --from aws-sam-cli sam validate --lint --region eu-west-1`; both pass.
 
 ### Task 3: Document the one-secret workflow and safe rotation sequence
 
@@ -153,19 +152,19 @@ the previously resolved Lambda environment.
 - Modify: `README.md`
 - Modify: `tests/test_readme.py`
 
-- [ ] Add failing documentation tests for `APP_SECRETS_SECRET_NAME`, the
+- [x] Add failing documentation tests for `APP_SECRETS_SECRET_NAME`, the
   removal of obsolete secret-name variables, and single-secret terminology.
-- [ ] Update the `.env` example, routine deployment description, and secret
+- [x] Update the `.env` example, routine deployment description, and secret
   synchronization section to describe one JSON Secrets Manager secret.
-- [ ] Replace the manual rotation example with a file-based complete JSON
+- [x] Replace the manual rotation example with a file-based complete JSON
   object update followed by a deployment containing a new
   `SecretRefreshToken`; state that partial field updates are not merged.
-- [ ] Document the webhook rotation ordering and the deliberate manual
+- [x] Document the webhook rotation ordering and the deliberate manual
   post-cutover cleanup of the three legacy secrets only after successful live
   verification.
-- [ ] Add/finish tests covering rotation, refresh, and cleanup wording without
+- [x] Add/finish tests covering rotation, refresh, and cleanup wording without
   embedding real secret values.
-- [ ] Run `uv run pytest tests/test_readme.py` and require it to pass before
+- [x] Run `uv run pytest tests/test_readme.py`; 8 tests pass.
   task 4.
 
 ### Task 4: Verify the complete migration contract
@@ -177,32 +176,34 @@ the previously resolved Lambda environment.
 - Modify: `tests/test_template.py` (only if checks reveal a defect)
 - Modify: `README.md` (only if checks reveal a defect)
 
-- [ ] Review the final diff against this plan: one JSON secret name, three
+- [x] Review the final diff against this plan: one JSON secret name, three
   JSON keys, unchanged application environment interface, and no runtime
   secret retrieval.
-- [ ] Run `uv run pytest` and fix any integration failures before proceeding.
-- [ ] Run `uv run ruff check .` and `uv run ruff format --check .`; fix all
+- [x] Run `uv run pytest`; 1,058 passed and 2 skipped.
+- [x] Run `uv run ruff check .` and `uv run ruff format --check .`; both pass.
   findings before proceeding.
-- [ ] Run `uv run mypy` and fix all type errors before proceeding.
-- [ ] Run `uvx --from aws-sam-cli sam build --beta-features --profile
-  meal-planner --region eu-west-1` and verify the generated template retains
+- [x] Run `uv run mypy`; no issues found.
+- [x] Run `uvx --from aws-sam-cli sam build --beta-features --region eu-west-1`
+  and verify the generated template retains
   the intended dynamic references.
-- [ ] Record all completed checks in this plan before task 5.
+- [x] Record all completed checks in this plan before task 5.
 
 ### Task 5: Finalize implementation documentation and plan tracking
 
 **Files:**
-- Modify: `docs/plans/ideas/2026-08-20-merge-aws-secrets.md`
-- Move: `docs/plans/ideas/2026-08-20-merge-aws-secrets.md` to
+- Modify: `docs/plans/2026-08-20-merge-aws-secrets.md`
+- Move: `docs/plans/2026-08-20-merge-aws-secrets.md` to
   `docs/plans/completed/2026-08-20-merge-aws-secrets.md`
 
-- [ ] Verify every acceptance criterion in the Overview and Technical Details
+- [x] Verify every acceptance criterion in the Overview and Technical Details
   is implemented and checked.
-- [ ] Confirm each preceding task includes completed tests for success and
+- [x] Confirm each preceding task includes completed tests for success and
   error behavior.
-- [ ] Run the final full test suite: `uv run pytest`.
-- [ ] Update this plan with any scope changes, validation results, or blockers.
-- [ ] Move the completed plan to `docs/plans/completed/` only when all
+- [x] Run the final full test suite: `uv run pytest` (1,058 passed, 2 skipped).
+- [x] Update this plan with validation results and the credential-free SAM
+  command adjustment. Live deployment and smoke verification were completed
+  successfully by the operator.
+- [x] Move the completed plan to `docs/plans/completed/` now that all
   implementation checkboxes are complete.
 
 ## Post-Completion
