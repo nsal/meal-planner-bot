@@ -4,6 +4,9 @@ from datetime import date
 from typing import Any
 
 from meal_planner.models.schemas import (
+    ConstraintEntry,
+    DietaryPreferenceEntry,
+    DietaryRule,
     FamilyMember,
     GrocerySection,
     GroceryStatus,
@@ -14,6 +17,64 @@ from meal_planner.models.schemas import (
     UserProfile,
     WeeklyPlan,
 )
+
+
+def make_constraint(
+    source_text: str = "peanuts",
+    *,
+    identifier: str = "constraint-1",
+    forbidden_terms: list[str] | None = None,
+) -> ConstraintEntry:
+    """Return one canonical persisted dietary constraint."""
+    return ConstraintEntry(
+        id=identifier,
+        source_text=source_text,
+        forbidden_terms=forbidden_terms or [source_text],
+    )
+
+
+def make_dietary_rule(
+    source_text: str = "eggs for breakfast",
+    *,
+    identifier: str = "preference-1",
+    foods_any_of: list[str] | None = None,
+    meal_type: str = "breakfast",
+    count: int = 1,
+) -> DietaryRule:
+    """Return one canonical strict dietary preference rule."""
+    return DietaryRule(
+        id=identifier,
+        source_text=source_text,
+        foods_any_of=foods_any_of or ["eggs"],
+        meal_type=meal_type,
+        count=count,
+    )
+
+
+def make_preference(
+    source_text: str = "eggs for breakfast",
+    *,
+    identifier: str = "preference-1",
+    rule: DietaryRule | None = None,
+) -> DietaryPreferenceEntry:
+    """Return one canonical persisted dietary preference."""
+    return DietaryPreferenceEntry(
+        id=identifier,
+        source_text=source_text,
+        rule=rule or make_dietary_rule(source_text, identifier=identifier),
+    )
+
+
+def make_legacy_profile_item() -> dict[str, Any]:
+    """Return a raw profile document for compatibility-boundary tests."""
+    return {
+        "name": "Alex",
+        "people_count": 1,
+        "family_members": [],
+        "dietary_constraints": ["Peanuts"],
+        "dietary_preferences": ["More vegetables"],
+        "goals": ["eat well"],
+    }
 
 
 def make_profile(*, with_nutrient_targets: bool = False) -> UserProfile:
@@ -36,8 +97,7 @@ def make_profile(*, with_nutrient_targets: bool = False) -> UserProfile:
             FamilyMember(name="Sam", calorie_target=1800, **sam_targets),
         ],
         dietary_constraints=[],
-        dietary_preferences=["balanced"],
-        goals=["eat well"],
+        dietary_preferences=[],
     )
 
 

@@ -9,10 +9,12 @@ from meal_planner.models import (
     PreferenceRequirement as ExportedPreferenceRequirement,
 )
 from meal_planner.models.schemas import (
+    ConstraintEntry,
     ConversationIntent,
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
+    DietaryRule,
     FamilyMember,
     GrocerySection,
     GroceryStatus,
@@ -21,6 +23,7 @@ from meal_planner.models.schemas import (
     MealLogDraft,
     MealLogEntry,
     MealOutcome,
+    MealType,
     PlanDay,
     PlanGenerationContext,
     PlannedMeal,
@@ -30,7 +33,10 @@ from meal_planner.models.schemas import (
     ProfileEditCategory,
     ProfileEditOperation,
     ProfileUpdateEntities,
+    RuleOperator,
+    RuleStrength,
     UserProfile,
+    Weekday,
     WeeklyPlan,
 )
 from tests.factories import make_profile
@@ -56,6 +62,202 @@ def test_preference_requirement_valid_exact_count_and_optional_scope() -> None:
     assert scoped.meal_type.value == "breakfast"
     assert unscoped.meal_type is None
     assert unscoped.exact_count == 2
+
+
+def test_dietary_rule_supports_operators_strength_and_weekdays() -> None:
+    """Serialize the shared rule contract without losing its scope."""
+    rule = DietaryRule(
+        id="r1",
+        source_text="eggs for breakfast twice",
+        foods_any_of=["egg"],
+        meal_type="breakfast",
+        weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY],
+        operator=RuleOperator.AT_LEAST,
+        count=2,
+        strength=RuleStrength.BEST_EFFORT,
+    )
+
+    restored = DietaryRule.model_validate_json(rule.model_dump_json())
+
+    assert restored == rule
+    assert restored.operator is RuleOperator.AT_LEAST
+    assert restored.weekdays == [Weekday.MONDAY, Weekday.WEDNESDAY]
+    assert restored.strength is RuleStrength.BEST_EFFORT
+
+
+@pytest.mark.parametrize(
+    "operator", [RuleOperator.EXACTLY, RuleOperator.AT_LEAST]
+)
+def test_dietary_rule_rejects_impossible_strict_named_day_count(
+    operator: RuleOperator,
+) -> None:
+    """Reject strict counts that exceed one selected meal per named day."""
+    with pytest.raises(ValidationError, match="per named weekday"):
+        DietaryRule(
+            id="r1",
+            source_text="eggs twice for breakfast on Monday and Wednesday",
+            foods_any_of=["eggs"],
+            meal_type=MealType.BREAKFAST,
+            weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY],
+            operator=operator,
+            count=2,
+            strength=RuleStrength.STRICT,
+        )
+
+
+def test_dietary_rule_uses_bounded_unscoped_daily_capacity() -> None:
+    """Meal-unscoped weekday rules use four supported daily meals."""
+    valid = DietaryRule(
+        id="r1",
+        source_text="eggs four times on Monday",
+        foods_any_of=["eggs"],
+        weekdays=[Weekday.MONDAY],
+        operator=RuleOperator.EXACTLY,
+        count=4,
+        strength=RuleStrength.STRICT,
+    )
+
+    assert valid.count == 4
+    with pytest.raises(ValidationError, match="per named weekday"):
+        DietaryRule(
+            id="r2",
+            source_text="eggs five times on Monday",
+            foods_any_of=["eggs"],
+            weekdays=[Weekday.MONDAY],
+            operator=RuleOperator.AT_LEAST,
+            count=5,
+            strength=RuleStrength.STRICT,
+        )
+
+
+@pytest.mark.parametrize(
+    ("operator", "strength"),
+    [
+        (RuleOperator.AT_MOST, RuleStrength.STRICT),
+        (RuleOperator.EXACTLY, RuleStrength.BEST_EFFORT),
+    ],
+)
+def test_dietary_rule_preserves_non_strict_weekday_controls(
+    operator: RuleOperator,
+    strength: RuleStrength,
+) -> None:
+    """Maxima and best-effort rules retain their existing flexibility."""
+    rule = DietaryRule(
+        id="r1",
+        source_text="eggs four times on Monday",
+        foods_any_of=["eggs"],
+        weekdays=[Weekday.MONDAY],
+        operator=operator,
+        count=4,
+        strength=strength,
+    )
+
+    assert rule.count == 4
+
+
+@pytest.mark.parametrize("operator", list(RuleOperator))
+def test_dietary_rule_allows_zero_count_exclusions(
+    operator: RuleOperator,
+) -> None:
+    """Allow zero for every operator, including explicit exclusions."""
+    rule = DietaryRule(
+        id="r1",
+        source_text="no eggs this week",
+        foods_any_of=["eggs"],
+        operator=operator,
+        count=0,
+    )
+
+    assert rule.count == 0
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"count": -1},
+        {"count": 29},
+        {"weekdays": [Weekday.MONDAY, Weekday.MONDAY]},
+        {"weekdays": list(Weekday) + [Weekday.MONDAY]},
+        {
+            "meal_type": MealType.BREAKFAST,
+            "weekdays": [Weekday.MONDAY, Weekday.WEDNESDAY],
+            "count": 3,
+        },
+    ],
+)
+def test_dietary_rule_rejects_invalid_bounds_and_duplicate_weekdays(
+    values: dict[str, object],
+) -> None:
+    """Reject counts outside bounds and scopes that cannot satisfy them."""
+    defaults: dict[str, object] = {
+        "id": "r1",
+        "source_text": "eggs",
+        "foods_any_of": ["eggs"],
+        "count": 1,
+    }
+
+    with pytest.raises(ValidationError):
+        DietaryRule(**{**defaults, **values})
+
+
+def test_constraint_entry_normalizes_and_deduplicates_forbidden_terms() -> None:
+    """Constraint terms are normalized at the schema boundary."""
+    entry = ConstraintEntry(
+        id="c1",
+        source_text="Peanut butter allergy",
+        forbidden_terms=["Peanuts", " peanut ", "Peanut Butter"],
+    )
+
+    assert entry.forbidden_terms == ["peanut", "peanut butter"]
+    assert ConstraintEntry.model_validate_json(entry.model_dump_json()) == entry
+
+
+def test_constraint_entry_requires_a_nonempty_unique_term_collection() -> None:
+    """Constraints cannot be represented without a matchable term."""
+    with pytest.raises(ValidationError):
+        ConstraintEntry(id="c1", source_text="unknown", forbidden_terms=[])
+    entry = ConstraintEntry(
+        id="c1",
+        source_text="peanuts",
+        forbidden_terms=["peanuts", " peanut "],
+    )
+    assert entry.forbidden_terms == ["peanut"]
+
+
+@pytest.mark.parametrize(
+    ("source_text", "expected_terms", "uninterpretable"),
+    [
+        ("allergic to peanuts", ["peanut"], False),
+        ("gluten-free", ["gluten", "wheat", "barley", "rye"], False),
+        ("vegan", [], True),
+    ],
+)
+def test_legacy_semantic_constraints_are_normalized_to_terms(
+    source_text: str,
+    expected_terms: list[str],
+    uninterpretable: bool,
+) -> None:
+    """Legacy semantic phrases retain only complete reviewed evidence."""
+    profile = UserProfile.model_validate(
+        {"name": "Alex", "dietary_constraints": [source_text]}
+    )
+
+    assert profile.dietary_constraints[0].forbidden_terms == expected_terms
+    assert profile.dietary_constraints[0].uninterpretable is uninterpretable
+
+
+def test_unknown_legacy_constraint_is_explicitly_uninterpretable() -> None:
+    """Unknown semantic prose cannot become safety evidence by copying it."""
+    profile = UserProfile.model_validate(
+        {
+            "name": "Alex",
+            "dietary_constraints": ["I react badly to mystery foods"],
+        }
+    )
+
+    constraint = profile.dietary_constraints[0]
+    assert constraint.uninterpretable
+    assert constraint.forbidden_terms == []
 
 
 @pytest.mark.parametrize(
@@ -167,6 +369,99 @@ def test_plan_generation_context_carries_bounded_preference_metadata() -> None:
     assert context.attempt == 2
     assert context.repair_feedback is not None
     assert context.repair_id == "repair-123"
+
+
+def test_generation_context_round_trips_prioritized_rule_snapshots() -> None:
+    """Retries retain each rule tier and constraint without reinterpretation."""
+    stored = DietaryRule(
+        id="stored-1",
+        source_text="eggs twice",
+        foods_any_of=["eggs"],
+        operator=RuleOperator.EXACTLY,
+        count=2,
+    )
+    current = DietaryRule(
+        id="current-1",
+        source_text="eggs at most once",
+        foods_any_of=["eggs"],
+        operator=RuleOperator.AT_MOST,
+        count=1,
+    )
+    constraint = ConstraintEntry(
+        id="constraint-1",
+        source_text="peanut allergy",
+        forbidden_terms=["peanuts"],
+    )
+    context = PlanGenerationContext(
+        preference="eggs at most once",
+        stored_rules=[stored],
+        current_rules=[current],
+        effective_rules=[current],
+        constraint_rules=[constraint],
+        attempt=1,
+    )
+
+    restored = PlanGenerationContext.model_validate_json(
+        context.model_dump_json()
+    )
+
+    assert restored == context
+    assert restored.stored_rules[0].id == "stored-1"
+    assert restored.current_rules[0].operator is RuleOperator.AT_MOST
+    assert restored.constraint_rules[0].forbidden_terms == ["peanut"]
+
+
+def test_generation_context_rejects_cross_tier_rule_id_collisions() -> None:
+    """A provider ID cannot identify rules in two planning tiers."""
+    stored = DietaryRule(
+        id="r1",
+        source_text="eggs",
+        foods_any_of=["eggs"],
+        count=1,
+    )
+    current = DietaryRule(
+        id="r1",
+        source_text="tofu",
+        foods_any_of=["tofu"],
+        count=1,
+    )
+
+    with pytest.raises(ValidationError, match="unique IDs"):
+        PlanGenerationContext(
+            stored_rules=[stored],
+            current_rules=[current],
+            effective_rules=[stored],
+        )
+
+
+def test_conversation_state_round_trips_prioritized_rule_snapshots() -> None:
+    """Durable conversation state carries the same retry-safe rule snapshot."""
+    now = datetime.now(timezone.utc)
+    stored = DietaryRule(
+        id="stored-1",
+        source_text="salmon once",
+        foods_any_of=["salmon"],
+        count=1,
+    )
+    current = stored.model_copy(update={"id": "current-1"})
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+        step=ConversationWorkflowStep.GENERATING,
+        preference="salmon once",
+        stored_rules=[stored],
+        current_rules=[current],
+        effective_rules=[current],
+        constraint_rules=[],
+        request_id="request-1",
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+
+    restored = ConversationState.model_validate_json(state.model_dump_json())
+
+    assert restored == state
+    assert restored.effective_rules[0].source_text == "salmon once"
 
 
 def test_tracked_attempt_two_may_omit_repair_id() -> None:
@@ -352,8 +647,6 @@ def test_profile_edit_menu_state_has_no_selected_operation() -> None:
             ProfileEditCategory.DIETARY_PREFERENCES,
             ProfileEditOperation.REMOVE,
         ),
-        (ProfileEditCategory.GOALS, ProfileEditOperation.ADD),
-        (ProfileEditCategory.GOALS, ProfileEditOperation.REMOVE),
     ],
 )
 def test_profile_edit_awaiting_input_accepts_valid_operation(
@@ -396,7 +689,6 @@ def test_nutrient_operations_have_stable_values_and_are_family_only(
     [
         ProfileEditCategory.DIETARY_CONSTRAINTS,
         ProfileEditCategory.DIETARY_PREFERENCES,
-        ProfileEditCategory.GOALS,
     ],
 )
 @pytest.mark.parametrize(
@@ -506,7 +798,7 @@ def test_non_profile_workflows_reject_profile_fields() -> None:
             target_week=date(2026, 8, 10),
             expected_plan_revision=1,
             request_id="request-1",
-            profile_category=ProfileEditCategory.GOALS,
+            profile_category=ProfileEditCategory.DIETARY_CONSTRAINTS,
         )
 
 
@@ -822,7 +1114,6 @@ def test_user_profile_defaults() -> None:
     assert profile.family_members == []
     assert profile.dietary_constraints == []
     assert profile.dietary_preferences == []
-    assert profile.goals == []
     assert profile.people_count == 1
 
 
@@ -837,11 +1128,18 @@ def test_user_profile_full() -> None:
         ],
         dietary_constraints=["peanuts", "gluten-free"],
         dietary_preferences=["keto"],
-        goals=["weight-loss"],
+        goals=["weight-loss"],  # legacy input is intentionally discarded
         people_count=2,
     )
     assert len(profile.family_members) == 2
-    assert profile.dietary_constraints == ["peanuts", "gluten-free"]
+    assert [entry.source_text for entry in profile.dietary_constraints] == [
+        "peanuts",
+        "gluten-free",
+    ]
+    assert [entry.source_text for entry in profile.dietary_preferences] == [
+        "keto"
+    ]
+    assert "goals" not in profile.model_dump()
     assert profile.people_count == 2
 
 
@@ -857,13 +1155,15 @@ def test_user_profile_merges_legacy_constraints_in_order_and_deduplicates() -> (
         }
     )
 
-    assert profile.dietary_constraints == [
+    assert [entry.source_text for entry in profile.dietary_constraints] == [
         "Peanuts",
         "Shellfish",
         "Gluten-free",
     ]
     dumped = profile.model_dump()
-    assert dumped["dietary_constraints"] == profile.dietary_constraints
+    assert dumped["dietary_constraints"] == [
+        entry.model_dump() for entry in profile.dietary_constraints
+    ]
     assert "allergies" not in dumped
     assert "restrictions" not in dumped
 
@@ -881,7 +1181,9 @@ def test_user_profile_prefers_present_canonical_constraints_over_legacy() -> (
         }
     )
 
-    assert profile.dietary_constraints == ["Vegan"]
+    assert [entry.source_text for entry in profile.dietary_constraints] == [
+        "Vegan"
+    ]
 
 
 def test_user_profile_has_no_constraints_when_legacy_data_is_empty() -> None:
@@ -927,7 +1229,11 @@ def test_profile_update_normalizes_legacy_constraints(
     """Partial legacy drafts preserve unanswered and explicit-empty states."""
     update = ProfileUpdateEntities.model_validate(legacy)
 
-    assert update.dietary_constraints == expected
+    assert (
+        None
+        if update.dietary_constraints is None
+        else [entry.source_text for entry in update.dietary_constraints]
+    ) == expected
     dumped = update.model_dump()
     assert "allergies" not in dumped
     assert "restrictions" not in dumped
@@ -944,6 +1250,23 @@ def test_profile_update_canonical_constraints_are_authoritative() -> None:
     )
 
     assert update.dietary_constraints is None
+
+
+def test_profile_and_update_discard_legacy_goals_from_canonical_dumps() -> None:
+    """Legacy goal input is accepted for reads but never remains canonical."""
+    profile = UserProfile.model_validate(
+        {"name": "Alex", "goals": ["lose weight"]}
+    )
+    update = ProfileUpdateEntities.model_validate(
+        {"goals": ["lose weight"], "name": "Alex"}
+    )
+
+    assert "goals" not in profile.model_dump()
+    assert "goals" not in update.model_dump()
+    assert "goals" not in profile.model_dump_json()
+    assert "goals" not in update.model_dump_json()
+    assert not hasattr(profile, "goals")
+    assert not hasattr(update, "goals")
 
 
 @pytest.mark.parametrize(
@@ -989,11 +1312,7 @@ def test_user_profile_ignores_legacy_revision_on_read() -> None:
 
 @pytest.mark.parametrize(
     "field",
-    [
-        "dietary_constraints",
-        "dietary_preferences",
-        "goals",
-    ],
+    ["dietary_constraints", "dietary_preferences"],
 )
 @pytest.mark.parametrize(
     "value",
@@ -1015,8 +1334,6 @@ def test_profile_update_normalizes_generic_no_value_phrases(
         ("dietary_preferences", "no dietary preferences."),
         ("dietary_preferences", "NO PREFERENCES"),
         ("dietary_constraints", " No dietary constraints! "),
-        ("goals", "not applicable"),
-        ("goals", "no goals"),
     ],
 )
 def test_profile_update_normalizes_field_specific_no_value_phrases(
@@ -1030,11 +1347,7 @@ def test_profile_update_normalizes_field_specific_no_value_phrases(
 
 @pytest.mark.parametrize(
     "field",
-    [
-        "dietary_constraints",
-        "dietary_preferences",
-        "goals",
-    ],
+    ["dietary_constraints", "dietary_preferences"],
 )
 @pytest.mark.parametrize("value", [None, [], ["peanuts"]])
 def test_profile_update_preserves_none_and_lists(
@@ -1043,16 +1356,16 @@ def test_profile_update_preserves_none_and_lists(
     """Keep missing values and list values on their existing code paths."""
     update = ProfileUpdateEntities.model_validate({field: value})
 
-    assert getattr(update, field) == value
+    actual = getattr(update, field)
+    if value is None or value == []:
+        assert actual == value
+    else:
+        assert [entry.source_text for entry in actual] == value
 
 
 @pytest.mark.parametrize(
     "field",
-    [
-        "dietary_constraints",
-        "dietary_preferences",
-        "goals",
-    ],
+    ["dietary_constraints", "dietary_preferences"],
 )
 @pytest.mark.parametrize(
     "value",

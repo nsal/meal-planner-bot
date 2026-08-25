@@ -12,9 +12,11 @@ from meal_planner.llm.prompts import (
     build_preference_interpretation_prompt,
 )
 from meal_planner.models.schemas import (
+    ConstraintEntry,
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
+    DietaryRule,
     FamilyMember,
     Ingredient,
     MealLogDraft,
@@ -68,7 +70,6 @@ def test_build_conversational_prompt_with_context() -> None:
         ],
         dietary_constraints=["peanuts", "dairy-free"],
         dietary_preferences=["low-carb"],
-        goals=["weight-loss"],
         people_count=2,
     )
     meal = PlannedMeal(meal_type="lunch", name="Salad")
@@ -412,6 +413,48 @@ def test_plan_prompt_renders_preference_and_constraints() -> None:
     assert "always take precedence" in prompt
 
 
+def test_plan_prompt_separates_constraint_strict_and_best_effort_rules() -> (
+    None
+):
+    """Effective prompt sections preserve rule priority and strictness."""
+    strict = DietaryRule(
+        id="strict-1",
+        source_text="eggs twice",
+        foods_any_of=["eggs"],
+        count=2,
+    )
+    best_effort = DietaryRule(
+        id="best-1",
+        source_text="beans once if convenient",
+        foods_any_of=["beans"],
+        count=1,
+        strength="best_effort",
+    )
+    constraint = ConstraintEntry(
+        id="constraint-1", source_text="no peanuts", forbidden_terms=["peanuts"]
+    )
+
+    prompt = build_plan_prompt(
+        preference="eggs twice",
+        constraints=[constraint],
+        effective_rules=[strict, best_effort],
+    )
+
+    assert "=== DIETARY CONSTRAINTS (HIGHEST PRIORITY) ===" in prompt
+    assert "=== EFFECTIVE STRICT RULES ===" in prompt
+    assert "=== EFFECTIVE BEST-EFFORT RULES ===" in prompt
+    assert prompt.index("HIGHEST PRIORITY") < prompt.index(
+        "EFFECTIVE STRICT RULES"
+    )
+    assert prompt.index("EFFECTIVE STRICT RULES") < prompt.index(
+        "EFFECTIVE BEST-EFFORT RULES"
+    )
+    assert "no peanuts" in prompt
+    assert "strict-1" in prompt
+    assert "best-1" in prompt
+    assert "Goals" not in prompt
+
+
 def test_plan_prompt_renders_raw_preference_and_every_exact_rule() -> None:
     """The planner sees raw wording and the application interpretation."""
     prompt = build_plan_prompt(
@@ -498,6 +541,47 @@ def test_preference_interpretation_prompt_defines_measurable_contract() -> None:
     assert "Combine alternative foods" in prompt
     assert "Every meaningful clause" in prompt
     assert "unparsed_text" in prompt
+
+
+@pytest.mark.parametrize(
+    ("mode", "required_text"),
+    [
+        ("constraint", "forbidden_terms"),
+        ("stored_preference", "stored dietary preference"),
+        ("current_plan_preference", "current plan preference"),
+    ],
+)
+def test_interpretation_prompt_has_mode_specific_rule_contract(
+    mode: str, required_text: str
+) -> None:
+    """Interpretation prompts describe the selected shared-rule mode."""
+    prompt = build_preference_interpretation_prompt(
+        "I'd like eggs for breakfast twice on Monday and Wednesday if "
+        "convenient; no peanuts",
+        mode=mode,
+    )
+
+    assert f'"mode": "{mode}"' in prompt
+    assert required_text in prompt
+    assert "exactly" in prompt
+    assert "at_least" in prompt
+    assert "at_most" in prompt
+    assert "weekdays" in prompt
+    assert "best_effort" in prompt
+    assert "unparsed_text" in prompt
+    assert "never silently discard" in prompt
+
+
+def test_interpretation_prompt_documents_wording_strength_defaults() -> None:
+    """Prompt makes implicit strictness rules explicit to the provider."""
+    prompt = build_preference_interpretation_prompt(
+        "I'd like eggs for breakfast if convenient"
+    )
+
+    assert "I'd like" in prompt
+    assert "at_least 1" in prompt
+    assert "if convenient" in prompt
+    assert "best_effort" in prompt
 
 
 def test_preference_interpretation_prompt_requires_clarification() -> None:

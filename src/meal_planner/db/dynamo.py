@@ -11,6 +11,7 @@ from boto3.dynamodb.conditions import Key  # type: ignore[import-untyped]
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
+from meal_planner.dietary_rules import has_constraint_conflict
 from meal_planner.models.schemas import (
     ConversationState,
     ConversationWorkflowKind,
@@ -18,9 +19,11 @@ from meal_planner.models.schemas import (
     MealLogEntry,
     MealOutcome,
     PlanStatus,
+    ProfileEditCategory,
     ProfileUpdateEntities,
     UserProfile,
     WeeklyPlan,
+    canonicalize_profile_rule_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,20 +68,116 @@ class DynamoRepository:
             get_kwargs["ConsistentRead"] = True
         response = self.table.get_item(**get_kwargs)
         item = response.get("Item")
-        return UserProfile.model_validate(self._data(item)) if item else None
+        return (
+            canonicalize_profile_rule_ids(
+                UserProfile.model_validate(self._data(item))
+            )
+            if item
+            else None
+        )
+
+    @staticmethod
+    def _canonical_profile(profile: UserProfile) -> UserProfile:
+        """Validate and deterministically normalize a profile before saving."""
+        canonical = canonicalize_profile_rule_ids(profile)
+        data = canonical.model_dump(mode="json", warnings=False)
+        preferences = data.get("dietary_preferences", [])
+        seen_sources: set[str] = set()
+        unique_preferences: list[dict[str, Any]] = []
+        for preference in preferences:
+            source_text = str(preference["source_text"])
+            source_key = source_text.casefold()
+            if source_key in seen_sources:
+                continue
+            seen_sources.add(source_key)
+            unique_preferences.append(preference)
+        data["dietary_preferences"] = unique_preferences
+        return UserProfile.model_validate(data)
+
+    @classmethod
+    def _prepare_guarded_profile(
+        cls,
+        profile: UserProfile,
+        category: ProfileEditCategory,
+    ) -> UserProfile | None:
+        """Apply profile-rule guards before a state-guarded transaction."""
+        canonical = cls._canonical_profile(profile)
+        if category is ProfileEditCategory.DIETARY_PREFERENCES:
+            if any(
+                preference.rule is not None
+                and has_constraint_conflict(
+                    preference.rule, canonical.dietary_constraints
+                )
+                for preference in canonical.dietary_preferences
+            ):
+                return None
+            return canonical
+
+        if category is ProfileEditCategory.DIETARY_CONSTRAINTS:
+            retained = [
+                preference
+                for preference in canonical.dietary_preferences
+                if preference.rule is None
+                or not has_constraint_conflict(
+                    preference.rule, canonical.dietary_constraints
+                )
+            ]
+            if len(retained) != len(canonical.dietary_preferences):
+                return canonical.model_copy(
+                    update={"dietary_preferences": retained}
+                )
+        return canonical
 
     def save_profile(
         self,
         user_id: str,
         profile: UserProfile,
-    ) -> None:
-        """Replace the user's canonical profile document."""
+        *,
+        expected_revision: int | None,
+    ) -> bool:
+        """Save a profile only when its caller-observed state is current."""
+        profile = self._canonical_profile(profile)
+        profile = profile.model_copy(
+            update={
+                "profile_revision": (
+                    0 if expected_revision is None else expected_revision + 1
+                )
+            }
+        )
         item = {
             "PK": f"USER#{user_id}",
             "SK": "PROFILE",
             **profile.model_dump(mode="json"),
         }
-        self.table.put_item(Item=item)
+        kwargs: dict[str, Any] = {"Item": item}
+        if expected_revision is None:
+            kwargs["ConditionExpression"] = "attribute_not_exists(#pk)"
+            kwargs["ExpressionAttributeNames"] = {"#pk": "PK"}
+        else:
+            revision_condition = (
+                "(attribute_not_exists(#profile_revision) OR "
+                "#profile_revision = :expected_revision)"
+                if expected_revision == 0
+                else "attribute_exists(#profile_revision) AND "
+                "#profile_revision = :expected_revision"
+            )
+            kwargs["ConditionExpression"] = (
+                "attribute_exists(#pk) AND " + revision_condition
+            )
+            kwargs["ExpressionAttributeNames"] = {
+                "#pk": "PK",
+                "#profile_revision": "profile_revision",
+            }
+            kwargs["ExpressionAttributeValues"] = {
+                ":expected_revision": expected_revision,
+            }
+        try:
+            self.table.put_item(**kwargs)
+        except ClientError as exc:
+            if self._is_conditional_failure(exc):
+                return False
+            raise
+        return True
 
     def save_profile_and_transition_state(
         self,
@@ -97,16 +196,31 @@ class DynamoRepository:
             or observed_state.profile_operation is None
         ):
             return False
+        prepared_profile = self._prepare_guarded_profile(
+            profile, observed_state.profile_category
+        )
+        if prepared_profile is None:
+            return False
+        committed_profile = prepared_profile.model_copy(
+            update={
+                "profile_revision": prepared_profile.profile_revision + 1,
+            }
+        )
         profile_item = {
             "PK": f"USER#{user_id}",
             "SK": "PROFILE",
-            **profile.model_dump(mode="json"),
+            **committed_profile.model_dump(mode="json"),
         }
         state_item = {
             **self._conversation_key(user_id),
             **next_state.model_dump(mode="json"),
         }
-        condition = (
+        profile_condition = (
+            "attribute_exists(PK) AND "
+            "(attribute_not_exists(#profile_revision) OR "
+            "#profile_revision = :observed_profile_revision)"
+        )
+        state_condition = (
             "#revision = :observed_revision AND "
             "#created_at = :observed_created_at AND "
             "#workflow_kind = :observed_workflow_kind AND "
@@ -114,7 +228,8 @@ class DynamoRepository:
             "#profile_category = :observed_profile_category AND "
             "#profile_operation = :observed_profile_operation"
         )
-        names = {
+        profile_names = {"#profile_revision": "profile_revision"}
+        state_names = {
             "#revision": "revision",
             "#created_at": "created_at",
             "#workflow_kind": "workflow_kind",
@@ -123,7 +238,10 @@ class DynamoRepository:
             "#profile_operation": "profile_operation",
         }
         observed_data = observed_state.model_dump(mode="json")
-        values = {
+        profile_values = {
+            ":observed_profile_revision": profile.profile_revision,
+        }
+        state_values = {
             ":observed_revision": observed_data["revision"],
             ":observed_created_at": observed_data["created_at"],
             ":observed_workflow_kind": observed_data["workflow_kind"],
@@ -138,15 +256,18 @@ class DynamoRepository:
                         "Put": {
                             "TableName": self.table.name,
                             "Item": profile_item,
+                            "ConditionExpression": profile_condition,
+                            "ExpressionAttributeNames": profile_names,
+                            "ExpressionAttributeValues": profile_values,
                         }
                     },
                     {
                         "Put": {
                             "TableName": self.table.name,
                             "Item": state_item,
-                            "ConditionExpression": condition,
-                            "ExpressionAttributeNames": names,
-                            "ExpressionAttributeValues": values,
+                            "ConditionExpression": state_condition,
+                            "ExpressionAttributeNames": state_names,
+                            "ExpressionAttributeValues": state_values,
                         }
                     },
                 ]

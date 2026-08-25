@@ -241,6 +241,14 @@ class TelegramAPI:
         self, chat_id: int | str, profile: UserProfile
     ) -> list[dict[str, Any]]:
         """Render a saved profile with controls for deterministic editing."""
+        constraints = (
+            ", ".join(item.source_text for item in profile.dietary_constraints)
+            or "None"
+        )
+        preferences = (
+            ", ".join(item.source_text for item in profile.dietary_preferences)
+            or "None"
+        )
         lines = [
             f"Family name: {profile.name}",
             f"People count: {profile.people_count}",
@@ -251,11 +259,8 @@ class TelegramAPI:
                 f"{_format_nutrient_target('fibre', member.fibre_target)})"
                 for member in profile.family_members
             ),
-            "Dietary constraints: "
-            f"{', '.join(profile.dietary_constraints) or 'None'}",
-            "Dietary preferences: "
-            f"{', '.join(profile.dietary_preferences) or 'None'}",
-            f"Goals: {', '.join(profile.goals) or 'None'}",
+            f"Dietary constraints: {constraints}",
+            f"Dietary preferences: {preferences}",
         ]
         keyboard = {
             "inline_keyboard": [
@@ -278,7 +283,6 @@ class TelegramAPI:
             (ProfileEditCategory.FAMILY, "Family"),
             (ProfileEditCategory.DIETARY_CONSTRAINTS, "Dietary constraints"),
             (ProfileEditCategory.DIETARY_PREFERENCES, "Dietary preferences"),
-            (ProfileEditCategory.GOALS, "Goals"),
         ]
         keyboard = [
             [
@@ -310,13 +314,11 @@ class TelegramAPI:
                 ProfileEditCategory.FAMILY: "Add member",
                 ProfileEditCategory.DIETARY_CONSTRAINTS: "Add constraint",
                 ProfileEditCategory.DIETARY_PREFERENCES: "Add preference",
-                ProfileEditCategory.GOALS: "Add goal",
             },
             ProfileEditOperation.REMOVE: {
                 ProfileEditCategory.FAMILY: "Remove member",
                 ProfileEditCategory.DIETARY_CONSTRAINTS: "Remove constraint",
                 ProfileEditCategory.DIETARY_PREFERENCES: "Remove preference",
-                ProfileEditCategory.GOALS: "Remove goal",
             },
             ProfileEditOperation.CHANGE_CALORIES: {
                 ProfileEditCategory.FAMILY: "Change calories",
@@ -396,7 +398,6 @@ class TelegramAPI:
         item_name = {
             ProfileEditCategory.DIETARY_CONSTRAINTS: "constraint",
             ProfileEditCategory.DIETARY_PREFERENCES: "preference",
-            ProfileEditCategory.GOALS: "goal",
         }.get(category, "item")
         prompt = prompts.get(
             (category, operation),
@@ -411,6 +412,59 @@ class TelegramAPI:
             ]
         }
         return self.send_message(chat_id, prompt, reply_markup=keyboard)
+
+    def send_profile_rule_review(
+        self,
+        chat_id: int | str,
+        category: ProfileEditCategory,
+        source_text: str,
+        rules: list[Any],
+        token: str | None,
+    ) -> list[dict[str, Any]]:
+        """Show an interpreted dietary rule before durable profile write."""
+        if not token:
+            raise ValueError(
+                "rule review requires a supported category and token"
+            )
+        lines = [
+            "Review this dietary profile change:",
+            source_text,
+            "",
+            "Meaning:",
+        ]
+        for rule in rules:
+            if hasattr(rule, "forbidden_terms"):
+                lines.append("- Exclude: " + ", ".join(rule.forbidden_terms))
+            else:
+                scope = (
+                    f" for {rule.meal_type.value}"
+                    if rule.meal_type is not None
+                    else ""
+                )
+                lines.append(
+                    f"- {rule.operator.value} {rule.count} of "
+                    f"{' or '.join(rule.foods_any_of)}{scope} "
+                    f"({rule.strength.value})"
+                )
+        return self.send_message(
+            chat_id,
+            "\n".join(lines),
+            reply_markup={
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "Confirm",
+                            "callback_data": f"profile:confirm:{token}",
+                        },
+                        {
+                            "text": "Cancel",
+                            "callback_data": f"profile:cancel:{token}",
+                        },
+                    ],
+                    [{"text": "Back", "callback_data": "profile:back"}],
+                ]
+            },
+        )
 
     def send_meal_review(
         self,

@@ -347,7 +347,6 @@ def test_parse_meal_callback_rejects_malformed_or_oversized_payload(
         "profile:category:family",
         "profile:category:dietary_constraints",
         "profile:category:dietary_preferences",
-        "profile:category:goals",
         "profile:operation:family:add",
         "profile:operation:family:remove",
         "profile:operation:family:change_calories",
@@ -357,8 +356,6 @@ def test_parse_meal_callback_rejects_malformed_or_oversized_payload(
         "profile:operation:dietary_constraints:remove",
         "profile:operation:dietary_preferences:add",
         "profile:operation:dietary_preferences:remove",
-        "profile:operation:goals:add",
-        "profile:operation:goals:remove",
     ],
 )
 def test_parse_every_accepted_profile_callback(payload: str) -> None:
@@ -426,6 +423,9 @@ def test_parse_family_nutrient_operation_callbacks(
         "profile:operation:unknown:add",
         "profile:operation:dietary_constraints:change_calories",
         "profile:operation:family:add:extra",
+        "profile:category:goals",
+        "profile:operation:goals:add",
+        "profile:operation:goals:remove",
         "checkin:2026-08-10:1:lunch:cooked",
         "profile:category:family:with:arbitrary:data",
     ],

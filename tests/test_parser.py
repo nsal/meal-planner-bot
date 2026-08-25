@@ -12,7 +12,15 @@ from meal_planner.llm.parser import (
     parse_plan_response_with_metadata,
     parse_preference_interpretation,
 )
-from meal_planner.models.schemas import ConversationIntent, MealType
+from meal_planner.models.schemas import (
+    ConstraintEntry,
+    ConversationIntent,
+    DietaryRule,
+    MealType,
+    RuleOperator,
+    RuleStrength,
+    Weekday,
+)
 
 
 def _preference_requirements(count: int) -> list[dict[str, Any]]:
@@ -206,6 +214,392 @@ def test_parse_preference_interpretation_complete_requirements() -> None:
     assert [item.id for item in requirements] == ["r1", "r2"]
     assert requirements[0].meal_type is MealType.BREAKFAST
     assert requirements[0].foods_any_of == ["crepes", "pancakes"]
+
+
+def test_parse_interpretation_supports_shared_rule_operators_and_scopes() -> (
+    None
+):
+    """The extended wire format becomes a shared DietaryRule contract."""
+    data = {
+        "mode": "current_plan_preference",
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": (
+                    "eggs at least once for breakfast on Monday and Wednesday"
+                ),
+                "foods_any_of": ["eggs"],
+                "meal_type": "breakfast",
+                "weekdays": ["monday", "wednesday"],
+                "operator": "at_least",
+                "count": 1,
+                "strength": "strict",
+            },
+            {
+                "id": "r2",
+                "source_text": "fish at most once on Wednesday if convenient",
+                "foods_any_of": ["fish"],
+                "weekdays": [3],
+                "operator": "at_most",
+                "count": 1,
+                "strength": "strict",
+            },
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert clarification is None
+    assert all(isinstance(rule, DietaryRule) for rule in requirements)
+    assert requirements[0].operator is RuleOperator.AT_LEAST
+    assert requirements[0].weekdays == [Weekday.MONDAY, Weekday.WEDNESDAY]
+    assert requirements[1].operator is RuleOperator.AT_MOST
+    assert requirements[1].weekdays == [Weekday.WEDNESDAY]
+    assert requirements[1].strength is RuleStrength.BEST_EFFORT
+
+
+@pytest.mark.parametrize("operator", ["exactly", "at_least"])
+def test_parse_interpretation_rejects_impossible_strict_named_day_count(
+    operator: str,
+) -> None:
+    """Schema failures become bounded clarification before dispatch."""
+    data = {
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": (
+                    "eggs twice for breakfast on Monday and Wednesday"
+                ),
+                "foods_any_of": ["eggs"],
+                "meal_type": "breakfast",
+                "weekdays": ["monday", "wednesday"],
+                "operator": operator,
+                "count": 2,
+                "strength": "strict",
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert requirements == []
+    assert clarification is not None
+    assert "malformed" in clarification.lower()
+
+
+def test_parse_interpretation_turns_id_like_into_strict_minimum_one() -> None:
+    """A bare positive request is never silently reduced to guidance."""
+    data = {
+        "mode": "stored_preference",
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": "I'd like eggs for breakfast",
+                "foods_any_of": ["eggs"],
+                "meal_type": "breakfast",
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert clarification is None
+    assert requirements[0].operator is RuleOperator.AT_LEAST
+    assert requirements[0].count == 1
+    assert requirements[0].strength is RuleStrength.STRICT
+
+
+@pytest.mark.parametrize(
+    ("source_text", "operator", "count", "expected_operator"),
+    [
+        (
+            "I'd like eggs exactly twice if convenient",
+            "exactly",
+            2,
+            RuleOperator.EXACTLY,
+        ),
+        (
+            "please include beans at most three times",
+            "at_most",
+            3,
+            RuleOperator.AT_MOST,
+        ),
+    ],
+)
+def test_positive_wording_preserves_explicit_operator_and_count(
+    source_text: str,
+    operator: str,
+    count: int,
+    expected_operator: RuleOperator,
+) -> None:
+    """Positive wording cannot replace an explicit count contract."""
+    data = {
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": source_text,
+                "foods_any_of": ["eggs" if "eggs" in source_text else "beans"],
+                "operator": operator,
+                "count": count,
+                "strength": "strict",
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert clarification is None
+    assert requirements[0].operator is expected_operator
+    assert requirements[0].count == count
+    expected_strength = (
+        RuleStrength.BEST_EFFORT
+        if "convenient" in source_text
+        else RuleStrength.STRICT
+    )
+    assert requirements[0].strength is expected_strength
+
+
+def test_positive_wording_without_count_defaults_to_strict_minimum_one() -> (
+    None
+):
+    """Only an unqualified positive request gets the default minimum."""
+    data = {
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": "please include lentils for dinner",
+                "foods_any_of": ["lentils"],
+                "meal_type": "dinner",
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert clarification is None
+    assert requirements[0].operator is RuleOperator.AT_LEAST
+    assert requirements[0].count == 1
+    assert requirements[0].strength is RuleStrength.STRICT
+
+
+def test_explicit_flexibility_overrides_generic_positive_wording() -> None:
+    """An omission qualifier makes a positive request best effort."""
+    data = {
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": "I'd like tofu if possible",
+                "foods_any_of": ["tofu"],
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert clarification is None
+    assert requirements[0].operator is RuleOperator.AT_LEAST
+    assert requirements[0].count == 1
+    assert requirements[0].strength is RuleStrength.BEST_EFFORT
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        "I'd like eggs exactly twice if convenient but strictly required",
+        "please include beans at least two times or at most three times",
+    ],
+)
+def test_contradictory_or_ambiguous_strength_wording_clarifies(
+    source_text: str,
+) -> None:
+    """Contradictory strength or operator wording fails closed."""
+    data = {
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": source_text,
+                "foods_any_of": ["eggs" if "eggs" in source_text else "beans"],
+                "operator": "exactly",
+                "count": 2,
+                "strength": "strict",
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert requirements == []
+    assert clarification is not None
+
+
+@pytest.mark.parametrize(
+    ("operator", "count"),
+    [("exactly", "twice"), ("at least or at most", 2)],
+)
+def test_malformed_counts_and_ambiguous_operators_clarify(
+    operator: str,
+    count: object,
+) -> None:
+    """Malformed structured count semantics remain bounded failures."""
+    data = {
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": "eggs with an unclear count",
+                "foods_any_of": ["eggs"],
+                "operator": operator,
+                "count": count,
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert requirements == []
+    assert clarification is not None
+
+
+def test_parse_constraint_mode_rejects_bad_terms() -> None:
+    """Constraint mode uses ConstraintEntry and fails closed on bad terms."""
+    data = {
+        "mode": "constraint",
+        "requirements": [],
+        "exclusions": [
+            {
+                "id": "c1",
+                "source_text": "no dairy",
+                "forbidden_terms": ["dairy"],
+            }
+        ],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    exclusions, clarification = parse_preference_interpretation(
+        data, mode="constraint"
+    )
+
+    assert clarification is None
+    assert isinstance(exclusions[0], ConstraintEntry)
+    assert exclusions[0].forbidden_terms == ["dairies"]
+
+    malformed = {
+        **data,
+        "exclusions": [
+            {"id": "c1", "source_text": "no ???", "forbidden_terms": ["???"]}
+        ],
+    }
+    parsed, clarification = parse_preference_interpretation(
+        malformed, mode="constraint"
+    )
+    assert parsed == []
+    assert clarification is not None
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {
+            "mode": "stored_preference",
+            "requirements": [
+                {
+                    "id": "r1",
+                    "source_text": "eggs exactly twice",
+                    "foods_any_of": ["eggs"],
+                    "operator": "exactly",
+                    "count": 2,
+                },
+                {
+                    "id": "r2",
+                    "source_text": "eggs at most once",
+                    "foods_any_of": ["eggs"],
+                    "operator": "at_most",
+                    "count": 1,
+                },
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        },
+        {
+            "mode": "stored_preference",
+            "requirements": [
+                {
+                    "id": "r1",
+                    "source_text": "eggs twice",
+                    "foods_any_of": ["eggs"],
+                    "operator": "exactly",
+                    "count": 2,
+                }
+            ],
+            "exclusions": [],
+            "clarification": "Which days?",
+            "unparsed_text": ["and tofu"],
+        },
+    ],
+)
+def test_parse_interpretation_rejects_contradictions_and_partial_results(
+    data: dict[str, Any],
+) -> None:
+    """Ambiguous or contradictory responses never return partial rules."""
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert requirements == []
+    assert clarification is not None
+    assert len(clarification) <= 500
+
+
+def test_parse_interpretation_rejects_wrong_mode_and_malformed_json() -> None:
+    """Mode mismatches and malformed output get bounded clarifications."""
+    wrong_mode = {
+        "mode": "constraint",
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": "eggs twice",
+                "foods_any_of": ["eggs"],
+                "operator": "exactly",
+                "count": 2,
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+    requirements, clarification = parse_preference_interpretation(wrong_mode)
+    assert requirements == []
+    assert clarification is not None
+
+    requirements, clarification = parse_preference_interpretation(
+        "```json\n{not valid}\n```"
+    )
+    assert requirements == []
+    assert clarification is not None
+    assert len(clarification) <= 500
 
 
 @pytest.mark.parametrize("count", [20, 21])

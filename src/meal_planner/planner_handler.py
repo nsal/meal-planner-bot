@@ -26,6 +26,7 @@ from meal_planner.db.dynamo import (
     DynamoRepository,
     RepairPublicationOutcome,
 )
+from meal_planner.dietary_rules import validate_constraints
 from meal_planner.llm.client import (
     LLMClient,
     LLMFailure,
@@ -46,19 +47,23 @@ from meal_planner.llm.prompts import (
     build_plan_revision_prompt,
 )
 from meal_planner.models.schemas import (
+    ConstraintEntry,
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
+    DietaryRule,
     GroceryStatus,
     MealOutcome,
     PlanGenerationContext,
     PlanRevisionContext,
     PlanStatus,
     PreferenceRequirement,
+    RuleStrength,
     WeeklyPlan,
 )
 from meal_planner.preferences import (
     PlanValidationResult,
+    format_best_effort_summary,
     format_satisfaction_summary,
     format_unmet_preference_clauses,
     validate_generated_plan,
@@ -146,6 +151,10 @@ class PlannerHandler:
         week_start: date | None = None,
         preference: str | None = None,
         requirements: list[PreferenceRequirement] | None = None,
+        stored_rules: list[DietaryRule] | None = None,
+        current_rules: list[DietaryRule] | None = None,
+        effective_rules: list[DietaryRule] | None = None,
+        constraint_rules: list[ConstraintEntry] | None = None,
         attempt: int = 1,
         repair_feedback: str | None = None,
         request_id: str | None = None,
@@ -159,6 +168,10 @@ class PlannerHandler:
             generation_context = PlanGenerationContext(
                 preference=preference,
                 requirements=requirements or [],
+                stored_rules=stored_rules or [],
+                current_rules=current_rules or [],
+                effective_rules=effective_rules or [],
+                constraint_rules=constraint_rules or [],
                 attempt=attempt,
                 repair_feedback=repair_feedback,
                 request_id=request_id,
@@ -179,6 +192,15 @@ class PlannerHandler:
                 self.telegram_api.send_message(
                     chat_id,
                     "Complete your profile before generating a meal plan.",
+                )
+                return
+            if not validate_constraints(
+                generation_context.constraint_rules
+            ).is_safe:
+                self.telegram_api.send_message(
+                    chat_id,
+                    "A saved dietary constraint cannot be safely matched. "
+                    "Please edit that constraint before generating a plan.",
                 )
                 return
             target_week = week_start or date.today()
@@ -206,6 +228,10 @@ class PlannerHandler:
                 week_start=target_week.isoformat(),
                 preference=generation_context.preference,
                 requirements=generation_context.requirements,
+                stored_rules=generation_context.stored_rules,
+                current_rules=generation_context.current_rules,
+                effective_rules=generation_context.effective_rules,
+                constraint_rules=generation_context.constraint_rules,
                 repair_feedback=generation_context.repair_feedback,
             )
             generation = self._generate_once(
@@ -249,7 +275,10 @@ class PlannerHandler:
                     logger.info("Discarded stale planner request")
                     return
             validation = validate_generated_plan(
-                plan, generation_context.requirements
+                plan,
+                generation_context.requirements,
+                rules=generation_context.effective_rules,
+                constraints=generation_context.constraint_rules,
             )
             if not validation.is_valid:
                 if generation_context.attempt == 1:
@@ -281,7 +310,11 @@ class PlannerHandler:
             )
             plan.grocery_status = GroceryStatus.NOT_REQUESTED
             plan.grocery_list = []
-            plan.planning_instructions = [preference] if preference else []
+            plan.planning_instructions = (
+                [generation_context.preference]
+                if generation_context.preference
+                else []
+            )
             for plan_day in plan.days:
                 for meal in plan_day.meals:
                     meal.outcome = MealOutcome.UNREPORTED
@@ -347,12 +380,23 @@ class PlannerHandler:
         delivery_started_at = time.monotonic()
         try:
             self.telegram_api.send_plan(chat_id, plan)
-            if validation.requirements:
+            has_strict_rules = any(
+                result.strength is RuleStrength.STRICT
+                for result in validation.rules
+            )
+            if validation.requirements or has_strict_rules:
                 self.telegram_api.send_message(
                     chat_id,
                     format_satisfaction_summary(
                         validation, generation_context.requirements
                     ),
+                )
+            if any(
+                result.strength is RuleStrength.BEST_EFFORT
+                for result in validation.rules
+            ):
+                self.telegram_api.send_message(
+                    chat_id, format_best_effort_summary(validation)
                 )
             self.telegram_api.send_message(
                 chat_id,
@@ -459,8 +503,15 @@ class PlannerHandler:
     @staticmethod
     def _validation_location(issue: Any) -> str:
         """Return a safe schema location for a domain validation issue."""
-        if issue.day is not None and issue.meal_type is not None:
-            return f"days[{issue.day - 1}].meals.{issue.meal_type.value}"
+        if issue.day is not None:
+            location = f"days[{issue.day - 1}]"
+            if issue.meal_type is not None:
+                location += f".meals.{issue.meal_type.value}"
+            return location
+        if issue.constraint_id is not None:
+            return "constraints"
+        if issue.rule_id is not None:
+            return "rules"
         if issue.requirement_id is not None:
             return "requirements"
         return "plan"
@@ -468,6 +519,8 @@ class PlannerHandler:
     @staticmethod
     def _validation_category(validation: PlanValidationResult) -> str:
         """Classify validation failures for stable terminal messaging."""
+        if validation.safety_issues:
+            return "safety"
         if any(
             issue.code.startswith("requirement_") for issue in validation.issues
         ):
@@ -596,6 +649,19 @@ class PlannerHandler:
             "requirements": [
                 requirement.model_dump(mode="json")
                 for requirement in context.requirements
+            ],
+            "stored_rules": [
+                rule.model_dump(mode="json") for rule in context.stored_rules
+            ],
+            "current_rules": [
+                rule.model_dump(mode="json") for rule in context.current_rules
+            ],
+            "effective_rules": [
+                rule.model_dump(mode="json") for rule in context.effective_rules
+            ],
+            "constraint_rules": [
+                rule.model_dump(mode="json")
+                for rule in context.constraint_rules
             ],
             "attempt": 2,
             "repair_feedback": feedback[:800],
@@ -783,6 +849,12 @@ class PlannerHandler:
                 if requirement.id in unmet_ids
             ]
             return format_unmet_preference_clauses(clauses)
+        if category == "safety":
+            return (
+                "The AI returned a meal plan that violated a dietary safety "
+                "constraint. No draft was saved. Your preference is retained; "
+                "use /plan to retry."
+            )
         if category == "completeness":
             return (
                 "The AI returned an invalid meal plan because it was "
@@ -1196,6 +1268,10 @@ class PlannerHandler:
                     {
                         "preference": event.get("preference"),
                         "requirements": event.get("requirements", []),
+                        "stored_rules": event.get("stored_rules", []),
+                        "current_rules": event.get("current_rules", []),
+                        "effective_rules": event.get("effective_rules", []),
+                        "constraint_rules": event.get("constraint_rules", []),
                         "attempt": event.get("attempt", 1),
                         "repair_feedback": event.get("repair_feedback"),
                         "request_id": event.get("request_id"),
@@ -1211,6 +1287,10 @@ class PlannerHandler:
                 week_start=week,
                 preference=context.preference,
                 requirements=context.requirements,
+                stored_rules=context.stored_rules,
+                current_rules=context.current_rules,
+                effective_rules=context.effective_rules,
+                constraint_rules=context.constraint_rules,
                 attempt=context.attempt,
                 repair_feedback=context.repair_feedback,
                 request_id=context.request_id,
