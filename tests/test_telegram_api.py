@@ -185,6 +185,24 @@ def test_plan_and_checkin_use_safe_text_and_specific_week(
     assert len(callback["callback_data"].encode()) <= 64
 
 
+@pytest.mark.parametrize("plan_days", [1, 3])
+def test_short_plan_rendering_stops_at_persisted_last_day(
+    mocker: MockerFixture, plan_days: int
+) -> None:
+    """Plan rendering includes exactly the days stored in the plan."""
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+
+    TelegramAPI("token").send_plan(1, make_plan(plan_days=plan_days))
+
+    payload = json.loads(urlopen.call_args.args[0].data.decode())
+    assert "Meal Plan" in payload["text"]
+    assert f"Day {plan_days}" in payload["text"]
+    assert f"Day {plan_days + 1}" not in payload["text"]
+
+
 def test_maximum_valid_plan_fits_one_notification(
     mocker: MockerFixture,
 ) -> None:

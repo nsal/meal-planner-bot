@@ -115,6 +115,13 @@ def _complete_plan_payload(week: date) -> dict[str, Any]:
     return payload
 
 
+def _revision_payload(week: date, plan_days: int) -> dict[str, Any]:
+    """Return a contiguous revision payload with the requested length."""
+    payload = make_plan_payload(week)
+    payload["days"] = payload["days"][:plan_days]
+    return payload
+
+
 def _preference_requirement(
     foods: list[str],
     exact_count: int,
@@ -460,6 +467,82 @@ def test_generate_plan_rejects_structurally_invalid_plan_before_save_or_display(
 
     repo.save_generated_draft.assert_not_called()
     api.send_plan.assert_not_called()
+
+
+@pytest.mark.parametrize("plan_days", [1, 3])
+def test_generate_plan_persists_and_delivers_exact_requested_length(
+    mocker: Any, plan_days: int
+) -> None:
+    """A requested one- or three-day plan can reach persistence and delivery."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = _complete_plan_payload(week)
+    payload["days"] = payload["days"][:plan_days]
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        plan_days=plan_days,
+    )
+
+    saved = repo.save_generated_draft.call_args.args[1]
+    assert len(saved.days) == plan_days
+    assert [plan_day.day for plan_day in saved.days] == list(
+        range(1, plan_days + 1)
+    )
+    api.send_plan.assert_called_once_with(1, saved)
+
+
+def test_generate_plan_rejects_wrong_requested_length_before_publication(
+    mocker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A structurally valid but wrong-sized plan enters bounded repair."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    state = _plan_request_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.get_conversation_state.return_value = state
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = _complete_plan_payload(week)
+    payload["days"] = payload["days"][:1]
+    llm.chat_json_sync.return_value = payload
+    lambda_client = mocker.MagicMock()
+    lambda_client.invoke.return_value = {"StatusCode": 202}
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "meal-planner-planner")
+
+    PlannerHandler(
+        repo,
+        api,
+        llm,
+        lambda_client=lambda_client,
+    ).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        plan_days=3,
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    api.send_plan.assert_not_called()
+    repair_event = json.loads(lambda_client.invoke.call_args.kwargs["Payload"])
+    assert repair_event["plan_days"] == 3
+    assert (
+        "code=wrong_day_count location=days" in repair_event["repair_feedback"]
+    )
 
 
 def test_invalid_first_attempt_schedules_fresh_repair_without_publication(
@@ -2715,6 +2798,79 @@ def test_revise_plan_publishes_normalized_replacement_before_delivery(
     assert "revised draft" in api.send_message.call_args.args[1]
 
 
+@pytest.mark.parametrize("plan_days", [1, 3])
+def test_revise_short_plan_preserves_existing_length(
+    mocker: Any, plan_days: int
+) -> None:
+    repo = mocker.MagicMock()
+    week = date.today()
+    current = make_plan(week_start=week, revision=4).model_copy(
+        update={"days": make_plan(week_start=week).days[:plan_days]}
+    )
+    state = _revision_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = current
+    repo.get_conversation_state.return_value = state
+    repo.replace_draft_and_clear_revision_state.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = _revision_payload(week, plan_days)
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment="Avoid cauliflower",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    replacement = repo.replace_draft_and_clear_revision_state.call_args.args[1]
+    assert len(replacement.days) == plan_days
+    repo.replace_draft_and_clear_revision_state.assert_called_once()
+    api.send_plan.assert_called_once_with(1, replacement)
+
+
+def test_revise_plan_rejects_wrong_length_before_publication_or_delivery(
+    mocker: Any,
+) -> None:
+    repo = mocker.MagicMock()
+    week = date.today()
+    current = make_plan(week_start=week, revision=4).model_copy(
+        update={"days": make_plan(week_start=week).days[:3]}
+    )
+    state = _revision_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = current
+    repo.get_conversation_state.return_value = state
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = _revision_payload(week, 7)
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment="Avoid cauliflower",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    repo.replace_draft_and_clear_revision_state.assert_not_called()
+    api.send_plan.assert_not_called()
+    repo.mark_conversation_retry_ready.assert_called_once()
+    retry_state = repo.mark_conversation_retry_ready.call_args.args[1]
+    assert retry_state.step is ConversationWorkflowStep.RETRY_READY
+    assert retry_state.revision == state.revision + 1
+
+
 def test_revision_unexpected_failure_retains_matching_retry_state(
     mocker: Any,
 ) -> None:
@@ -3508,6 +3664,73 @@ def test_finalize_grocery_success(mocker: Any) -> None:
     assert repo.complete_grocery.call_args.args[3][0].name == "Produce"
 
 
+@pytest.mark.parametrize("plan_days", [1, 3])
+def test_finalize_grocery_uses_exact_persisted_short_plan_days(
+    mocker: Any, plan_days: int
+) -> None:
+    """Generate groceries from exactly the persisted short-plan days."""
+    repo = mocker.MagicMock()
+    plan = make_plan(
+        status=PlanStatus.CONFIRMED,
+        grocery_status=GroceryStatus.PENDING,
+        plan_days=plan_days,
+        week_start=date(2026, 8, 10),
+        revision=4,
+    )
+    markers = [f"short-plan-day-{day}-lunch" for day in range(1, plan_days + 1)]
+    plan = plan.model_copy(
+        update={
+            "days": [
+                day.model_copy(
+                    update={
+                        "meals": [
+                            meal.model_copy(update={"name": marker})
+                            for meal in day.meals
+                        ]
+                    }
+                )
+                for day, marker in zip(plan.days, markers)
+            ]
+        }
+    )
+    repo.get_plan.return_value = plan
+    repo.get_profile.return_value = make_profile()
+    events: list[str] = []
+    sections = {"sections": [{"name": "Produce", "items": ["Apples"]}]}
+    grocery_llm = mocker.MagicMock()
+    grocery_llm.chat_json_sync.return_value = sections
+    repo.complete_grocery.side_effect = lambda *_args: (
+        events.append("complete") or True
+    )
+    api = mocker.MagicMock()
+    api.send_message.side_effect = lambda *_args: events.append("ready")
+
+    PlannerHandler(
+        repo,
+        api,
+        mocker.MagicMock(),
+        grocery_llm_client=grocery_llm,
+    ).finalize_grocery("user", 1, plan.week_start_date)
+
+    prompt = grocery_llm.chat_json_sync.call_args.args[0]
+    for marker in markers:
+        assert prompt.count(marker) == 1
+    assert f"short-plan-day-{plan_days + 1}-lunch" not in prompt
+    assert "Scale quantities for 2 people." in prompt
+    repo.complete_grocery.assert_called_once_with(
+        "user", plan.week_start_date, plan.revision, mocker.ANY
+    )
+    parsed_sections = repo.complete_grocery.call_args.args[3]
+    assert [section.model_dump(mode="json") for section in parsed_sections] == [
+        {"name": "Produce", "items": ["Apples"]}
+    ]
+    assert repo.fail_grocery.call_count == 0
+    api.send_message.assert_called_once_with(
+        1, "Your grocery list is ready. Use /grocery to view it."
+    )
+    assert events == ["complete", "ready"]
+
+
 def test_finalize_grocery_uses_dedicated_llm_client(mocker: Any) -> None:
     repo = mocker.MagicMock()
     plan = make_plan(
@@ -3635,6 +3858,7 @@ def test_handle_event_forwards_requirements_and_repair_metadata(
         "user_id": "user",
         "chat_id": 1,
         "week_start": "2026-08-10",
+        "plan_days": 3,
         "preference": "eggs three times",
         "requirements": [
             {
@@ -3654,6 +3878,7 @@ def test_handle_event_forwards_requirements_and_repair_metadata(
 
     assert generate.call_args.kwargs == {
         "week_start": date(2026, 8, 10),
+        "plan_days": 3,
         "preference": "eggs three times",
         "requirements": [
             PreferenceRequirement(
@@ -3673,6 +3898,55 @@ def test_handle_event_forwards_requirements_and_repair_metadata(
         "state_revision": None,
         "repair_id": "repair-123",
     }
+
+
+@pytest.mark.parametrize(
+    "plan_days",
+    [True, False, "3", 3.0, 3.5, None],
+)
+def test_generate_plan_event_rejects_non_integer_plan_days_without_side_effects(
+    mocker: Any, plan_days: object
+) -> None:
+    """Malformed planner durations never reach any generation side effect."""
+    repo = mocker.MagicMock()
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    planner = PlannerHandler(repo, api, llm)
+    generate = mocker.patch.object(planner, "generate_plan")
+    event: dict[str, object] = {
+        "action": "generate_plan",
+        "user_id": "user",
+        "chat_id": 1,
+        "week_start": "2026-08-10",
+        "plan_days": plan_days,
+    }
+
+    assert not planner.handle_event(event)
+    generate.assert_not_called()
+    llm.chat_json_sync.assert_not_called()
+    repo.assert_not_called()
+    api.assert_not_called()
+
+
+@pytest.mark.parametrize("plan_days", [1, 7])
+def test_generate_plan_event_forwards_valid_integer_plan_days(
+    mocker: Any, plan_days: int
+) -> None:
+    """Valid integer planner durations reach generation unchanged."""
+    planner = PlannerHandler(mocker.MagicMock(), mocker.MagicMock())
+    generate = mocker.patch.object(planner, "generate_plan")
+
+    assert planner.handle_event(
+        {
+            "action": "generate_plan",
+            "user_id": "user",
+            "chat_id": 1,
+            "plan_days": plan_days,
+        }
+    )
+
+    assert generate.call_args.kwargs["plan_days"] == plan_days
+    assert type(generate.call_args.kwargs["plan_days"]) is int
 
 
 def test_handle_event_preserves_distinct_effective_rule_ids(
@@ -3800,6 +4074,7 @@ def test_legacy_generation_event_remains_compatible(mocker: Any) -> None:
         }
     )
     assert generate.call_args.kwargs["requirements"] == []
+    assert generate.call_args.kwargs["plan_days"] == 7
     assert generate.call_args.kwargs["attempt"] == 1
     assert generate.call_args.kwargs["repair_feedback"] is None
 

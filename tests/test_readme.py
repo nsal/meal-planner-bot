@@ -62,6 +62,18 @@ def test_readme_documents_preference_clarification_contract() -> None:
     assert "your next reply is combined with it" in readme
 
 
+def test_readme_documents_duration_neutral_generated_plan_workflow() -> None:
+    """Keep generated-plan documentation aligned with variable durations."""
+    readme = _normalized_readme()
+
+    assert "variable-length meal plan" in readme
+    assert "`N, preference`" in readme
+    assert "`1, no preference`" in readme
+    assert "`3, fish for dinner`" in readme
+    assert "one whole-plan provider request per invocation" in readme
+    assert "one whole-week provider request per invocation" not in readme
+
+
 def test_readme_documents_optional_member_nutrient_targets() -> None:
     """Document optional targets and their deterministic amendment grammar."""
     readme = _normalized_readme().lower()
@@ -140,7 +152,7 @@ def test_readme_documents_operator_failure_diagnostics() -> None:
     """Document bounded, sanitized Planner failure diagnostics."""
     readme = _normalized_readme()
 
-    assert "one whole-week provider request per invocation" in readme
+    assert "one whole-plan provider request per invocation" in readme
     assert (
         "one sanitized CloudWatch warning per failed typed provider attempt"
         in readme

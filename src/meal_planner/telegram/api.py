@@ -501,7 +501,7 @@ class TelegramAPI:
         self, chat_id: int | str, plan: WeeklyPlan
     ) -> list[dict[str, Any]]:
         lines = [
-            f"Weekly Meal Plan (week of {plan.week_start_date})",
+            f"Meal Plan (starting {plan.week_start_date})",
             f"Status: {plan.status.value}",
             "",
         ]

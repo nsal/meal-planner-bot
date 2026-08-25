@@ -1,7 +1,7 @@
 """Prompt builders and templates for LLM context assembly."""
 
 import json
-from datetime import date
+from datetime import date, timedelta
 from typing import Literal, Optional, Sequence
 
 from meal_planner.models.schemas import (
@@ -267,6 +267,7 @@ def build_plan_prompt(
     meal_history: Optional[list[MealLogEntry]] = None,
     previous_plan: Optional[WeeklyPlan] = None,
     week_start: str = "2026-08-10",
+    plan_days: int = 7,
     preference: str | None = None,
     requirements: Sequence[PreferenceRequirement | DietaryRule] | None = None,
     stored_rules: Sequence[DietaryRule] | None = None,
@@ -276,7 +277,9 @@ def build_plan_prompt(
     constraints: Sequence[ConstraintEntry] | None = None,
     repair_feedback: str | None = None,
 ) -> str:
-    """Build 7-day meal plan generation prompt."""
+    """Build a meal-plan generation prompt for the requested duration."""
+    end_date = date.fromisoformat(week_start) + timedelta(days=plan_days - 1)
+    day_sequence = ", ".join(str(day) for day in range(1, plan_days + 1))
     profile_text = "General profile (2000 kcal/day target, 1 person)."
     if profile:
         members_str = (
@@ -354,9 +357,11 @@ def build_plan_prompt(
 
     return (
         "You are an expert nutritionist and meal planner.\n"
-        "Generate a 7-day meal plan based on the profile below.\n\n"
+        f"Generate a {plan_days}-day meal plan based on the profile below.\n\n"
         "=== REQUIREMENTS ===\n"
         f"Week Start Date: {week_start}\n"
+        f"Inclusive Plan Date Range: {week_start} through "
+        f"{end_date.isoformat()}\n"
         "Include at most four meals per day.\n"
         f"Profile & Constraints:\n{profile_text}\n\n"
         "=== REQUEST-SPECIFIC PREFERENCE (HIGH PRIORITY) ===\n"
@@ -394,9 +399,12 @@ def build_plan_prompt(
         "constraints remain higher priority.\n\n"
         "=== GENERATED PLAN CONTRACT ===\n"
         "Include exactly one breakfast, one lunch, and one dinner on each "
-        "of the 7 days. Snack is optional, and do not add other meal "
+        f"of the {plan_days} days. Snack is optional, and do not add other "
+        "meal "
         "types. Every present meal must include at least one non-empty "
         "ingredient item and positive est_calories.\n\n"
+        f"The days array must contain exactly {plan_days} consecutive entries "
+        f"with day numbers: {day_sequence}.\n\n"
         f"{repair_text}"
         f"Recent Meal History (avoid repeating):\n{history_text}\n\n"
         f"Previous Plan Feedback:\n{prev_plan_text}\n\n"
@@ -550,10 +558,17 @@ def build_plan_revision_prompt(
     current_plan: WeeklyPlan,
     amendment: str,
     *,
+    expected_plan_days: int | None = None,
     week_start: str | None = None,
 ) -> str:
     """Build a complete-plan replacement prompt for a draft revision."""
+    plan_days = (
+        len(current_plan.days)
+        if expected_plan_days is None
+        else expected_plan_days
+    )
     target_week = week_start or current_plan.week_start_date
+    target_week_end = current_plan.week_start + timedelta(days=plan_days - 1)
     plan_json = json.dumps(
         current_plan.model_dump(by_alias=True, mode="json"),
         indent=2,
@@ -568,9 +583,10 @@ def build_plan_revision_prompt(
         )
         or "None."
     )
+    legacy_seven_day_text = " (seven days)" if plan_days == 7 else ""
     return (
         "You are an expert nutritionist revising an existing family meal "
-        "plan. Return a complete replacement for the current seven-day "
+        f"plan. Return a complete replacement for the current {plan_days}-day "
         "draft.\n\n"
         "=== TRUSTED HOUSEHOLD PROFILE AND SAFETY CONSTRAINTS ===\n"
         f"{_profile_text(profile)}\n\n"
@@ -589,8 +605,10 @@ def build_plan_revision_prompt(
         "The application does not calculate, validate, detect, or repair "
         "target compliance. Keep the returned plan JSON schema unchanged; "
         "do not add nutrient totals or per-member portions. Use the same "
-        "week and return all "
-        f"seven days for week start {target_week}. Do not return a patch.\n\n"
+        f"week and return all {plan_days} days{legacy_seven_day_text} "
+        f"for the inclusive date range from {target_week} through "
+        f"{target_week_end.isoformat()}. Return days 1 through {plan_days} "
+        "in order. Do not return a patch.\n\n"
         "=== OUTPUT JSON SCHEMA ===\n"
         "Return strictly valid JSON matching this schema:\n"
         "{\n"

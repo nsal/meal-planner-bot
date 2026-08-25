@@ -1966,6 +1966,122 @@ def test_plan_selection_distinguishes_latest_exact_and_active(
     assert repo.get_active_plan("user", date(2026, 8, 11)) is None
 
 
+@pytest.mark.parametrize("plan_days", [1, 3])
+def test_short_confirmed_plan_is_active_only_through_dynamic_end(
+    repo: DynamoRepository, plan_days: int
+) -> None:
+    """Active-plan reads include the final persisted day and no later date."""
+    start = date(2026, 8, 10)
+    draft = make_plan(
+        week_start=start, plan_days=plan_days, status=PlanStatus.DRAFT
+    )
+    repo.save_plan("user", draft)
+    assert repo.confirm_plan("user", draft.week_start_date, draft.revision)
+
+    confirmed = repo.get_plan("user", start)
+    assert confirmed is not None
+    final_date = start + timedelta(days=plan_days - 1)
+    assert repo.get_active_plan("user", start) == confirmed
+    assert repo.get_active_plan("user", final_date) == confirmed
+    assert repo.get_active_plan("user", final_date + timedelta(days=1)) is None
+
+
+@pytest.mark.parametrize("plan_days", [1, 3])
+def test_short_plan_lifecycle_bounds_edits_outcomes_and_groceries(
+    repo: DynamoRepository, plan_days: int
+) -> None:
+    """Short plans retain CAS lifecycle behavior at their actual last day."""
+    plan = make_plan(
+        plan_days=plan_days,
+        status=PlanStatus.DRAFT,
+    )
+    repo.save_plan("user", plan)
+    assert repo.confirm_plan("user", plan.week_start_date, plan.revision)
+    confirmed = repo.get_plan("user", plan.week_start_date)
+    assert confirmed is not None
+
+    last_day = confirmed.days[-1]
+    edited = last_day.meals[0].model_copy(update={"name": "Edited lunch"})
+    assert repo.update_meal(
+        "user",
+        confirmed.week_start_date,
+        plan_days,
+        "lunch",
+        edited,
+        expected_revision=confirmed.revision,
+        expected_status=PlanStatus.CONFIRMED,
+    )
+    assert not repo.update_meal(
+        "user",
+        confirmed.week_start_date,
+        plan_days + 1,
+        "lunch",
+        edited,
+        expected_revision=confirmed.revision + 1,
+        expected_status=PlanStatus.CONFIRMED,
+    )
+    snapshot = repo.get_active_plan_snapshot("user")
+    assert snapshot is not None
+    assert repo.update_meal_outcome(
+        "user",
+        confirmed.week_start_date,
+        plan_days,
+        "lunch",
+        MealOutcome.COOKED,
+        expected_epoch=snapshot.active_epoch,
+    )
+    assert repo.complete_grocery(
+        "user",
+        confirmed.week_start_date,
+        confirmed.revision + 1,
+        [GrocerySection(name="Produce", items=["Apples"])],
+    )
+
+    saved = repo.get_plan("user", confirmed.week_start_date)
+    assert saved is not None
+    assert saved.days[-1].meals[0].name == "Edited lunch"
+    assert saved.days[-1].meals[0].outcome is MealOutcome.COOKED
+    assert saved.grocery_status is GroceryStatus.READY
+
+
+@pytest.mark.parametrize("plan_days", [1, 3])
+def test_short_plan_outcome_rejects_day_after_persisted_end(
+    repo: DynamoRepository, plan_days: int
+) -> None:
+    """Out-of-range outcome writes leave the persisted plan unchanged."""
+    plan = make_plan(plan_days=plan_days, status=PlanStatus.DRAFT)
+    repo.save_plan("user", plan)
+    assert repo.confirm_plan("user", plan.week_start_date, plan.revision)
+    confirmed = repo.get_plan("user", plan.week_start_date)
+    assert confirmed is not None
+    before_snapshot = repo.get_active_plan_snapshot("user")
+    assert before_snapshot is not None
+
+    assert not repo.update_meal_outcome(
+        "user",
+        confirmed.week_start_date,
+        plan_days + 1,
+        "lunch",
+        MealOutcome.COOKED,
+        expected_epoch=before_snapshot.active_epoch,
+    )
+
+    saved = repo.get_plan("user", confirmed.week_start_date)
+    after_snapshot = repo.get_active_plan_snapshot("user")
+    assert saved == confirmed
+    assert saved is not None
+    assert all(
+        meal.outcome is MealOutcome.UNREPORTED
+        for plan_day in saved.days
+        for meal in plan_day.meals
+    )
+    assert saved.revision == confirmed.revision
+    assert saved.status is PlanStatus.CONFIRMED
+    assert saved.grocery_status is confirmed.grocery_status
+    assert after_snapshot is not None
+    assert after_snapshot.active_epoch == before_snapshot.active_epoch
+
+
 def test_active_plan_snapshot_returns_legacy_absent_epoch(
     repo: DynamoRepository,
 ) -> None:
