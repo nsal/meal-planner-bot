@@ -7,6 +7,7 @@ from meal_planner.telegram.commands import BOT_COMMANDS, render_help
 
 PROJECT_ROOT = Path(__file__).parents[1]
 README_PATH = PROJECT_ROOT / "README.md"
+PROMPT_PATH = PROJECT_ROOT / "docs" / "prompt.md"
 
 
 def _read_readme() -> str:
@@ -17,6 +18,11 @@ def _read_readme() -> str:
 def _normalized_readme() -> str:
     """Load the README with Markdown line wrapping removed."""
     return " ".join(_read_readme().split())
+
+
+def _read_prompt_documentation() -> str:
+    """Load the planner prompt documentation."""
+    return PROMPT_PATH.read_text(encoding="utf-8")
 
 
 def test_profile_command_description_is_consistent_across_surfaces() -> None:
@@ -48,7 +54,7 @@ def test_readme_documents_preference_clarification_contract() -> None:
     """Document supported rules and recoverable interpretation failures."""
     readme = _normalized_readme()
 
-    assert "exact-count rules in natural language" in readme
+    assert "structured natural-language rules" in readme
     assert "asks a focused clarification question" in readme
     assert "original wording stays attached to the same `/plan` workflow" in (
         readme
@@ -85,6 +91,49 @@ def test_readme_documents_validation_and_repair_contract() -> None:
     assert "cancelled or replaced request cannot save or display a stale" in (
         readme
     )
+
+
+def test_readme_documents_two_field_priority_and_safe_confirmation() -> None:
+    """Document the canonical profile and its safety-first workflow."""
+    readme = _normalized_readme()
+
+    assert (
+        "two dietary fields: `dietary_constraints` and `dietary_preferences`"
+    ) in readme
+    assert (
+        "dietary constraints > current plan preferences > stored dietary "
+        "preferences"
+    ) in readme
+    assert "review the interpreted meaning before saving" in readme
+    assert "constraints cannot be overridden" in readme.lower()
+    assert "declared meal names and ingredient items" in readme
+    assert "never saves or displays a failing candidate" in readme
+
+
+def test_readme_documents_rule_strength_override_and_validation_limits() -> (
+    None
+):
+    """Document strictness, override behavior, and validation boundaries."""
+    readme = _normalized_readme()
+
+    assert "I'd like eggs for breakfast" in readme
+    assert "if convenient" in readme
+    assert "three stored egg breakfasts" in readme
+    assert "current maximum of two" in readme
+    assert "apply only to newly generated plans" in readme
+    assert "not medical cross-contamination certification" in readme
+
+
+def test_prompt_documentation_matches_structured_rule_contract() -> None:
+    """Document prompt priority and strict/best-effort rule sections."""
+    prompt = " ".join(_read_prompt_documentation().split())
+
+    assert "DIETARY CONSTRAINTS (HIGHEST PRIORITY)" in prompt
+    assert "EFFECTIVE STRICT RULES" in prompt
+    assert "EFFECTIVE BEST-EFFORT RULES" in prompt
+    assert "goals" not in prompt.lower()
+    assert "declared meal names and ingredient items" in prompt
+    assert "not medical cross-contamination certification" in prompt
 
 
 def test_readme_documents_operator_failure_diagnostics() -> None:

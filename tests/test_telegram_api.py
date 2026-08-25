@@ -315,7 +315,6 @@ def test_profile_root_renders_all_categories_and_close(
                     "callback_data": ("profile:category:dietary_preferences"),
                 }
             ],
-            [{"text": "Goals", "callback_data": "profile:category:goals"}],
             [{"text": "Done", "callback_data": "profile:done"}],
             [{"text": "Close", "callback_data": "profile:close"}],
         ]
@@ -347,13 +346,6 @@ def test_profile_root_renders_all_categories_and_close(
             [
                 (ProfileEditOperation.ADD, "Add preference"),
                 (ProfileEditOperation.REMOVE, "Remove preference"),
-            ],
-        ),
-        (
-            ProfileEditCategory.GOALS,
-            [
-                (ProfileEditOperation.ADD, "Add goal"),
-                (ProfileEditOperation.REMOVE, "Remove goal"),
             ],
         ),
     ],

@@ -33,37 +33,50 @@ the locked `uv` environment.
   or `/plan` replaces an older unfinished workflow. `/profile` also replaces
   an older unfinished workflow when it opens the profile editor.
 - `/profile` lets you view and amend the saved household profile. Tap `Amend profile`, choose
-  `Family`, `Dietary constraints`, `Dietary preferences`, or `Goals`, then
+  `Family`, `Dietary constraints`, or `Dietary preferences`, then
   choose an operation. Each operation accepts one guided message: use
   `John 1500` to add a family member or change a member's calories, the exact
   member name to remove someone, or one item such as `dairy` or `eat more
-  vegetables` to add or remove a constraint, preference, or goal. After a
+  vegetables` to add or remove a constraint or preference. After a
   successful change the category menu returns so you can make another
   amendment. Use `Back` to navigate, `Done` to finish and save the session,
   `Close` to leave it, or `/cancel` to clear the active edit.
+- The canonical profile has two dietary fields: `dietary_constraints` and
+  `dietary_preferences`. A new dietary rule is interpreted and shown for
+  confirmation; review the interpreted meaning before saving. Priority is
+  dietary constraints > current plan preferences > stored dietary
+  preferences. Constraints cannot be overridden, and a preference that
+  conflicts with one is rejected.
 - `/plan` asks for a request-specific preference before starting asynchronous
   generation. `no preference` and `anything` remove the extra constraint; the
   saved family profile is never changed. A failed request retains the
   preference so `/plan` can retry it.
-- Request-specific preferences support exact-count rules in natural language:
-  name one food or alternatives, give a positive count, and optionally name a
-  meal type. For example, `one breakfast with pancakes or crepes`, `eggs
-  exactly three times for breakfast`, and `one salmon or trout dinner` are
-  supported; omitting the meal type counts across eligible meals. Counts must
-  fit the seven-day plan. The conversational LLM turns these clauses into
-  typed rules and asks a focused clarification question when a clause is
-  ambiguous, unsupported, conflicting, or incomplete. The original wording
-  stays attached to the same `/plan` workflow while the next reply is
-  interpreted with it.
-- The application validates exact counts and evidence after generation. It
-  matches whole words or phrases in meal names and ingredient item names,
-  ignoring case, punctuation, whitespace, and conservative singular/plural
-  differences. Alternative foods share one count, and each distinct day and
-  meal type counts at most once; culinary knowledge alone is not evidence.
-  Accepted plans show a compact `Preferences satisfied` summary. The first
-  invalid plan is never saved or displayed: the Planner makes one automatic
-  repair in a fresh asynchronous invocation. A second invalid result is
-  terminal, retains the preference, and can be retried manually with `/plan`.
+- Request-specific preferences support structured natural-language rules.
+  `I'd like eggs for breakfast` becomes a strict minimum of one, while
+  `beans for breakfast if convenient` is best effort and may be omitted.
+  A current plan preference overrides only conflicting stored preferences:
+  three stored egg breakfasts plus a current maximum of two resolves to
+  exactly two preferred days rather than permitting zero. The conversational
+  LLM asks a focused clarification question when a clause is ambiguous,
+  unsupported, conflicting, or incomplete. The original wording stays
+  attached to the same `/plan` workflow, and your next reply is combined with
+  it.
+- The application validates constraints first, then strict rules and plan
+  completeness. It matches whole words or phrases in declared meal names and
+  ingredient items, ignoring case, punctuation, whitespace, and conservative
+  singular/plural differences. Alternative foods share one count, and each
+  distinct day and meal type counts at most once; culinary knowledge alone is
+  not evidence. Best-effort misses do not invalidate a plan. The candidate is
+  checked before anything is persisted or displayed. The Planner never saves
+  or displays a failing candidate: it makes one automatic repair in a fresh
+  asynchronous invocation. A second invalid result is terminal, leaves the
+  previous draft unchanged, retains the preference, and can be retried
+  manually with `/plan`.
+- Profile changes apply only to newly generated plans. Existing weekly plans
+  are not revalidated or altered after a constraint changes, and users are
+  responsible for regenerating them. Declared-ingredient validation does not
+  detect undeclared product cross-contamination and is not medical
+  cross-contamination certification.
   For an in-progress request, publication and release of that request happen
   together, so a cancelled or replaced request cannot save or display a stale
   result.
@@ -405,12 +418,11 @@ The Telegram command menu and `/help` show the same command reference:
 
 - `/start` begins onboarding. Supply the family name separately from the
   household size, every household member's name and calorie target, dietary
-  constraints, dietary preferences, and
-  goals. Known onboarding fields carry across conversational turns, so provide
-  only the fields the bot still requests.
+  constraints, and dietary preferences. Known onboarding fields carry across
+  conversational turns, so provide only the fields the bot still requests.
 - `/profile` shows the persisted family name and individual member details,
   with button-led amendment navigation for family members, dietary
-  constraints, dietary preferences, and goals. Family add and calorie changes
+  constraints, and dietary preferences. Family add and calorie changes
   use one message such as `John 1500`; list changes use one item such as
   `dairy` or `eat more vegetables`.
 - Natural-language no-value answers such as `none`, `nothing`, `no allergies`,

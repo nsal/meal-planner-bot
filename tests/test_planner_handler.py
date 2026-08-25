@@ -17,9 +17,11 @@ from meal_planner.llm.client import (
     LLMTransientError,
 )
 from meal_planner.models.schemas import (
+    ConstraintEntry,
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
+    DietaryRule,
     GroceryStatus,
     MealOutcome,
     MealType,
@@ -27,6 +29,8 @@ from meal_planner.models.schemas import (
     PlanRevisionContext,
     PlanStatus,
     PreferenceRequirement,
+    RuleStrength,
+    Weekday,
 )
 from meal_planner.planner_handler import (
     PlannerDeadlineExceeded,
@@ -123,6 +127,35 @@ def _preference_requirement(
         foods_any_of=foods,
         meal_type=meal_type,
         exact_count=exact_count,
+    )
+
+
+def _dietary_constraint(
+    term: str = "peanuts",
+    *,
+    identifier: str = "constraint-1",
+) -> ConstraintEntry:
+    """Build one deterministic constraint for planner safety tests."""
+    return ConstraintEntry(
+        id=identifier,
+        source_text=f"Avoid {term}",
+        forbidden_terms=[term],
+    )
+
+
+def _dietary_rule(
+    *,
+    identifier: str = "rule-1",
+    strength: RuleStrength = RuleStrength.STRICT,
+) -> DietaryRule:
+    """Build one structured egg rule for planner validation tests."""
+    return DietaryRule(
+        id=identifier,
+        source_text="Egg breakfasts",
+        foods_any_of=["egg"],
+        meal_type=MealType.BREAKFAST,
+        count=1,
+        strength=strength,
     )
 
 
@@ -482,6 +515,631 @@ def test_invalid_first_attempt_schedules_fresh_repair_without_publication(
     assert "code=requirement_count_mismatch" in repair_event["repair_feedback"]
     assert "location=requirements" in repair_event["repair_feedback"]
     assert "Egg breakfast" not in repair_event["repair_feedback"]
+
+
+def test_constraint_violation_schedules_one_repair_without_publication(
+    mocker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Safety failures are rejected before publication and repaired once."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    state = _plan_request_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.get_conversation_state.return_value = state
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = _complete_plan_payload(week)
+    payload["days"][0]["meals"][0]["ingredients"] = [{"item": "peanuts"}]
+    llm.chat_json_sync.return_value = payload
+    lambda_client = mocker.MagicMock()
+    lambda_client.invoke.return_value = {"StatusCode": 202}
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "meal-planner-planner")
+    constraint = _dietary_constraint()
+
+    PlannerHandler(
+        repo,
+        api,
+        llm,
+        lambda_client=lambda_client,
+    ).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        preference="Avoid peanuts",
+        constraint_rules=[constraint],
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    api.send_plan.assert_not_called()
+    api.send_message.assert_not_called()
+    lambda_client.invoke.assert_called_once()
+    repair_event = json.loads(lambda_client.invoke.call_args.kwargs["Payload"])
+    assert repair_event["attempt"] == 2
+    assert repair_event["constraint_rules"] == [
+        constraint.model_dump(mode="json")
+    ]
+    feedback = repair_event["repair_feedback"]
+    assert "code=constraint_violation" in feedback
+    assert "location=days[0].meals.breakfast" in feedback
+    assert len(feedback) <= 800
+    assert "peanuts" not in feedback.casefold()
+
+
+@pytest.mark.parametrize("violating_food", ["gluten", "wheat"])
+def test_semantic_legacy_constraint_violation_schedules_repair(
+    mocker: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    violating_food: str,
+) -> None:
+    """Legacy semantic constraints block publication on violating meals."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    state = _plan_request_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.get_conversation_state.return_value = state
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = _complete_plan_payload(week)
+    payload["days"][0]["meals"][0]["ingredients"] = [{"item": violating_food}]
+    llm.chat_json_sync.return_value = payload
+    lambda_client = mocker.MagicMock()
+    lambda_client.invoke.return_value = {"StatusCode": 202}
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "meal-planner-planner")
+    constraint = ConstraintEntry(
+        id="legacy-constraint",
+        source_text="gluten-free",
+        forbidden_terms=["gluten-free"],
+    )
+
+    PlannerHandler(
+        repo,
+        api,
+        llm,
+        lambda_client=lambda_client,
+    ).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        constraint_rules=[constraint],
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    api.send_plan.assert_not_called()
+    lambda_client.invoke.assert_called_once()
+    repair_event = json.loads(lambda_client.invoke.call_args.kwargs["Payload"])
+    assert "code=constraint_violation" in repair_event["repair_feedback"]
+
+
+def test_vegan_constraint_blocks_provider_and_publication(
+    mocker: Any,
+) -> None:
+    """An incomplete vegan constraint cannot reach generation or saving."""
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    constraint = ConstraintEntry(
+        id="vegan-constraint",
+        source_text="vegan",
+        forbidden_terms=["vegan"],
+    )
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user",
+        1,
+        constraint_rules=[constraint],
+    )
+
+    llm.chat_json_sync.assert_not_called()
+    repo.save_generated_draft.assert_not_called()
+    api.send_plan.assert_not_called()
+
+
+def test_uninterpretable_constraint_is_rejected_before_provider_call(
+    mocker: Any,
+) -> None:
+    """An explicitly uninterpretable constraint cannot reach generation."""
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    constraint = ConstraintEntry(
+        id="unknown-constraint",
+        source_text="I react badly to mystery foods",
+        forbidden_terms=[],
+        uninterpretable=True,
+    )
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user",
+        1,
+        constraint_rules=[constraint],
+    )
+
+    llm.chat_json_sync.assert_not_called()
+    api.send_plan.assert_not_called()
+
+
+def test_repaired_safe_plan_is_published_with_relevant_raw_instruction(
+    mocker: Any,
+) -> None:
+    """A repaired safe plan is saved and retains only request wording."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    state = _plan_request_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.get_conversation_state.return_value = state
+    repo.save_generated_draft_and_clear_conversation_state.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = _complete_plan_payload(week)
+    constraint = _dietary_constraint()
+    raw_preference = "Avoid peanuts for this plan"
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        preference=raw_preference,
+        constraint_rules=[constraint],
+        attempt=2,
+        repair_feedback="code=constraint_violation location=days[0]",
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    saved = (
+        repo.save_generated_draft_and_clear_conversation_state.call_args.args[1]
+    )
+    assert saved.planning_instructions == [raw_preference]
+    repo.save_generated_draft_and_clear_conversation_state.assert_called_once()
+    api.send_plan.assert_called_once_with(1, saved)
+    assert api.send_message.call_count == 1
+
+
+def test_repaired_safety_failure_keeps_previous_draft_retry_ready(
+    mocker: Any,
+) -> None:
+    """A second safety failure changes neither draft nor publication state."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    previous = make_plan(week_start=week, revision=4)
+    state = _plan_request_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = previous
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = previous
+    repo.get_conversation_state.return_value = state
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = _complete_plan_payload(week)
+    payload["days"][0]["meals"][0]["ingredients"] = [{"item": "peanuts"}]
+    llm.chat_json_sync.return_value = payload
+    constraint = _dietary_constraint()
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        preference="Avoid peanuts",
+        constraint_rules=[constraint],
+        attempt=2,
+        repair_feedback="code=constraint_violation location=days[0]",
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    repo.save_generated_draft_and_clear_conversation_state.assert_not_called()
+    api.send_plan.assert_not_called()
+    repo.mark_conversation_retry_ready.assert_called_once()
+    retry_state = repo.mark_conversation_retry_ready.call_args.args[1]
+    assert retry_state.step is ConversationWorkflowStep.RETRY_READY
+    assert previous.revision == 4
+    message = api.send_message.call_args.args[1]
+    assert "safety constraint" in message
+    assert "peanuts" not in message.casefold()
+
+
+def test_constraint_feedback_precedes_rules_and_completeness_on_both_attempts(
+    mocker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both attempts apply the safety gate before other validation gates."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    state = _plan_request_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.get_conversation_state.return_value = state
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = _complete_plan_payload(week)
+    payload["days"][0]["meals"] = [
+        {
+            "meal_type": "breakfast",
+            "name": "Peanut breakfast",
+            "ingredients": [{"item": "peanuts"}],
+            "est_calories": 400,
+        }
+    ]
+    llm.chat_json_sync.return_value = payload
+    lambda_client = mocker.MagicMock()
+    lambda_client.invoke.return_value = {"StatusCode": 202}
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "meal-planner-planner")
+    constraint = _dietary_constraint()
+    rule = _dietary_rule()
+    planner = PlannerHandler(
+        repo,
+        api,
+        llm,
+        lambda_client=lambda_client,
+    )
+
+    planner.generate_plan(
+        "user",
+        1,
+        week_start=week,
+        preference="Egg breakfasts",
+        effective_rules=[rule],
+        constraint_rules=[constraint],
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+    first_feedback = json.loads(
+        lambda_client.invoke.call_args.kwargs["Payload"]
+    )["repair_feedback"]
+    planner.generate_plan(
+        "user",
+        1,
+        week_start=week,
+        preference="Egg breakfasts",
+        effective_rules=[rule],
+        constraint_rules=[constraint],
+        attempt=2,
+        repair_feedback=first_feedback,
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    assert first_feedback.index("constraint_violation") < first_feedback.index(
+        "strict_rule_mismatch"
+    )
+    assert first_feedback.index("strict_rule_mismatch") < first_feedback.index(
+        "missing_meal_type"
+    )
+    assert lambda_client.invoke.call_count == 1
+    assert repo.mark_conversation_retry_ready.called
+
+
+def test_best_effort_miss_does_not_schedule_repair(
+    mocker: Any,
+) -> None:
+    """Best-effort misses are reported without consuming a repair."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.save_generated_draft.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = _complete_plan_payload(week)
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        preference="If convenient, include eggs",
+        effective_rules=[
+            _dietary_rule(
+                strength=RuleStrength.BEST_EFFORT,
+            )
+        ],
+    )
+
+    repo.save_generated_draft.assert_called_once()
+    api.send_plan.assert_called_once()
+    messages = [call.args[1] for call in api.send_message.call_args_list]
+    assert any("Best-effort preferences:" in message for message in messages)
+    assert any("not met" in message for message in messages)
+    assert any("Review this draft" in message for message in messages)
+
+
+@pytest.mark.parametrize("matched_count", [0, 1, 2])
+def test_structured_maximum_accepts_zero_through_two_matches(
+    mocker: Any, matched_count: int
+) -> None:
+    """A structured maximum never becomes an exact-count requirement."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.save_generated_draft.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = _complete_plan_payload(week)
+    for day, plan_day in enumerate(payload["days"], start=1):
+        if day <= matched_count:
+            plan_day["meals"][0]["name"] = "Egg breakfast"
+            plan_day["meals"][0]["ingredients"] = [{"item": "egg"}]
+    llm.chat_json_sync.return_value = payload
+    rule = DietaryRule(
+        id="rule-at-most-two",
+        source_text="eggs at most twice",
+        foods_any_of=["egg"],
+        meal_type=MealType.BREAKFAST,
+        operator="at_most",
+        count=2,
+    )
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        preference=None,
+        requirements=[],
+        effective_rules=[rule],
+    )
+
+    repo.save_generated_draft.assert_called_once()
+    api.send_plan.assert_called_once()
+    assert not any(
+        "invalid meal plan" in call.args[1].lower()
+        for call in api.send_message.call_args_list
+    )
+
+
+def test_interpreted_legacy_strict_rule_blocks_a_violating_plan(
+    mocker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typed legacy rule still reaches the strict safety gate."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    state = _plan_request_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.get_conversation_state.return_value = state
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = _complete_plan_payload(week)
+    payload["days"][0]["meals"][0]["ingredients"] = [{"item": "oats"}]
+    llm.chat_json_sync.return_value = payload
+    lambda_client = mocker.MagicMock()
+    lambda_client.invoke.return_value = {"StatusCode": 202}
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "meal-planner-planner")
+    rule = DietaryRule(
+        id="r-stored-legacy-eggs",
+        source_text="eggs for breakfast",
+        foods_any_of=["eggs"],
+        meal_type=MealType.BREAKFAST,
+        operator="at_least",
+        count=1,
+        strength=RuleStrength.STRICT,
+    )
+
+    PlannerHandler(
+        repo,
+        api,
+        llm,
+        lambda_client=lambda_client,
+    ).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        preference=None,
+        stored_rules=[rule],
+        effective_rules=[rule],
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    api.send_plan.assert_not_called()
+    lambda_client.invoke.assert_called_once()
+    repair_event = json.loads(lambda_client.invoke.call_args.kwargs["Payload"])
+    assert "code=strict_rule_mismatch" in repair_event["repair_feedback"]
+
+
+def test_strict_weekday_failure_identifies_missing_day_in_repair_feedback(
+    mocker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Planner repair feedback identifies a missing named weekday."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    state = _plan_request_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.get_conversation_state.return_value = state
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = _complete_plan_payload(week)
+    payload["days"][0]["meals"][0]["ingredients"] = [{"item": "egg"}]
+    llm.chat_json_sync.return_value = payload
+    lambda_client = mocker.MagicMock()
+    lambda_client.invoke.return_value = {"StatusCode": 202}
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "meal-planner-planner")
+    rule = DietaryRule(
+        id="weekday-eggs",
+        source_text="eggs for breakfast on Monday and Wednesday",
+        foods_any_of=["egg"],
+        meal_type=MealType.BREAKFAST,
+        weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY],
+        operator="at_least",
+        count=1,
+        strength=RuleStrength.STRICT,
+    )
+
+    PlannerHandler(
+        repo,
+        api,
+        llm,
+        lambda_client=lambda_client,
+    ).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        preference="Egg breakfasts",
+        effective_rules=[rule],
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    api.send_plan.assert_not_called()
+    lambda_client.invoke.assert_called_once()
+    repair_event = json.loads(lambda_client.invoke.call_args.kwargs["Payload"])
+    assert "days[2].meals.breakfast" in repair_event["repair_feedback"]
+    assert "strict_rule_mismatch" in repair_event["repair_feedback"]
+
+
+def test_unscoped_weekday_failure_preserves_day_only_repair_location(
+    mocker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unscoped weekday repair retains the missing day's location."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    state = _plan_request_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.get_conversation_state.return_value = state
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = _complete_plan_payload(week)
+    payload["days"][0]["meals"][0]["ingredients"] = [{"item": "egg"}]
+    llm.chat_json_sync.return_value = payload
+    lambda_client = mocker.MagicMock()
+    lambda_client.invoke.return_value = {"StatusCode": 202}
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "meal-planner-planner")
+    rule = DietaryRule(
+        id="weekday-eggs-unscoped",
+        source_text="eggs on Monday and Wednesday",
+        foods_any_of=["egg"],
+        meal_type=None,
+        weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY],
+        operator="at_least",
+        count=1,
+        strength=RuleStrength.STRICT,
+    )
+
+    PlannerHandler(
+        repo,
+        api,
+        llm,
+        lambda_client=lambda_client,
+    ).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        preference="eggs on Monday and Wednesday",
+        effective_rules=[rule],
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    api.send_plan.assert_not_called()
+    lambda_client.invoke.assert_called_once()
+    repair_event = json.loads(lambda_client.invoke.call_args.kwargs["Payload"])
+    feedback = repair_event["repair_feedback"]
+    assert repair_event["attempt"] == 2
+    assert "code=strict_rule_mismatch location=days[2]" in feedback
+    assert "location=rules" not in feedback
+    assert rule.source_text not in feedback
+    assert "Egg breakfast" not in feedback
+    assert len(feedback) <= 800
+
+
+@pytest.mark.parametrize(
+    ("issue", "expected_location"),
+    [
+        (
+            ValidationIssue(
+                code="strict_rule_mismatch",
+                message="private rule details",
+                day=3,
+                rule_id="rule-1",
+            ),
+            "days[2]",
+        ),
+        (
+            ValidationIssue(
+                code="missing_meal_type",
+                message="private meal details",
+                day=3,
+                meal_type=MealType.DINNER,
+            ),
+            "days[2].meals.dinner",
+        ),
+        (
+            ValidationIssue(
+                code="strict_rule_mismatch",
+                message="private rule details",
+                rule_id="rule-1",
+            ),
+            "rules",
+        ),
+        (
+            ValidationIssue(
+                code="constraint_violation",
+                message="private constraint details",
+                constraint_id="constraint-1",
+            ),
+            "constraints",
+        ),
+        (
+            ValidationIssue(
+                code="requirement_count_mismatch",
+                message="private requirement details",
+                requirement_id="requirement-1",
+            ),
+            "requirements",
+        ),
+        (
+            ValidationIssue(code="missing", message="private plan details"),
+            "plan",
+        ),
+    ],
+)
+def test_validation_location_preserves_bounded_issue_paths(
+    issue: ValidationIssue, expected_location: str
+) -> None:
+    """Validation issue paths retain existing non-day precedence."""
+    validation = PlanValidationResult(
+        valid=False,
+        requirements=(),
+        issues=(issue,),
+    )
+
+    feedback = PlannerHandler._validation_feedback(validation)
+
+    assert f"location={expected_location}" in feedback
+    assert issue.message not in feedback
 
 
 @pytest.mark.parametrize("meal_type", list(MealType))
@@ -3005,12 +3663,59 @@ def test_handle_event_forwards_requirements_and_repair_metadata(
                 exact_count=3,
             )
         ],
+        "stored_rules": [],
+        "current_rules": [],
+        "effective_rules": [],
+        "constraint_rules": [],
         "attempt": 2,
         "repair_feedback": "r1 matched 2; expected exactly 3",
         "request_id": None,
         "state_revision": None,
         "repair_id": "repair-123",
     }
+
+
+def test_handle_event_preserves_distinct_effective_rule_ids(
+    mocker: Any,
+) -> None:
+    """The planner accepts the ordered, unique partial-scope snapshot."""
+    planner = PlannerHandler(mocker.MagicMock(), mocker.MagicMock())
+    generate = mocker.patch.object(planner, "generate_plan")
+    event = {
+        "action": "generate_plan",
+        "user_id": "user",
+        "chat_id": 1,
+        "week_start": "2026-08-10",
+        "preference": "eggs",
+        "effective_rules": [
+            {
+                "id": "r-current-wednesday",
+                "source_text": "eggs at most once Wednesday",
+                "foods_any_of": ["egg"],
+                "weekdays": [3],
+                "operator": "at_most",
+                "count": 1,
+                "strength": "strict",
+            },
+            {
+                "id": "r-stored-weekdays",
+                "source_text": "eggs weekdays",
+                "foods_any_of": ["egg"],
+                "weekdays": [1, 2, 3, 4, 5],
+                "operator": "exactly",
+                "count": 4,
+                "strength": "strict",
+            },
+        ],
+    }
+
+    assert planner.handle_event(event)
+
+    forwarded = generate.call_args.kwargs["effective_rules"]
+    assert [rule.id for rule in forwarded] == [
+        "r-current-wednesday",
+        "r-stored-weekdays",
+    ]
 
 
 @pytest.mark.parametrize(

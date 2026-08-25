@@ -1,5 +1,7 @@
 """Pydantic models for meal-planner persistence and LLM contracts."""
 
+import hashlib
+import json
 from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Annotated, Any
@@ -35,6 +37,7 @@ PlanInstruction = Annotated[
 ]
 PlanningInstruction = PlanInstruction
 MAX_PLAN_REQUIREMENTS = 20
+MAX_MEALS_PER_DAY = 4
 RequestId = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
@@ -67,7 +70,6 @@ _FIELD_NO_VALUE_PHRASES = {
     "dietary_preferences": frozenset(
         {"no dietary preferences", "no preferences"}
     ),
-    "goals": frozenset({"no goals"}),
 }
 _LEGACY_CONSTRAINT_NO_VALUE_PHRASES = {
     "allergies": frozenset({"no dietary constraints", "no allergies"}),
@@ -143,6 +145,109 @@ def _normalize_legacy_constraints(
     return normalized
 
 
+def _normalize_profile_entries(
+    value: Any, field_name: str, *, preserve_unanswered: bool
+) -> Any:
+    """Give old string profile entries deterministic structured shapes."""
+    if not isinstance(value, dict) or field_name not in value:
+        return value
+    entries = value[field_name]
+    if entries is None:
+        return value
+    if not isinstance(entries, list):
+        if isinstance(entries, str) and _is_no_value_phrase(
+            entries, field_name
+        ):
+            normalized = dict(value)
+            normalized[field_name] = []
+            return normalized
+        return value
+
+    normalized_entries: list[Any] = []
+    for index, entry in enumerate(entries, start=1):
+        if hasattr(entry, "model_dump"):
+            entry = entry.model_dump()
+        if isinstance(entry, str):
+            source_text = entry.strip()
+            if field_name == "dietary_constraints":
+                from meal_planner.dietary_rules import expand_constraint_terms
+
+                expansion = expand_constraint_terms([source_text])
+                normalized_entries.append(
+                    {
+                        "id": f"legacy-constraint-{index}",
+                        "source_text": source_text,
+                        "forbidden_terms": list(expansion.terms),
+                        "uninterpretable": not expansion.is_safe,
+                    }
+                )
+            else:
+                normalized_entries.append(
+                    {
+                        "id": f"legacy-preference-{index}",
+                        "source_text": source_text,
+                        "rule": None,
+                    }
+                )
+            continue
+        if isinstance(entry, dict):
+            item = dict(entry)
+            entry_kind = (
+                "constraint"
+                if field_name == "dietary_constraints"
+                else "preference"
+            )
+            item.setdefault(
+                "id",
+                f"legacy-{entry_kind}-{index}",
+            )
+            if field_name == "dietary_constraints":
+                raw_source_text: Any = item.get("source_text")
+                if isinstance(raw_source_text, str) and (
+                    "forbidden_terms" not in item
+                    or item.get("forbidden_terms") == [raw_source_text]
+                ):
+                    from meal_planner.dietary_rules import (
+                        expand_constraint_terms,
+                    )
+
+                    expansion = expand_constraint_terms([raw_source_text])
+                    item["forbidden_terms"] = list(expansion.terms)
+                    item["uninterpretable"] = not expansion.is_safe
+            elif "rule" not in item and "foods_any_of" in item:
+                rule = dict(item)
+                rule["id"] = item["id"]
+                item = {
+                    "id": item["id"],
+                    "source_text": item.get("source_text", "legacy"),
+                    "rule": rule,
+                }
+            normalized_entries.append(item)
+            continue
+        normalized_entries.append(entry)
+
+    normalized = dict(value)
+    normalized[field_name] = normalized_entries
+    return normalized
+
+
+def _normalize_profile_models(value: Any, *, preserve_unanswered: bool) -> Any:
+    """Normalize legacy profile fields before Pydantic validates them."""
+    normalized = _normalize_legacy_constraints(
+        value, preserve_unanswered=preserve_unanswered
+    )
+    normalized = _normalize_profile_entries(
+        normalized,
+        "dietary_constraints",
+        preserve_unanswered=preserve_unanswered,
+    )
+    return _normalize_profile_entries(
+        normalized,
+        "dietary_preferences",
+        preserve_unanswered=preserve_unanswered,
+    )
+
+
 class ConversationIntent(str, Enum):
     """Supported conversational mutations and response intents."""
 
@@ -189,13 +294,44 @@ class MealType(str, Enum):
     SNACK = "snack"
 
 
+def daily_meal_capacity(meal_type: MealType | None) -> int:
+    """Return the bounded number of eligible meals on one day."""
+    return 1 if meal_type is not None else MAX_MEALS_PER_DAY
+
+
+class RuleOperator(str, Enum):
+    """Count operators supported by dietary preference rules."""
+
+    EXACTLY = "exactly"
+    AT_LEAST = "at_least"
+    AT_MOST = "at_most"
+
+
+class RuleStrength(str, Enum):
+    """Whether a dietary preference participates in safety validation."""
+
+    STRICT = "strict"
+    BEST_EFFORT = "best_effort"
+
+
+class Weekday(int, Enum):
+    """ISO weekday values used in persisted dietary rule scopes."""
+
+    MONDAY = 1
+    TUESDAY = 2
+    WEDNESDAY = 3
+    THURSDAY = 4
+    FRIDAY = 5
+    SATURDAY = 6
+    SUNDAY = 7
+
+
 class ProfileEditCategory(str, Enum):
     """Profile categories exposed by the deterministic edit workflow."""
 
     FAMILY = "family"
     DIETARY_CONSTRAINTS = "dietary_constraints"
     DIETARY_PREFERENCES = "dietary_preferences"
-    GOALS = "goals"
 
 
 class ProfileEditOperation(str, Enum):
@@ -223,8 +359,119 @@ class ProfileEditOperation(str, Enum):
         }
 
 
+class DietaryRule(BaseModel):
+    """One bounded, structured dietary preference rule."""
+
+    id: RequirementId
+    source_text: PlanPreference
+    foods_any_of: list[PreferenceFood] = Field(min_length=1, max_length=20)
+    meal_type: MealType | None = None
+    weekdays: list[Weekday] = Field(default_factory=list, max_length=7)
+    operator: RuleOperator = RuleOperator.EXACTLY
+    count: int = Field(ge=0, le=28)
+    strength: RuleStrength = RuleStrength.STRICT
+
+    @field_validator("foods_any_of")
+    @classmethod
+    def reject_duplicate_foods(cls, value: list[str]) -> list[str]:
+        """Reject alternatives that identify the same normalized food."""
+        normalized = [normalize_food(food) for food in value]
+        if any(not food_tokens for food_tokens in normalized):
+            raise ValueError(
+                "foods_any_of entries must contain matchable food tokens"
+            )
+        if len(set(normalized)) != len(value):
+            raise ValueError("foods_any_of must not contain duplicates")
+        return value
+
+    @field_validator("weekdays")
+    @classmethod
+    def reject_duplicate_weekdays(cls, value: list[Weekday]) -> list[Weekday]:
+        """Reject duplicate weekday scopes while retaining input order."""
+        if len(value) != len(set(value)):
+            raise ValueError("weekdays must not contain duplicates")
+        return value
+
+    @model_validator(mode="after")
+    def validate_count_for_scope(self) -> "DietaryRule":
+        """Keep strict weekday rules within one day's capacity."""
+        if self.weekdays:
+            if (
+                self.strength is RuleStrength.STRICT
+                and self.operator
+                in {RuleOperator.EXACTLY, RuleOperator.AT_LEAST}
+                and self.count > daily_meal_capacity(self.meal_type)
+            ):
+                raise ValueError("count must fit per named weekday capacity")
+        elif self.meal_type is not None and self.count > 7:
+            raise ValueError("count must fit the selected meal scope")
+        return self
+
+
+class ConstraintEntry(BaseModel):
+    """One persisted dietary constraint and its normalized forbidden terms."""
+
+    id: RequirementId
+    source_text: PlanPreference
+    forbidden_terms: list[PreferenceFood] = Field(
+        default_factory=list, max_length=20
+    )
+    uninterpretable: bool = False
+
+    @field_validator("forbidden_terms", mode="before")
+    @classmethod
+    def normalize_forbidden_terms(cls, value: Any) -> Any:
+        """Normalize terms without making network calls or guessing aliases."""
+        if not isinstance(value, list):
+            return value
+        normalized: list[str] = []
+        seen: set[tuple[str, ...]] = set()
+        for term in value:
+            if not isinstance(term, str):
+                normalized.append(term)
+                continue
+            tokens = normalize_food(term)
+            if tokens and tokens not in seen:
+                seen.add(tokens)
+                normalized.append(" ".join(tokens))
+        return normalized
+
+    @field_validator("forbidden_terms")
+    @classmethod
+    def reject_unmatchable_terms(cls, value: list[str]) -> list[str]:
+        """Reject malformed terms while allowing explicit unknown input."""
+        if any(not normalize_food(term) for term in value):
+            raise ValueError("forbidden_terms must contain matchable terms")
+        return value
+
+    @model_validator(mode="after")
+    def validate_interpretation(self) -> "ConstraintEntry":
+        """Require an explicit marker when no safe terms are available."""
+        if not self.forbidden_terms and not self.uninterpretable:
+            raise ValueError(
+                "constraints without terms must be marked uninterpretable"
+            )
+        if self.uninterpretable and self.forbidden_terms:
+            raise ValueError(
+                "uninterpretable constraints cannot contain forbidden terms"
+            )
+        return self
+
+
+class DietaryPreferenceEntry(BaseModel):
+    """Stored preference wording with an optional interpreted rule."""
+
+    id: RequirementId
+    source_text: PlanPreference
+    rule: DietaryRule | None = None
+
+
 class PreferenceRequirement(BaseModel):
-    """One bounded, exact-count preference for a weekly meal plan."""
+    """One bounded, exact-count preference for a weekly meal plan.
+
+    This legacy contract remains available while planner consumers migrate to
+    :class:`DietaryRule`.
+    """
 
     id: RequirementId
     source_text: PlanPreference
@@ -306,6 +553,28 @@ class ConversationState(BaseModel):
     requirements: list[PreferenceRequirement] = Field(
         default_factory=list, max_length=20
     )
+    stored_rules: list[DietaryRule] = Field(
+        default_factory=list,
+        max_length=20,
+        validation_alias=AliasChoices("stored_rules", "stored_preferences"),
+    )
+    current_rules: list[DietaryRule] = Field(
+        default_factory=list,
+        max_length=20,
+        validation_alias=AliasChoices("current_rules", "current_preferences"),
+    )
+    effective_rules: list[DietaryRule] = Field(
+        default_factory=list,
+        max_length=20,
+        validation_alias=AliasChoices(
+            "effective_rules", "effective_preference_rules"
+        ),
+    )
+    constraint_rules: list[ConstraintEntry] = Field(
+        default_factory=list,
+        max_length=20,
+        validation_alias=AliasChoices("constraint_rules", "constraints"),
+    )
     profile_category: ProfileEditCategory | None = None
     profile_operation: ProfileEditOperation | None = None
     amendment: PlanInstruction | None = None
@@ -320,6 +589,21 @@ class ConversationState(BaseModel):
     updated_at: datetime
     expires_at: int = Field(ge=1)
     last_update_id: str | None = None
+
+    @property
+    def stored_preferences(self) -> list[DietaryRule]:
+        """Return stored preference rules using profile terminology."""
+        return self.stored_rules
+
+    @property
+    def current_preferences(self) -> list[DietaryRule]:
+        """Return current plan preference rules."""
+        return self.current_rules
+
+    @property
+    def constraints(self) -> list[ConstraintEntry]:
+        """Return independent constraint rules."""
+        return self.constraint_rules
 
     @field_validator("created_at", "updated_at")
     @classmethod
@@ -342,6 +626,17 @@ class ConversationState(BaseModel):
     @model_validator(mode="after")
     def validate_workflow_shape(self) -> "ConversationState":
         """Reject steps and fields that belong to another workflow."""
+        tier_ids = [
+            rule.id
+            for rules in (
+                self.constraint_rules,
+                self.stored_rules,
+                self.current_rules,
+            )
+            for rule in rules
+        ]
+        if len(tier_ids) != len(set(tier_ids)):
+            raise ValueError("planning rule tiers must have unique IDs")
         meal_steps = {
             ConversationWorkflowStep.AWAITING_MEAL_INPUT,
             ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
@@ -362,6 +657,10 @@ class ConversationState(BaseModel):
             if (
                 self.preference is not None
                 or self.requirements
+                or self.stored_rules
+                or self.current_rules
+                or self.effective_rules
+                or self.constraint_rules
                 or self.profile_category is not None
                 or self.profile_operation is not None
                 or self.amendment is not None
@@ -426,6 +725,10 @@ class ConversationState(BaseModel):
                 self.meal_draft is not None
                 or self.preference is not None
                 or self.requirements
+                or self.stored_rules
+                or self.current_rules
+                or self.effective_rules
+                or self.constraint_rules
                 or self.profile_category is not None
                 or self.profile_operation is not None
             ):
@@ -451,6 +754,10 @@ class ConversationState(BaseModel):
                 self.meal_draft is not None
                 or self.preference is not None
                 or self.requirements
+                or self.stored_rules
+                or self.current_rules
+                or self.effective_rules
+                or self.constraint_rules
                 or self.request_id is not None
                 or self.amendment is not None
                 or self.target_week is not None
@@ -527,6 +834,28 @@ class PlanGenerationContext(BaseModel):
     requirements: list[PreferenceRequirement] = Field(
         default_factory=list, max_length=MAX_PLAN_REQUIREMENTS
     )
+    stored_rules: list[DietaryRule] = Field(
+        default_factory=list,
+        max_length=MAX_PLAN_REQUIREMENTS,
+        validation_alias=AliasChoices("stored_rules", "stored_preferences"),
+    )
+    current_rules: list[DietaryRule] = Field(
+        default_factory=list,
+        max_length=MAX_PLAN_REQUIREMENTS,
+        validation_alias=AliasChoices("current_rules", "current_preferences"),
+    )
+    effective_rules: list[DietaryRule] = Field(
+        default_factory=list,
+        max_length=MAX_PLAN_REQUIREMENTS,
+        validation_alias=AliasChoices(
+            "effective_rules", "effective_preference_rules"
+        ),
+    )
+    constraint_rules: list[ConstraintEntry] = Field(
+        default_factory=list,
+        max_length=MAX_PLAN_REQUIREMENTS,
+        validation_alias=AliasChoices("constraint_rules", "constraints"),
+    )
     attempt: int = Field(default=1, ge=1, le=2)
     repair_feedback: RepairFeedback | None = None
     request_id: RequestId | None = None
@@ -562,7 +891,42 @@ class PlanGenerationContext(BaseModel):
         requirement_ids = [requirement.id for requirement in self.requirements]
         if len(requirement_ids) != len(set(requirement_ids)):
             raise ValueError("plan requirements must have unique IDs")
+        for rules, label in (
+            (self.stored_rules, "stored rules"),
+            (self.current_rules, "current rules"),
+            (self.effective_rules, "effective rules"),
+            (self.constraint_rules, "constraint rules"),
+        ):
+            rule_ids = [rule.id for rule in rules]
+            if len(rule_ids) != len(set(rule_ids)):
+                raise ValueError(f"{label} must have unique IDs")
+        tier_ids = [
+            rule.id
+            for rules in (
+                self.constraint_rules,
+                self.stored_rules,
+                self.current_rules,
+            )
+            for rule in rules
+        ]
+        if len(tier_ids) != len(set(tier_ids)):
+            raise ValueError("planning rule tiers must have unique IDs")
         return self
+
+    @property
+    def stored_preferences(self) -> list[DietaryRule]:
+        """Return stored preference rules using profile terminology."""
+        return self.stored_rules
+
+    @property
+    def current_preferences(self) -> list[DietaryRule]:
+        """Return current plan preference rules."""
+        return self.current_rules
+
+    @property
+    def constraints(self) -> list[ConstraintEntry]:
+        """Return independent constraint rules."""
+        return self.constraint_rules
 
 
 class PlanRevisionContext(BaseModel):
@@ -600,25 +964,31 @@ class UserProfile(BaseModel):
 
     name: ShortText
     family_members: list[FamilyMember] = Field(default_factory=list)
-    dietary_constraints: list[ShortText] = Field(default_factory=list)
-    dietary_preferences: list[ShortText] = Field(default_factory=list)
-    goals: list[ShortText] = Field(default_factory=list)
+    dietary_constraints: list[ConstraintEntry] = Field(
+        default_factory=list, max_length=MAX_PLAN_REQUIREMENTS
+    )
+    dietary_preferences: list[DietaryPreferenceEntry] = Field(
+        default_factory=list, max_length=MAX_PLAN_REQUIREMENTS
+    )
     people_count: int = Field(default=1, ge=1, le=20)
+    profile_revision: int = Field(default=0, ge=0)
 
     @model_validator(mode="before")
     @classmethod
     def normalize_legacy_constraints(cls, value: Any) -> Any:
         """Map legacy persisted constraint fields to the canonical field."""
-        return _normalize_legacy_constraints(value, preserve_unanswered=False)
+        return _normalize_profile_models(value, preserve_unanswered=False)
 
     @field_validator("dietary_constraints")
     @classmethod
-    def deduplicate_constraints(cls, value: list[str]) -> list[str]:
+    def deduplicate_constraints(
+        cls, value: list[ConstraintEntry]
+    ) -> list[ConstraintEntry]:
         """Keep the first spelling of each case-insensitive constraint."""
-        deduplicated: list[str] = []
+        deduplicated: list[ConstraintEntry] = []
         seen: set[str] = set()
         for constraint in value:
-            key = constraint.casefold()
+            key = constraint.source_text.casefold()
             if key not in seen:
                 seen.add(key)
                 deduplicated.append(constraint)
@@ -640,26 +1010,145 @@ class UserProfile(BaseModel):
         return len(self.family_members) == self.people_count
 
 
+def _application_owned_id(namespace: str, payload: dict[str, Any]) -> str:
+    """Return a deterministic, opaque ID owned by this application."""
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()[:32]
+    return f"r-{namespace}-{digest}"
+
+
+def _canonical_foods(foods: list[str]) -> list[str]:
+    """Return normalized food alternatives in deterministic order."""
+    return sorted(" ".join(normalize_food(food)) for food in foods)
+
+
+def application_owned_dietary_rule_id(
+    rule: DietaryRule, *, namespace: str
+) -> str:
+    """Build a stable ID from rule content and its owning application tier."""
+    return _application_owned_id(
+        namespace,
+        {
+            "source_text": rule.source_text.casefold().strip(),
+            "foods_any_of": _canonical_foods(rule.foods_any_of),
+            "meal_type": rule.meal_type.value if rule.meal_type else None,
+            "weekdays": sorted(day.value for day in rule.weekdays),
+            "operator": rule.operator.value,
+            "count": rule.count,
+            "strength": rule.strength.value,
+        },
+    )
+
+
+def application_owned_constraint_id(
+    constraint: ConstraintEntry, *, namespace: str
+) -> str:
+    """Build a stable ID from canonical constraint content and its tier."""
+    return _application_owned_id(
+        namespace,
+        {
+            "source_text": constraint.source_text.casefold().strip(),
+            "forbidden_terms": _canonical_foods(constraint.forbidden_terms),
+            "uninterpretable": constraint.uninterpretable,
+        },
+    )
+
+
+def application_owned_text_id(source_text: str, *, namespace: str) -> str:
+    """Build a stable ID for an uninterpreted persisted profile entry."""
+    return _application_owned_id(
+        namespace, {"source_text": source_text.casefold().strip()}
+    )
+
+
+def canonicalize_dietary_rule(
+    rule: DietaryRule, *, namespace: str
+) -> DietaryRule:
+    """Replace provider identity with a stable application-owned identity."""
+    return rule.model_copy(
+        update={
+            "id": application_owned_dietary_rule_id(rule, namespace=namespace)
+        }
+    )
+
+
+def canonicalize_constraint_entry(
+    constraint: ConstraintEntry, *, namespace: str
+) -> ConstraintEntry:
+    """Replace a constraint provider ID with an application-owned identity."""
+    return constraint.model_copy(
+        update={
+            "id": application_owned_constraint_id(
+                constraint, namespace=namespace
+            )
+        }
+    )
+
+
+def canonicalize_profile_rule_ids(profile: UserProfile) -> UserProfile:
+    """Canonicalize every persisted dietary rule without dropping content."""
+    validated = UserProfile.model_validate(
+        profile.model_dump(mode="json", warnings=False)
+    )
+    constraints = []
+    for constraint in validated.dietary_constraints:
+        canonical = canonicalize_constraint_entry(
+            constraint, namespace="profile-constraint"
+        )
+        constraints.append(canonical.model_dump(mode="json"))
+    preferences: list[dict[str, Any]] = []
+    for preference in validated.dietary_preferences:
+        if preference.rule is None:
+            identifier = application_owned_text_id(
+                preference.source_text, namespace="profile-preference"
+            )
+            rule_data = None
+        else:
+            rule = canonicalize_dietary_rule(
+                preference.rule, namespace="profile-preference"
+            )
+            identifier = rule.id
+            rule_data = rule.model_dump(mode="json")
+        preferences.append(
+            {
+                "id": identifier,
+                "source_text": preference.source_text,
+                "rule": rule_data,
+            }
+        )
+    data = validated.model_dump(mode="json", warnings=False)
+    data["dietary_constraints"] = constraints
+    data["dietary_preferences"] = preferences
+    return UserProfile.model_validate(data)
+
+
 class ProfileUpdateEntities(BaseModel):
     """Explicit fields accepted from an LLM profile-update intent."""
 
     name: ShortText | None = None
     people_count: int | None = Field(default=None, ge=1, le=20)
     family_members: list[FamilyMember] | None = None
-    dietary_constraints: list[ShortText] | None = None
-    dietary_preferences: list[ShortText] | None = None
-    goals: list[ShortText] | None = None
+    dietary_constraints: list[ConstraintEntry] | None = Field(
+        default=None, max_length=MAX_PLAN_REQUIREMENTS
+    )
+    dietary_preferences: list[DietaryPreferenceEntry] | None = Field(
+        default=None, max_length=MAX_PLAN_REQUIREMENTS
+    )
 
     @model_validator(mode="before")
     @classmethod
     def normalize_legacy_constraints(cls, value: Any) -> Any:
         """Map legacy profile-update fields to the canonical field."""
-        return _normalize_legacy_constraints(value, preserve_unanswered=True)
+        return _normalize_profile_models(value, preserve_unanswered=True)
 
     @field_validator(
         "dietary_constraints",
         "dietary_preferences",
-        "goals",
         mode="before",
     )
     @classmethod
@@ -673,15 +1162,15 @@ class ProfileUpdateEntities(BaseModel):
     @field_validator("dietary_constraints")
     @classmethod
     def deduplicate_constraints(
-        cls, value: list[str] | None
-    ) -> list[str] | None:
+        cls, value: list[ConstraintEntry] | None
+    ) -> list[ConstraintEntry] | None:
         """Keep the first spelling of each case-insensitive constraint."""
         if value is None:
             return None
-        deduplicated: list[str] = []
+        deduplicated: list[ConstraintEntry] = []
         seen: set[str] = set()
         for constraint in value:
-            key = constraint.casefold()
+            key = constraint.source_text.casefold()
             if key not in seen:
                 seen.add(key)
                 deduplicated.append(constraint)

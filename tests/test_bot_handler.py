@@ -2,7 +2,6 @@
 
 import base64
 import json
-from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Generator
 from unittest.mock import call
@@ -18,22 +17,30 @@ from meal_planner.bot_handler import (
 )
 from meal_planner.db.dynamo import ActivePlanSnapshot, DynamoRepository
 from meal_planner.models.schemas import (
+    ConstraintEntry,
     ConversationIntent,
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
+    DietaryPreferenceEntry,
+    DietaryRule,
     FamilyMember,
     GroceryStatus,
     MealLogDraft,
     MealLogEntry,
     MealOutcome,
     MealType,
+    PlanGenerationContext,
     PlanStatus,
     PreferenceRequirement,
     ProfileEditCategory,
     ProfileEditOperation,
     ProfileUpdateEntities,
+    RuleOperator,
+    RuleStrength,
     UserProfile,
+    Weekday,
+    canonicalize_profile_rule_ids,
 )
 from meal_planner.router import RouteResult, RouteType
 from meal_planner.telegram.access import TelegramAccessPolicy
@@ -601,6 +608,369 @@ def _profile_text(text: str) -> RouteResult:
     )
 
 
+def _confirm_pending_profile_rule(
+    handler: BotHandler, state: ConversationState
+) -> None:
+    """Confirm the token stored in a pending profile interpretation."""
+    assert state.last_update_id is not None
+    payload = json.loads(state.last_update_id.removeprefix("profile-pending:"))
+    handler.handle_callback(
+        _profile_callback(f"profile:confirm:{payload['token']}")
+    )
+
+
+def _constraint_interpretation(text: str) -> str:
+    """Return one complete provider response for a constraint test."""
+    return json.dumps(
+        {
+            "mode": "constraint",
+            "requirements": [],
+            "exclusions": [
+                {
+                    "id": "constraint-1",
+                    "source_text": text,
+                    "forbidden_terms": [text],
+                }
+            ],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+
+
+def _preference_interpretation(text: str, food: str = "eggs") -> str:
+    """Return one complete provider response for a preference test."""
+    return json.dumps(
+        {
+            "mode": "stored_preference",
+            "requirements": [
+                {
+                    "id": "preference-new",
+                    "source_text": text,
+                    "foods_any_of": [food],
+                    "meal_type": "breakfast",
+                    "weekdays": [],
+                    "operator": "at_least",
+                    "count": 1,
+                    "strength": "strict",
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+
+
+def test_profile_rule_interpretation_is_durable_until_confirmation(
+    handler: BotHandler,
+) -> None:
+    """A parsed preference is reviewed, then saved exactly once."""
+    state = _profile_input_state(
+        handler,
+        ProfileEditCategory.DIETARY_PREFERENCES,
+        ProfileEditOperation.ADD,
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.transition_conversation_state.return_value = True
+    handler.repo.save_profile_and_transition_state.return_value = True
+    handler.llm_client.chat_sync.return_value = _preference_interpretation(
+        "I would like eggs for breakfast"
+    )
+
+    handler.handle_conversational(
+        _profile_text("I would like eggs for breakfast")
+    )
+
+    pending = handler.repo.transition_conversation_state.call_args.args[1]
+    assert pending.last_update_id is not None
+    assert pending.last_update_id.startswith("profile-pending:")
+    handler.repo.get_conversation_state.return_value = pending
+    _confirm_pending_profile_rule(handler, pending)
+
+    saved = handler.repo.save_profile_and_transition_state.call_args.args[1]
+    assert saved.dietary_preferences[-1].rule is not None
+    assert saved.dietary_preferences[-1].rule.count == 1
+    assert saved.dietary_preferences[-1].rule.strength.value == "strict"
+
+
+def test_stale_profile_confirmation_reloads_latest_profile(
+    handler: BotHandler,
+) -> None:
+    """A rejected confirmation refreshes state without replaying the edit."""
+    state = _profile_input_state(
+        handler,
+        ProfileEditCategory.DIETARY_PREFERENCES,
+        ProfileEditOperation.ADD,
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.transition_conversation_state.return_value = True
+    handler.llm_client.chat_sync.return_value = _preference_interpretation(
+        "eggs for breakfast"
+    )
+
+    handler.handle_conversational(_profile_text("eggs for breakfast"))
+    pending = handler.repo.transition_conversation_state.call_args.args[1]
+    handler.repo.get_conversation_state.return_value = pending
+    handler.repo.get_profile.side_effect = [
+        make_profile(),
+        make_profile().model_copy(
+            update={
+                "dietary_constraints": [
+                    ConstraintEntry(
+                        id="constraint-1",
+                        source_text="peanuts",
+                        forbidden_terms=["peanut"],
+                    )
+                ]
+            }
+        ),
+    ]
+    handler.repo.save_profile_and_transition_state.return_value = False
+
+    _confirm_pending_profile_rule(handler, pending)
+
+    assert handler.repo.get_profile.call_args_list == [
+        call("user", consistent_read=True),
+        call("user", consistent_read=True),
+    ]
+    assert "stale" in handler.telegram_api.send_message.call_args.args[1]
+
+
+def test_sequential_profile_confirmations_replace_provider_ids(
+    handler: BotHandler,
+) -> None:
+    """Unrelated confirmed rules receive distinct application IDs."""
+    profile = make_profile().model_copy(update={"dietary_preferences": []})
+    state = _profile_input_state(
+        handler,
+        ProfileEditCategory.DIETARY_PREFERENCES,
+        ProfileEditOperation.ADD,
+    )
+
+    def provider_response(text: str) -> str:
+        return json.dumps(
+            {
+                "mode": "stored_preference",
+                "requirements": [
+                    {
+                        "id": "r1",
+                        "source_text": text,
+                        "foods_any_of": ["eggs" if "eggs" in text else "tofu"],
+                        "meal_type": (
+                            "breakfast" if "eggs" in text else "dinner"
+                        ),
+                        "weekdays": [],
+                        "operator": "at_least",
+                        "count": 1,
+                        "strength": "strict",
+                    }
+                ],
+                "exclusions": [],
+                "clarification": None,
+                "unparsed_text": [],
+            }
+        )
+
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.get_profile.return_value = profile
+    handler.repo.transition_conversation_state.return_value = True
+    handler.repo.save_profile_and_transition_state.return_value = True
+    handler.llm_client.chat_sync.side_effect = [
+        provider_response("eggs for breakfast"),
+        provider_response("tofu for dinner"),
+    ]
+
+    handler.handle_conversational(_profile_text("eggs for breakfast"))
+    pending = handler.repo.transition_conversation_state.call_args.args[1]
+    handler.repo.get_conversation_state.return_value = pending
+    _confirm_pending_profile_rule(handler, pending)
+    first_saved = handler.repo.save_profile_and_transition_state.call_args.args[
+        1
+    ]
+
+    second_state = _profile_input_state(
+        handler,
+        ProfileEditCategory.DIETARY_PREFERENCES,
+        ProfileEditOperation.ADD,
+    )
+    handler.repo.get_conversation_state.return_value = second_state
+    handler.repo.get_profile.return_value = first_saved
+    handler.handle_conversational(_profile_text("tofu for dinner"))
+    second_pending = handler.repo.transition_conversation_state.call_args.args[
+        1
+    ]
+    handler.repo.get_conversation_state.return_value = second_pending
+    _confirm_pending_profile_rule(handler, second_pending)
+    second_saved = (
+        handler.repo.save_profile_and_transition_state.call_args.args[1]
+    )
+
+    ids = [
+        preference.rule.id
+        for preference in second_saved.dietary_preferences
+        if preference.rule is not None
+    ]
+    assert len(ids) == len(set(ids))
+    assert all(identifier != "r1" for identifier in ids)
+
+
+def test_stored_and_current_provider_id_collision_is_repaired_before_dispatch(
+    handler: BotHandler,
+) -> None:
+    """Stored/current rule collisions do not become length feedback."""
+    stored = DietaryRule(
+        id="r1",
+        source_text="eggs for breakfast",
+        foods_any_of=["eggs"],
+        meal_type="breakfast",
+        count=1,
+    )
+    handler.repo.get_profile.return_value = make_profile().model_copy(
+        update={
+            "dietary_preferences": [
+                DietaryPreferenceEntry(
+                    id="r1",
+                    source_text=stored.source_text,
+                    rule=stored,
+                )
+            ]
+        }
+    )
+    handler.repo.get_conversation_state.return_value = handler._new_plan_state()
+    handler.repo.transition_conversation_state.return_value = True
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": "current_plan_preference",
+            "requirements": [
+                {
+                    "id": "r1",
+                    "source_text": "tofu for dinner",
+                    "foods_any_of": ["tofu"],
+                    "meal_type": "dinner",
+                    "weekdays": [],
+                    "operator": "at_least",
+                    "count": 1,
+                    "strength": "strict",
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="tofu for dinner",
+            raw_update={"update_id": 9001},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    effective_ids = [rule.id for rule in saved.effective_rules]
+    assert len(effective_ids) == len(set(effective_ids))
+    assert handler.lambda_client.invoke.called
+    assert "too long" not in (
+        handler.telegram_api.send_message.call_args.args[1].lower()
+    )
+
+
+def test_profile_rule_confirmation_rejects_latest_constraint_conflict(
+    handler: BotHandler,
+) -> None:
+    """A concurrent constraint makes a pending preference non-saveable."""
+    state = _profile_input_state(
+        handler,
+        ProfileEditCategory.DIETARY_PREFERENCES,
+        ProfileEditOperation.ADD,
+    )
+    profile = make_profile().model_copy(
+        update={
+            "dietary_constraints": [
+                ConstraintEntry(
+                    id="constraint-eggs",
+                    source_text="no eggs",
+                    forbidden_terms=["eggs"],
+                )
+            ]
+        }
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.transition_conversation_state.return_value = True
+    handler.repo.get_profile.return_value = profile
+    handler.llm_client.chat_sync.return_value = _preference_interpretation(
+        "eggs for breakfast"
+    )
+
+    handler.handle_conversational(_profile_text("eggs for breakfast"))
+    pending = handler.repo.transition_conversation_state.call_args.args[1]
+    handler.repo.get_conversation_state.return_value = pending
+    handler.handle_callback(
+        _profile_callback(
+            "profile:confirm:"
+            + json.loads(
+                pending.last_update_id.removeprefix("profile-pending:")
+            )["token"]
+        )
+    )
+
+    handler.repo.save_profile_and_transition_state.assert_not_called()
+    message = handler.telegram_api.send_message.call_args.args[1].lower()
+    assert "conflicts" in message
+
+
+def test_constraint_confirmation_reports_atomic_preference_removal(
+    handler: BotHandler,
+) -> None:
+    """Constraint confirmation reports preferences removed by the guard."""
+    state = _profile_input_state(
+        handler,
+        ProfileEditCategory.DIETARY_CONSTRAINTS,
+        ProfileEditOperation.ADD,
+    )
+    preference_rule = DietaryRule(
+        id="preference-eggs",
+        source_text="eggs for breakfast",
+        foods_any_of=["eggs"],
+        meal_type="breakfast",
+        count=1,
+    )
+    profile = make_profile().model_copy(
+        update={
+            "dietary_preferences": [
+                DietaryPreferenceEntry(
+                    id="preference-eggs",
+                    source_text="eggs for breakfast",
+                    rule=preference_rule,
+                )
+            ]
+        }
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.transition_conversation_state.return_value = True
+    handler.repo.get_profile.return_value = profile
+    handler.repo.save_profile_and_transition_state.return_value = True
+    handler.llm_client.chat_sync.return_value = _constraint_interpretation(
+        "eggs"
+    )
+
+    handler.handle_conversational(_profile_text("no eggs"))
+    pending = handler.repo.transition_conversation_state.call_args.args[1]
+    handler.repo.get_conversation_state.return_value = pending
+    _confirm_pending_profile_rule(handler, pending)
+
+    saved = handler.repo.save_profile_and_transition_state.call_args.args[1]
+    assert saved.dietary_constraints
+    assert saved.dietary_preferences
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "eggs for breakfast" in message
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
@@ -706,38 +1076,14 @@ def test_profile_target_parser_rejects_malformed_clear_and_values(
         ),
         (
             ProfileEditCategory.DIETARY_CONSTRAINTS,
-            ProfileEditOperation.ADD,
-            "No peanuts",
-            ["No peanuts"],
-        ),
-        (
-            ProfileEditCategory.DIETARY_CONSTRAINTS,
             ProfileEditOperation.REMOVE,
             "PEANUTS",
             [],
         ),
         (
             ProfileEditCategory.DIETARY_PREFERENCES,
-            ProfileEditOperation.ADD,
-            "Mediterranean",
-            ["balanced", "Mediterranean"],
-        ),
-        (
-            ProfileEditCategory.DIETARY_PREFERENCES,
             ProfileEditOperation.REMOVE,
             "BALANCED",
-            [],
-        ),
-        (
-            ProfileEditCategory.GOALS,
-            ProfileEditOperation.ADD,
-            "Eat more vegetables",
-            ["eat well", "Eat more vegetables"],
-        ),
-        (
-            ProfileEditCategory.GOALS,
-            ProfileEditOperation.REMOVE,
-            "EAT WELL",
             [],
         ),
     ],
@@ -764,7 +1110,6 @@ def test_profile_amendment_successes_return_to_category_menu(
         existing = {
             ProfileEditCategory.DIETARY_CONSTRAINTS: ["Peanuts"],
             ProfileEditCategory.DIETARY_PREFERENCES: ["balanced"],
-            ProfileEditCategory.GOALS: ["eat well"],
         }[category]
         profile = profile.model_copy(update={category.value: existing})
     state = _profile_input_state(handler, category, operation)
@@ -864,7 +1209,6 @@ def test_family_target_amendments_preserve_other_member_targets(
     handler.repo.get_conversation_state.return_value = state
     handler.repo.get_profile.return_value = profile
     handler.repo.save_profile_and_transition_state.return_value = True
-
     handler.handle_conversational(_profile_text(text))
 
     saved = handler.repo.save_profile_and_transition_state.call_args.args[1]
@@ -1233,7 +1577,7 @@ def test_family_nutrient_operation_in_invalid_category_does_not_write(
     """Family-only nutrient operations cannot mutate item categories."""
     state = _profile_input_state(
         handler,
-        ProfileEditCategory.GOALS,
+        ProfileEditCategory.DIETARY_CONSTRAINTS,
         ProfileEditOperation.CHANGE_PROTEIN,
     )
     handler.repo.get_conversation_state.return_value = state
@@ -1390,7 +1734,6 @@ def test_family_addition_preserves_display_spelling(
     [
         (ProfileEditCategory.DIETARY_CONSTRAINTS, "dairy"),
         (ProfileEditCategory.DIETARY_PREFERENCES, "Mediterranean"),
-        (ProfileEditCategory.GOALS, "eat better"),
     ],
 )
 def test_unrelated_amendment_is_allowed_on_legacy_duplicate_profile(
@@ -1416,14 +1759,48 @@ def test_unrelated_amendment_is_allowed_on_legacy_duplicate_profile(
     handler.repo.get_conversation_state.return_value = state
     handler.repo.get_profile.return_value = profile
     handler.repo.save_profile_and_transition_state.return_value = True
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": (
+                "constraint"
+                if category is ProfileEditCategory.DIETARY_CONSTRAINTS
+                else "stored_preference"
+            ),
+            "requirements": []
+            if category is ProfileEditCategory.DIETARY_CONSTRAINTS
+            else [
+                {
+                    "id": "preference-1",
+                    "source_text": text,
+                    "foods_any_of": [text],
+                    "meal_type": None,
+                    "count": 1,
+                    "operator": "exactly",
+                    "strength": "strict",
+                }
+            ],
+            "exclusions": [
+                {
+                    "id": "constraint-1",
+                    "source_text": text,
+                    "forbidden_terms": [text],
+                }
+            ]
+            if category is ProfileEditCategory.DIETARY_CONSTRAINTS
+            else [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
 
     handler.handle_conversational(_profile_text(text))
 
-    saved = handler.repo.save_profile_and_transition_state.call_args.args[1]
-    assert getattr(saved, category.value)[-1] == text
-    handler.repo.save_profile_and_transition_state.assert_called_once()
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.last_update_id is not None
+    assert saved.last_update_id.startswith("profile-pending:")
+    handler.repo.save_profile_and_transition_state.assert_not_called()
     handler.repo.save_profile.assert_not_called()
-    handler.repo.transition_conversation_state.assert_not_called()
+    handler.repo.transition_conversation_state.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -1439,7 +1816,6 @@ def test_unrelated_amendment_is_allowed_on_legacy_duplicate_profile(
             ProfileEditOperation.REMOVE,
             "missing",
         ),
-        (ProfileEditCategory.GOALS, ProfileEditOperation.ADD, "   "),
     ],
 )
 def test_item_profile_amendment_errors_do_not_write(
@@ -1499,7 +1875,7 @@ def test_profile_amendment_rejects_malformed_calories_and_last_member(
     handler.repo.save_profile.assert_not_called()
 
 
-def test_profile_amendment_does_not_use_profile_revision_cas(
+def test_profile_amendment_uses_atomic_transaction_path(
     handler: BotHandler,
 ) -> None:
     """Profile amendments use the atomic transaction path."""
@@ -1511,12 +1887,14 @@ def test_profile_amendment_does_not_use_profile_revision_cas(
     profile = make_profile()
     handler.repo.get_conversation_state.return_value = state
     handler.repo.get_profile.return_value = profile
+    handler.llm_client.chat_sync.return_value = _constraint_interpretation(
+        "dairy"
+    )
 
     handler.handle_conversational(_profile_text("dairy"))
 
-    handler.repo.save_profile_and_transition_state.assert_called_once()
+    handler.repo.transition_conversation_state.assert_called_once()
     handler.repo.save_profile.assert_not_called()
-    handler.repo.transition_conversation_state.assert_not_called()
 
 
 def test_profile_amendment_requests_consistent_profile_read(
@@ -1531,12 +1909,13 @@ def test_profile_amendment_requests_consistent_profile_read(
     handler.repo.get_conversation_state.return_value = state
     handler.repo.get_profile.return_value = make_profile()
     handler.repo.save_profile_and_transition_state.return_value = True
+    handler.llm_client.chat_sync.return_value = _constraint_interpretation(
+        "dairy"
+    )
 
     handler.handle_conversational(_profile_text("dairy"))
 
-    handler.repo.get_profile.assert_called_once_with(
-        "user", consistent_read=True
-    )
+    handler.repo.get_profile.assert_not_called()
 
 
 def test_profile_amendment_conflict_does_not_claim_profile_changed(
@@ -1551,15 +1930,16 @@ def test_profile_amendment_conflict_does_not_claim_profile_changed(
     handler.repo.get_conversation_state.return_value = state
     handler.repo.get_profile.return_value = make_profile()
     handler.repo.save_profile_and_transition_state.return_value = False
+    handler.llm_client.chat_sync.return_value = _constraint_interpretation(
+        "dairy"
+    )
 
     handler.handle_conversational(_profile_text("dairy"))
 
-    message = handler.telegram_api.send_message.call_args.args[1].lower()
-    assert "stale" in message
-    assert "changed" not in message
+    handler.telegram_api.send_profile_rule_review.assert_called_once()
     handler.telegram_api.send_profile_category.assert_not_called()
     handler.repo.save_profile.assert_not_called()
-    handler.repo.transition_conversation_state.assert_not_called()
+    handler.repo.transition_conversation_state.assert_called_once()
 
 
 def test_profile_amendment_unexpected_save_failure_is_not_partial_success(
@@ -1576,15 +1956,16 @@ def test_profile_amendment_unexpected_save_failure_is_not_partial_success(
     handler.repo.save_profile_and_transition_state.side_effect = RuntimeError(
         "dynamodb unavailable"
     )
+    handler.llm_client.chat_sync.return_value = _constraint_interpretation(
+        "dairy"
+    )
 
     handler.handle_conversational(_profile_text("dairy"))
 
-    message = handler.telegram_api.send_message.call_args.args[1].lower()
-    assert "couldn't save" in message
-    assert "changed" not in message
+    handler.telegram_api.send_profile_rule_review.assert_called_once()
     handler.telegram_api.send_profile_category.assert_not_called()
     handler.repo.save_profile.assert_not_called()
-    handler.repo.transition_conversation_state.assert_not_called()
+    handler.repo.transition_conversation_state.assert_called_once()
 
 
 def test_sequential_profile_amendments_preserve_prior_changes(
@@ -1594,10 +1975,7 @@ def test_sequential_profile_amendments_preserve_prior_changes(
     """A strongly consistent amendment read preserves the prior amendment."""
     handler, repo = real_profile_handler
     initial_profile = make_profile()
-    repo.save_profile("user", initial_profile)
-    initial_item = deepcopy(
-        repo.table.get_item(Key={"PK": "USER#user", "SK": "PROFILE"})["Item"]
-    )
+    repo.save_profile("user", initial_profile, expected_revision=None)
     transaction = mocker.spy(repo.table.meta.client, "transact_write_items")
     amendment_transaction = mocker.spy(
         repo, "save_profile_and_transition_state"
@@ -1610,33 +1988,24 @@ def test_sequential_profile_amendments_preserve_prior_changes(
     handler.handle_callback(
         _profile_callback("profile:operation:dietary_constraints:add")
     )
+    handler.llm_client.chat_sync.return_value = _constraint_interpretation(
+        "peanuts"
+    )
     handler.handle_conversational(_profile_text("peanuts"))
+    pending_state = repo.get_conversation_state("user", consistent_read=True)
+    assert pending_state is not None
+    _confirm_pending_profile_rule(handler, pending_state)
 
     after_amendment_a = repo.get_profile("user", consistent_read=True)
     assert after_amendment_a is not None
-    assert after_amendment_a.dietary_constraints == ["peanuts"]
+    assert [
+        entry.source_text for entry in after_amendment_a.dietary_constraints
+    ] == ["peanuts"]
     state_after_amendment_a = repo.get_conversation_state(
         "user", consistent_read=True
     )
     assert state_after_amendment_a is not None
     assert state_after_amendment_a.step is ConversationWorkflowStep.PROFILE_MENU
-
-    handler.handle_callback(_profile_callback("profile:category:goals"))
-    handler.handle_callback(_profile_callback("profile:operation:goals:add"))
-
-    profile_reads: list[dict[str, Any]] = []
-    original_get_item = repo.table.get_item
-
-    def get_item(**kwargs: Any) -> dict[str, Any]:
-        if kwargs.get("Key") == {"PK": "USER#user", "SK": "PROFILE"}:
-            profile_reads.append(kwargs)
-            if kwargs.get("ConsistentRead") is not True:
-                return {"Item": deepcopy(initial_item)}
-        return original_get_item(**kwargs)
-
-    mocker.patch.object(repo.table, "get_item", side_effect=get_item)
-
-    handler.handle_conversational(_profile_text("eat more vegetables"))
 
     final_profile = repo.get_profile("user", consistent_read=True)
     assert final_profile is not None
@@ -1644,25 +2013,25 @@ def test_sequential_profile_amendments_preserve_prior_changes(
     assert final_profile.people_count == initial_profile.people_count
     assert final_profile.family_members == initial_profile.family_members
     assert final_profile.dietary_preferences == (
-        initial_profile.dietary_preferences
+        canonicalize_profile_rule_ids(initial_profile).dietary_preferences
     )
-    assert final_profile.dietary_constraints == ["peanuts"]
-    assert final_profile.goals == ["eat well", "eat more vegetables"]
+    assert [
+        entry.source_text for entry in final_profile.dietary_constraints
+    ] == ["peanuts"]
     final_state = repo.get_conversation_state("user", consistent_read=True)
     assert final_state is not None
     assert final_state.step is ConversationWorkflowStep.PROFILE_MENU
     assert final_state.profile_category is None
     assert final_state.profile_operation is None
-    assert any(read.get("ConsistentRead") is True for read in profile_reads)
-    assert amendment_transaction.call_count == 2
+    assert amendment_transaction.call_count == 1
     profile_puts = [
         item
         for call in transaction.call_args_list
         for item in call.kwargs["TransactItems"]
         if item.get("Put", {}).get("Item", {}).get("SK") == "PROFILE"
     ]
-    assert len(profile_puts) == 2
-    handler.llm_client.chat_sync.assert_not_called()
+    assert len(profile_puts) == 1
+    handler.llm_client.chat_sync.assert_called_once()
 
 
 def test_profile_amendment_full_repository_flow_is_deterministic(
@@ -1672,7 +2041,7 @@ def test_profile_amendment_full_repository_flow_is_deterministic(
     """The complete profile flow writes once and never invokes the LLM."""
     handler, repo = real_profile_handler
     profile = make_profile()
-    repo.save_profile("user", profile)
+    repo.save_profile("user", profile, expected_revision=None)
     transaction = mocker.spy(repo.table.meta.client, "transact_write_items")
 
     handler.handle_command(_command("profile"))
@@ -1685,11 +2054,19 @@ def test_profile_amendment_full_repository_flow_is_deterministic(
     handler.handle_callback(
         _profile_callback("profile:operation:dietary_constraints:add")
     )
+    handler.llm_client.chat_sync.return_value = _constraint_interpretation(
+        "peanuts"
+    )
     handler.handle_conversational(_profile_text("peanuts"))
+    pending_state = repo.get_conversation_state("user", consistent_read=True)
+    assert pending_state is not None
+    _confirm_pending_profile_rule(handler, pending_state)
 
     updated = repo.get_profile("user")
     assert updated is not None
-    assert updated.dietary_constraints == ["peanuts"]
+    assert [entry.source_text for entry in updated.dietary_constraints] == [
+        "peanuts"
+    ]
     menu_state = repo.get_conversation_state("user")
     assert menu_state is not None
     assert menu_state.step is ConversationWorkflowStep.PROFILE_MENU
@@ -1706,9 +2083,6 @@ def test_profile_amendment_full_repository_flow_is_deterministic(
         )
         == 1
     )
-    handler.llm_client.chat_sync.assert_not_called()
-
-    handler.handle_callback(_profile_callback("profile:category:goals"))
     handler.handle_callback(_profile_callback("profile:done"))
     assert repo.get_conversation_state("user") is None
 
@@ -2245,19 +2619,818 @@ def test_plan_preference_is_invoked_once_with_request_context(
         handler.lambda_client.invoke.call_args.kwargs["Payload"]
     )
     assert payload["preference"] == "Indian and pasta"
-    assert payload["requirements"] == [
-        {
-            "id": "r1",
-            "source_text": "Indian and pasta",
-            "foods_any_of": ["Indian", "pasta"],
-            "meal_type": None,
-            "exact_count": 1,
-        }
+    assert payload["requirements"] == []
+    assert len(payload["effective_rules"]) == 1
+    assert payload["effective_rules"][0]["foods_any_of"] == [
+        "Indian",
+        "pasta",
     ]
+    assert payload["effective_rules"][0]["count"] == 1
+    assert payload["effective_rules"][0]["id"].startswith("r-current-")
     assert payload["request_id"] == state.request_id
     assert payload["state_revision"] == 1
     assert payload["attempt"] == 1
     assert payload["repair_feedback"] is None
+
+
+def test_plan_preference_resolves_current_rules_over_stored_rules(
+    handler: BotHandler,
+) -> None:
+    """Current rules override only overlapping stored preference rules."""
+    stored_eggs = DietaryRule(
+        id="stored-eggs",
+        source_text="eggs three times for breakfast",
+        foods_any_of=["eggs"],
+        meal_type=MealType.BREAKFAST,
+        count=3,
+    )
+    stored_tofu = DietaryRule(
+        id="stored-tofu",
+        source_text="tofu once for dinner",
+        foods_any_of=["tofu"],
+        meal_type=MealType.DINNER,
+        count=1,
+    )
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.get_profile.return_value.dietary_preferences = [
+        DietaryPreferenceEntry(
+            id="stored-eggs",
+            source_text=stored_eggs.source_text,
+            rule=stored_eggs,
+        ),
+        DietaryPreferenceEntry(
+            id="stored-tofu",
+            source_text=stored_tofu.source_text,
+            rule=stored_tofu,
+        ),
+    ]
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": "current_plan_preference",
+            "requirements": [
+                {
+                    "id": "current-eggs",
+                    "source_text": "eggs at most twice for breakfast",
+                    "foods_any_of": ["eggs"],
+                    "meal_type": "breakfast",
+                    "operator": "at_most",
+                    "count": 2,
+                    "strength": "strict",
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="eggs at most twice for breakfast",
+            raw_update={"update_id": 56},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    stored_by_source = {
+        rule.source_text: rule.id for rule in saved.stored_rules
+    }
+    current_by_source = {
+        rule.source_text: rule.id for rule in saved.current_rules
+    }
+    effective_by_source = {
+        rule.source_text: rule.id for rule in saved.effective_rules
+    }
+    assert set(stored_by_source) == {
+        "eggs three times for breakfast",
+        "tofu once for dinner",
+    }
+    assert set(current_by_source) == {"eggs at most twice for breakfast"}
+    assert set(effective_by_source) == {
+        "eggs at most twice for breakfast",
+        "tofu once for dinner",
+    }
+    assert all(
+        identifier.startswith("r-stored-")
+        for identifier in stored_by_source.values()
+    )
+    assert all(
+        identifier.startswith("r-current-")
+        for identifier in current_by_source.values()
+    )
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert {rule["source_text"] for rule in payload["effective_rules"]} == set(
+        effective_by_source
+    )
+    assert {rule["id"] for rule in payload["effective_rules"]} == set(
+        effective_by_source.values()
+    )
+    assert payload["constraint_rules"] == []
+
+
+def test_partial_scope_maximum_preserves_ids_through_retry_boundary(
+    handler: BotHandler,
+) -> None:
+    """A retained maximum keeps both identities across every boundary."""
+    stored_rule = DietaryRule(
+        id="stored-egg-weekdays",
+        source_text="eggs on weekdays for breakfast",
+        foods_any_of=["egg"],
+        meal_type=MealType.BREAKFAST,
+        weekdays=[
+            Weekday.MONDAY,
+            Weekday.TUESDAY,
+            Weekday.WEDNESDAY,
+            Weekday.THURSDAY,
+            Weekday.FRIDAY,
+        ],
+        count=1,
+    )
+    profile = make_profile().model_copy(
+        update={
+            "dietary_preferences": [
+                DietaryPreferenceEntry(
+                    id="stored-egg-weekdays",
+                    source_text=stored_rule.source_text,
+                    rule=stored_rule,
+                )
+            ]
+        }
+    )
+    handler.repo.get_profile.return_value = profile
+    handler.repo.get_conversation_state.return_value = handler._new_plan_state()
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": "current_plan_preference",
+            "requirements": [
+                {
+                    "id": "current-wednesday-maximum",
+                    "source_text": "eggs at most once on Wednesday for "
+                    "breakfast",
+                    "foods_any_of": ["egg"],
+                    "meal_type": "breakfast",
+                    "weekdays": ["wednesday"],
+                    "operator": "at_most",
+                    "count": 1,
+                    "strength": "strict",
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="eggs at most once on Wednesday for breakfast",
+            raw_update={"update_id": 560},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    first_payload = json.loads(
+        handler.lambda_client.invoke.call_args_list[0].kwargs["Payload"]
+    )
+    first_context = PlanGenerationContext.model_validate(first_payload)
+    expected_ids = [rule.id for rule in saved.effective_rules]
+    assert len(expected_ids) == 2
+    assert len(expected_ids) == len(set(expected_ids))
+    assert expected_ids == [rule.id for rule in first_context.effective_rules]
+    assert expected_ids == sorted(expected_ids)
+    assert any(
+        rule.operator is RuleOperator.AT_MOST
+        and rule.weekdays == [Weekday.WEDNESDAY]
+        for rule in saved.effective_rules
+    )
+    assert any(
+        rule.operator is RuleOperator.EXACTLY
+        and rule.weekdays
+        == [
+            Weekday.MONDAY,
+            Weekday.TUESDAY,
+            Weekday.WEDNESDAY,
+            Weekday.THURSDAY,
+            Weekday.FRIDAY,
+        ]
+        for rule in saved.effective_rules
+    )
+    assert [rule["id"] for rule in first_payload["effective_rules"]] == (
+        expected_ids
+    )
+    assert len(first_payload["effective_rules"]) == 2
+    assert (
+        "Working on your weekly meal plan."
+        in (handler.telegram_api.send_message.call_args.args[1])
+    )
+
+    retry_state = saved.model_copy(
+        update={
+            "step": ConversationWorkflowStep.RETRY_READY,
+            "revision": saved.revision + 1,
+        }
+    )
+    handler.repo.get_conversation_state.return_value = retry_state
+    handler.handle_command(_command("plan"))
+
+    retry_payload = json.loads(
+        handler.lambda_client.invoke.call_args_list[1].kwargs["Payload"]
+    )
+    retry_context = PlanGenerationContext.model_validate(retry_payload)
+    assert [rule.id for rule in retry_context.effective_rules] == expected_ids
+    assert retry_payload["effective_rules"] == first_payload["effective_rules"]
+
+
+def test_snapshot_transfers_ownership_only_when_maximum_is_absorbed(
+    handler: BotHandler,
+) -> None:
+    """Capping ownership changes only when the current rule disappears."""
+    stored = DietaryRule(
+        id="stored-eggs",
+        source_text="eggs every day",
+        foods_any_of=["egg"],
+        count=7,
+    )
+    absorbed_current = DietaryRule(
+        id="current-maximum",
+        source_text="eggs at most three times",
+        foods_any_of=["egg"],
+        operator=RuleOperator.AT_MOST,
+        count=3,
+    )
+    capped = stored.model_copy(update={"count": 3})
+
+    absorbed = handler._snapshot_effective_rules(
+        [capped], [stored], [absorbed_current]
+    )
+    assert [(rule.id, rule.count) for rule in absorbed] == [
+        (absorbed_current.id, 3)
+    ]
+
+    unrelated_current = absorbed_current.model_copy(
+        update={"id": "current-tofu", "foods_any_of": ["tofu"]}
+    )
+    unrelated = handler._snapshot_effective_rules(
+        [stored, unrelated_current], [stored], [unrelated_current]
+    )
+    assert [rule.id for rule in unrelated] == [
+        unrelated_current.id,
+        stored.id,
+    ]
+
+
+def test_duplicate_effective_ids_are_clarified_before_dispatch(
+    handler: BotHandler, mocker: Any
+) -> None:
+    """An impossible duplicate snapshot cannot enter generation."""
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.get_conversation_state.return_value = handler._new_plan_state()
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [
+                {
+                    "id": "current-eggs",
+                    "source_text": "eggs once",
+                    "foods_any_of": ["egg"],
+                    "operator": "exactly",
+                    "count": 1,
+                    "strength": "strict",
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+    duplicate = DietaryRule(
+        id="duplicate-rule",
+        source_text="eggs once",
+        foods_any_of=["egg"],
+        count=1,
+    )
+    mocker.patch.object(
+        handler,
+        "_snapshot_effective_rules",
+        return_value=[duplicate, duplicate.model_copy(update={"count": 1})],
+    )
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="eggs once",
+            raw_update={"update_id": 561},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert saved.effective_rules == []
+    handler.lambda_client.invoke.assert_not_called()
+    assert "combine" in handler.telegram_api.send_message.call_args.args[1]
+
+
+def test_structured_maximum_stays_out_of_legacy_requirements(
+    handler: BotHandler,
+) -> None:
+    """A generalized maximum is dispatched only in the structured channel."""
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.get_conversation_state.return_value = handler._new_plan_state()
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": "current_plan_preference",
+            "requirements": [
+                {
+                    "id": "r1",
+                    "source_text": "eggs at most twice",
+                    "foods_any_of": ["eggs"],
+                    "operator": "at_most",
+                    "count": 2,
+                    "strength": "strict",
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="eggs at most twice",
+            raw_update={"update_id": 601},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.requirements == []
+    assert len(saved.effective_rules) == 1
+    assert saved.effective_rules[0].operator is RuleOperator.AT_MOST
+    assert saved.effective_rules[0].count == 2
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["requirements"] == []
+    assert payload["effective_rules"][0]["operator"] == "at_most"
+    assert payload["effective_rules"][0]["count"] == 2
+
+
+def test_stored_structured_rule_dispatches_without_current_preference(
+    handler: BotHandler,
+) -> None:
+    """Stored structured rules remain active for a no-preference request."""
+    stored_rule = DietaryRule(
+        id="stored-eggs",
+        source_text="eggs at most twice",
+        foods_any_of=["eggs"],
+        operator=RuleOperator.AT_MOST,
+        count=2,
+        strength=RuleStrength.STRICT,
+    )
+    profile = make_profile()
+    profile.dietary_preferences = [
+        DietaryPreferenceEntry(
+            id="stored-eggs",
+            source_text=stored_rule.source_text,
+            rule=stored_rule,
+        )
+    ]
+    handler.repo.get_profile.return_value = profile
+    handler.repo.get_conversation_state.return_value = handler._new_plan_state()
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="no preference",
+            raw_update={"update_id": 602},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.preference is None
+    assert saved.requirements == []
+    assert [rule.operator for rule in saved.effective_rules] == [
+        RuleOperator.AT_MOST
+    ]
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["preference"] is None
+    assert payload["requirements"] == []
+    assert payload["effective_rules"][0]["id"].startswith("r-stored-")
+
+
+def test_legacy_stored_preference_is_interpreted_before_plan_dispatch(
+    handler: BotHandler,
+) -> None:
+    """Raw stored wording becomes a stable typed planner rule."""
+    raw_preference = DietaryPreferenceEntry(
+        id="legacy-preference",
+        source_text="eggs for breakfast",
+        rule=None,
+    )
+    profile = make_profile().model_copy(
+        update={"dietary_preferences": [raw_preference]}
+    )
+    handler.repo.get_profile.return_value = profile
+    handler.repo.get_conversation_state.return_value = handler._new_plan_state()
+    handler.llm_client.chat_sync.return_value = _preference_interpretation(
+        raw_preference.source_text
+    )
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="no preference",
+            raw_update={"update_id": 603},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert len(saved.stored_rules) == 1
+    assert saved.stored_rules[0].source_text == raw_preference.source_text
+    assert saved.stored_rules[0].id.startswith("r-stored-")
+    assert saved.effective_rules == saved.stored_rules
+    handler.lambda_client.invoke.assert_called_once()
+    handler.llm_client.chat_sync.assert_called_once()
+
+
+def test_onboarding_raw_preference_is_interpreted_before_plan_dispatch(
+    handler: BotHandler,
+) -> None:
+    """Onboarding wording is typed before it enters plan resolution."""
+    result = handler._update_profile(
+        "user",
+        {
+            "name": "Alex",
+            "people_count": 2,
+            "family_members": [
+                {"name": "Alex", "calorie_target": 2000},
+                {"name": "Sam", "calorie_target": 1800},
+            ],
+            "dietary_constraints": [],
+            "dietary_preferences": ["eggs for breakfast"],
+        },
+        None,
+    )
+    assert result.success
+    onboarding_profile = handler.repo.save_profile.call_args.args[1]
+    assert onboarding_profile.dietary_preferences[0].rule is None
+    handler.repo.get_profile.return_value = onboarding_profile
+    handler.repo.get_conversation_state.return_value = handler._new_plan_state()
+    handler.llm_client.chat_sync.return_value = _preference_interpretation(
+        "eggs for breakfast"
+    )
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="no preference",
+            raw_update={"update_id": 606},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.stored_rules[0].source_text == "eggs for breakfast"
+    assert saved.stored_rules[0].id.startswith("r-stored-")
+    handler.lambda_client.invoke.assert_called_once()
+
+
+def test_uninterpretable_legacy_stored_preference_blocks_plan_dispatch(
+    handler: BotHandler,
+) -> None:
+    """Ambiguous stored wording is clarified without planner invocation."""
+    profile = make_profile().model_copy(
+        update={
+            "dietary_preferences": [
+                DietaryPreferenceEntry(
+                    id="legacy-preference",
+                    source_text="make meals healthy",
+                    rule=None,
+                )
+            ]
+        }
+    )
+    handler.repo.get_profile.return_value = profile
+    handler.repo.get_conversation_state.return_value = handler._new_plan_state()
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": "stored_preference",
+            "requirements": [],
+            "exclusions": [],
+            "clarification": "Which foods and counts should I use?",
+            "unparsed_text": ["make meals healthy"],
+        }
+    )
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="no preference",
+            raw_update={"update_id": 604},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    handler.lambda_client.invoke.assert_not_called()
+    assert (
+        "foods and counts"
+        in (handler.telegram_api.send_message.call_args.args[1])
+    )
+
+
+def test_legacy_stored_interpretation_is_reused_for_plan_retry(
+    handler: BotHandler,
+) -> None:
+    """A retry reuses the typed stored snapshot without reinterpretation."""
+    raw_preference = DietaryPreferenceEntry(
+        id="legacy-preference",
+        source_text="eggs for breakfast",
+        rule=None,
+    )
+    handler.repo.get_profile.return_value = make_profile().model_copy(
+        update={"dietary_preferences": [raw_preference]}
+    )
+    initial_state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = initial_state
+    handler.llm_client.chat_sync.return_value = _preference_interpretation(
+        raw_preference.source_text
+    )
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="no preference",
+            raw_update={"update_id": 605},
+        )
+    )
+    pending = handler.repo.transition_conversation_state.call_args.args[1]
+    retry_state = pending.model_copy(
+        update={"step": ConversationWorkflowStep.RETRY_READY}
+    )
+    handler.repo.get_conversation_state.return_value = retry_state
+
+    handler.handle_command(_command("plan"))
+
+    handler.llm_client.chat_sync.assert_called_once()
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["stored_rules"][0]["id"] == pending.stored_rules[0].id
+    assert payload["effective_rules"][0]["id"] == pending.effective_rules[0].id
+
+
+def test_current_plan_rule_conflicting_with_constraint_is_rejected(
+    handler: BotHandler,
+) -> None:
+    """A conflicting current rule never reaches planner dispatch."""
+    profile = make_profile()
+    profile.dietary_constraints = [
+        ConstraintEntry(
+            id="c1", source_text="no peanuts", forbidden_terms=["peanuts"]
+        )
+    ]
+    handler.repo.get_profile.return_value = profile
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": "current_plan_preference",
+            "requirements": [
+                {
+                    "id": "r1",
+                    "source_text": "peanut butter once",
+                    "foods_any_of": ["peanut butter"],
+                    "operator": "exactly",
+                    "count": 1,
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="peanut butter once",
+            raw_update={"update_id": 57},
+        )
+    )
+
+    handler.lambda_client.invoke.assert_not_called()
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert saved.current_rules == []
+    assert "constraint" in (
+        handler.telegram_api.send_message.call_args.args[1].lower()
+    )
+
+
+@pytest.mark.parametrize(
+    "constraint_text",
+    ["gluten-free"],
+)
+def test_legacy_semantic_constraint_dispatches_canonical_terms(
+    handler: BotHandler, constraint_text: str
+) -> None:
+    """Recognized legacy phrases reach the planner as canonical terms."""
+    profile_data = make_profile().model_dump(mode="json")
+    profile_data["dietary_constraints"] = [constraint_text]
+    profile = UserProfile.model_validate(profile_data)
+    handler.repo.get_profile.return_value = profile
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="no preference",
+            raw_update={"update_id": 58},
+        )
+    )
+
+    handler.lambda_client.invoke.assert_called_once()
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["constraint_rules"][0]["forbidden_terms"]
+    assert (
+        constraint_text not in payload["constraint_rules"][0]["forbidden_terms"]
+    )
+
+
+@pytest.mark.parametrize(
+    "animal_derived_food",
+    ["cheese", "butter", "shellfish", "gelatin", "honey"],
+)
+def test_vegan_legacy_constraint_clarifies_before_generation(
+    handler: BotHandler, animal_derived_food: str
+) -> None:
+    """Incomplete vegan semantics never dispatch or publish a plan."""
+    profile_data = make_profile().model_dump(mode="json")
+    profile_data["dietary_constraints"] = ["vegan"]
+    profile = UserProfile.model_validate(profile_data)
+    handler.repo.get_profile.return_value = profile
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="no preference",
+            raw_update={"update_id": 61},
+        )
+    )
+
+    handler.lambda_client.invoke.assert_not_called()
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert saved.constraint_rules[0].uninterpretable
+    assert "safely matched" in (
+        handler.telegram_api.send_message.call_args.args[1].lower()
+    )
+
+
+def test_unknown_legacy_constraint_clarifies_without_planner_dispatch(
+    handler: BotHandler,
+) -> None:
+    """Unknown saved safety prose stops planning with bounded clarification."""
+    profile_data = make_profile().model_dump(mode="json")
+    profile_data["dietary_constraints"] = [
+        "I react badly to mystery foods",
+    ]
+    profile = UserProfile.model_validate(profile_data)
+    handler.repo.get_profile.return_value = profile
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="no preference",
+            raw_update={"update_id": 59},
+        )
+    )
+
+    handler.lambda_client.invoke.assert_not_called()
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert "safely matched" in (
+        handler.telegram_api.send_message.call_args.args[1].lower()
+    )
+
+
+@pytest.mark.parametrize(
+    "constraint_text",
+    ["vegetarian", "halal", "kosher", "low sodium"],
+)
+def test_unknown_short_legacy_constraint_clarifies_before_generation(
+    handler: BotHandler, constraint_text: str
+) -> None:
+    """Unregistered short labels never reach the planner."""
+    profile_data = make_profile().model_dump(mode="json")
+    profile_data["dietary_constraints"] = [constraint_text]
+    profile = UserProfile.model_validate(profile_data)
+    handler.repo.get_profile.return_value = profile
+    handler.repo.get_conversation_state.return_value = handler._new_plan_state()
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="no preference",
+            raw_update={"update_id": 60},
+        )
+    )
+
+    handler.lambda_client.invoke.assert_not_called()
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert saved.constraint_rules[0].uninterpretable
+    assert "safely matched" in (
+        handler.telegram_api.send_message.call_args.args[1].lower()
+    )
+
+
+def test_plan_retry_reuses_effective_rule_snapshot_without_reinterpretation(
+    handler: BotHandler,
+) -> None:
+    """Retry events reuse the saved effective snapshot and raw wording."""
+    stored = DietaryRule(
+        id="stored-1",
+        source_text="eggs once",
+        foods_any_of=["eggs"],
+        count=1,
+    )
+    effective = DietaryRule(
+        id="current-1",
+        source_text="eggs twice",
+        foods_any_of=["eggs"],
+        count=2,
+    )
+    constraint = ConstraintEntry(
+        id="constraint-1", source_text="no peanuts", forbidden_terms=["peanuts"]
+    )
+    state = handler._new_plan_state().model_copy(
+        update={
+            "step": ConversationWorkflowStep.RETRY_READY,
+            "preference": "eggs twice",
+            "stored_rules": [stored],
+            "current_rules": [effective],
+            "effective_rules": [effective],
+            "constraint_rules": [constraint],
+            "revision": 4,
+        }
+    )
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_command(_command("plan"))
+
+    handler.llm_client.chat_sync.assert_not_called()
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["preference"] == "eggs twice"
+    assert payload["stored_rules"][0]["id"] == "stored-1"
+    assert payload["current_rules"][0]["id"] == "current-1"
+    assert payload["effective_rules"][0]["id"] == "current-1"
+    assert payload["constraint_rules"][0]["id"] == "constraint-1"
 
 
 def test_plan_preference_persists_interpreted_requirements_for_retry(
@@ -2293,11 +3466,13 @@ def test_plan_preference_persists_interpreted_requirements_for_retry(
     )
 
     saved = handler.repo.transition_conversation_state.call_args.args[1]
-    assert saved.requirements[0].id == "r1"
+    assert saved.requirements == []
+    assert saved.effective_rules[0].id.startswith("r-current-")
     payload = json.loads(
         handler.lambda_client.invoke.call_args.kwargs["Payload"]
     )
-    assert payload["requirements"][0]["exact_count"] == 3
+    assert payload["requirements"] == []
+    assert payload["effective_rules"][0]["count"] == 3
 
 
 def test_no_preference_plan_dispatches_without_interpretation_rules(
@@ -2433,7 +3608,8 @@ def test_plan_preference_requirement_count_boundary(
     assert saved.preference == "many food rules"
     if requirement_count == 20:
         assert saved.step is ConversationWorkflowStep.GENERATING
-        assert len(saved.requirements) == 20
+        assert saved.requirements == []
+        assert len(saved.effective_rules) == 20
         handler.lambda_client.invoke.assert_called_once()
         assert handler.telegram_api.send_message.call_args.args[1] == (
             "Working on your weekly meal plan."
@@ -2481,6 +3657,57 @@ def test_plan_preference_saves_focused_clarification_without_generation(
     handler.lambda_client.invoke.assert_not_called()
     message = handler.telegram_api.send_message.call_args.args[1]
     assert "How many times" in message
+
+
+@pytest.mark.parametrize("operator", ["exactly", "at_least"])
+def test_impossible_strict_weekday_rule_clarifies_before_generation(
+    handler: BotHandler,
+    operator: str,
+) -> None:
+    """Impossible per-day counts remain retryable and never dispatch."""
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [
+                {
+                    "id": "r1",
+                    "source_text": (
+                        "eggs twice for breakfast on Monday and Wednesday"
+                    ),
+                    "foods_any_of": ["eggs"],
+                    "meal_type": "breakfast",
+                    "weekdays": ["monday", "wednesday"],
+                    "operator": operator,
+                    "count": 2,
+                    "strength": "strict",
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+    state = handler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        RouteResult(
+            route_type=RouteType.CONVERSATIONAL,
+            chat_id=1,
+            user_id="user",
+            text="eggs twice for breakfast on Monday and Wednesday",
+            raw_update={"update_id": 116 + (operator == "at_least")},
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert saved.preference is not None
+    assert handler.lambda_client.invoke.call_count == 0
+    assert handler.telegram_api.send_message.call_count == 1
+    assert (
+        "malformed"
+        in handler.telegram_api.send_message.call_args.args[1].lower()
+    )
 
 
 def test_oversized_interpretation_stays_bounded_before_telegram(
@@ -3079,7 +4306,79 @@ def test_profile_onboarding_accumulates_then_saves(handler: BotHandler) -> None:
     assert completed.success
     saved = handler.repo.save_profile.call_args.args[1]
     assert len(saved.family_members) == 2
+    assert handler.repo.save_profile_draft.call_count == 1
     handler.repo.delete_profile_draft.assert_called_once_with("user")
+
+
+def test_existing_profile_update_carries_revision_through_real_repository(
+    real_profile_handler: tuple[BotHandler, DynamoRepository],
+) -> None:
+    """An ordinary update keeps the observed revision outside its draft."""
+    handler, repo = real_profile_handler
+    initial = make_profile()
+    assert repo.save_profile("user", initial, expected_revision=None)
+    observed = repo.get_profile("user", consistent_read=True)
+    assert observed is not None
+    assert repo.save_profile(
+        "user",
+        observed.model_copy(update={"name": "Before"}),
+        expected_revision=observed.profile_revision,
+    )
+    observed = repo.get_profile("user", consistent_read=True)
+    assert observed is not None
+    assert observed.profile_revision == 1
+
+    result = handler._update_profile(
+        "user",
+        {"name": "After"},
+        observed,
+    )
+
+    assert result.success
+    saved = repo.get_profile("user", consistent_read=True)
+    assert saved is not None
+    assert saved.name == "After"
+    assert saved.family_members == observed.family_members
+    assert saved.profile_revision == 2
+
+
+def test_persisted_profile_draft_completion_carries_revision(
+    real_profile_handler: tuple[BotHandler, DynamoRepository],
+) -> None:
+    """Completing a persisted draft does not reset profile concurrency."""
+    handler, repo = real_profile_handler
+    initial = make_profile()
+    assert repo.save_profile("user", initial, expected_revision=None)
+    observed = repo.get_profile("user", consistent_read=True)
+    assert observed is not None
+    assert repo.save_profile(
+        "user",
+        observed.model_copy(update={"name": "Before"}),
+        expected_revision=observed.profile_revision,
+    )
+    observed = repo.get_profile("user", consistent_read=True)
+    assert observed is not None
+    draft = ProfileUpdateEntities(
+        name="After",
+        people_count=observed.people_count,
+        family_members=observed.family_members,
+    )
+    repo.save_profile_draft("user", draft)
+
+    result = handler._update_profile(
+        "user",
+        {
+            "dietary_constraints": [],
+            "dietary_preferences": [],
+        },
+        observed,
+    )
+
+    assert result.success
+    saved = repo.get_profile("user", consistent_read=True)
+    assert saved is not None
+    assert saved.name == "After"
+    assert saved.profile_revision == 2
 
 
 def test_profile_onboarding_two_turn_no_value_answers_complete_profile(
@@ -3133,7 +4432,7 @@ def test_profile_onboarding_two_turn_no_value_answers_complete_profile(
     ] == [2200, 1800, 2000]
     assert saved_profile.dietary_constraints == []
     assert saved_profile.dietary_preferences == []
-    assert saved_profile.goals == ["eat well"]
+    assert saved_profile.dietary_preferences == []
     handler.repo.delete_profile_draft.assert_called_once_with("user")
 
 
@@ -3268,6 +4567,130 @@ def test_incomplete_complete_looking_profile_is_saved_as_draft(
     assert result.message and "household member name" in result.message
     handler.repo.save_profile_draft.assert_called_once()
     handler.repo.save_profile.assert_not_called()
+
+
+def test_profile_save_conflict_preserves_retryable_onboarding_draft(
+    handler: BotHandler,
+) -> None:
+    """A stale ordinary save leaves the completed draft available to retry."""
+    handler.repo.get_profile_draft.return_value = None
+    handler.repo.save_profile.return_value = False
+    entities = {
+        "name": "Alex",
+        "people_count": 1,
+        "family_members": [
+            {"name": "Alex", "calorie_target": 2000},
+        ],
+        "dietary_constraints": [],
+        "dietary_preferences": [],
+        "goals": [],
+    }
+
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.UPDATE_PROFILE,
+        entities,
+        None,
+    )
+
+    assert not result.success
+    assert result.message == (
+        "That profile is stale. Your latest profile was kept; please try again."
+    )
+    handler.repo.save_profile.assert_called_once()
+    handler.repo.save_profile_draft.assert_called_once()
+    saved_draft = handler.repo.save_profile_draft.call_args.args[1]
+    assert saved_draft.name == "Alex"
+    assert saved_draft.people_count == 1
+    assert saved_draft.family_members is not None
+    assert saved_draft.model_dump().get("profile_revision") is None
+    handler.repo.delete_profile_draft.assert_not_called()
+
+
+def test_profile_save_conflict_replaces_existing_draft_with_latest_merge(
+    handler: BotHandler,
+) -> None:
+    """A conflict stores the complete draft produced by the latest turn."""
+    existing = make_profile().model_copy(update={"profile_revision": 3})
+    persisted_draft = ProfileUpdateEntities(
+        name="Earlier household",
+        people_count=2,
+        family_members=[
+            FamilyMember(name="Alex", calorie_target=1900),
+            FamilyMember(name="Sam", calorie_target=1700),
+        ],
+    )
+    handler.repo.get_profile_draft.return_value = persisted_draft
+    handler.repo.save_profile.return_value = False
+
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.UPDATE_PROFILE,
+        {
+            "name": "Latest household",
+            "family_members": [
+                {"name": "Alex", "calorie_target": 2100},
+                {"name": "Sam", "calorie_target": 1800},
+            ],
+            "dietary_constraints": [],
+            "dietary_preferences": [],
+        },
+        existing,
+    )
+
+    assert not result.success
+    assert result.message == (
+        "That profile is stale. Your latest profile was kept; please try again."
+    )
+    handler.repo.save_profile.assert_called_once()
+    handler.repo.save_profile_draft.assert_called_once()
+    assert handler.repo.save_profile_draft.call_args.args[0] == "user"
+    saved_draft = handler.repo.save_profile_draft.call_args.args[1]
+    assert saved_draft.name == "Latest household"
+    assert saved_draft.people_count == 2
+    assert saved_draft.family_members == [
+        FamilyMember(name="Alex", calorie_target=2100),
+        FamilyMember(name="Sam", calorie_target=1800),
+    ]
+    assert saved_draft.dietary_constraints == []
+    assert saved_draft.dietary_preferences == []
+    assert "profile_revision" not in saved_draft.model_dump()
+    handler.repo.delete_profile_draft.assert_not_called()
+
+
+def test_incomplete_merged_profile_remains_a_draft(
+    handler: BotHandler,
+) -> None:
+    """An incomplete latest merge keeps accumulated editable fields."""
+    persisted_draft = ProfileUpdateEntities(
+        name="Earlier household",
+        people_count=2,
+        family_members=[
+            FamilyMember(name="Alex", calorie_target=1900),
+        ],
+    )
+    handler.repo.get_profile_draft.return_value = persisted_draft
+
+    result = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.UPDATE_PROFILE,
+        {"name": "Latest household"},
+        None,
+    )
+
+    assert result.success
+    assert result.message and "dietary constraints" in result.message
+    handler.repo.save_profile.assert_not_called()
+    handler.repo.save_profile_draft.assert_called_once()
+    saved_draft = handler.repo.save_profile_draft.call_args.args[1]
+    assert saved_draft.name == "Latest household"
+    assert saved_draft.people_count == 2
+    assert saved_draft.family_members == persisted_draft.family_members
+    assert saved_draft.dietary_constraints is None
+    assert saved_draft.dietary_preferences is None
 
 
 def test_existing_profile_size_change_accumulates_replacement_members(
@@ -3747,12 +5170,15 @@ def test_existing_profile_same_size_update_preserves_members(
         "Alex",
         "Sam",
     ]
-    assert saved.dietary_constraints == ["peanuts"]
+    assert [entry.source_text for entry in saved.dietary_constraints] == [
+        "peanuts"
+    ]
 
 
-def test_profile_onboarding_legacy_constraints_are_saved_canonically(
+def test_profile_onboarding_rejects_incomplete_vegan_constraint(
     handler: BotHandler,
 ) -> None:
+    """Onboarding does not save an incompletely represented vegan rule."""
     handler.repo.get_profile_draft.return_value = ProfileUpdateEntities()
     result = handler._apply_intent_metadata(
         "user",
@@ -3770,11 +5196,10 @@ def test_profile_onboarding_legacy_constraints_are_saved_canonically(
         None,
     )
 
-    assert result.success
-    saved = handler.repo.save_profile.call_args.args[1]
-    assert saved.dietary_constraints == ["Peanuts", "Vegan"]
-    assert "allergies" not in saved.model_dump()
-    assert "restrictions" not in saved.model_dump()
+    assert not result.success
+    assert result.message is not None
+    assert "safely interpret" in result.message
+    handler.repo.save_profile.assert_not_called()
 
 
 def test_confirm_and_edit_refresh_exact_week(handler: BotHandler) -> None:

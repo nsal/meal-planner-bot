@@ -2,10 +2,13 @@
 
 import json
 from datetime import date
-from typing import Optional
+from typing import Literal, Optional, Sequence
 
 from meal_planner.models.schemas import (
+    ConstraintEntry,
     ConversationState,
+    DietaryPreferenceEntry,
+    DietaryRule,
     FamilyMember,
     MealLogEntry,
     MealOutcome,
@@ -14,6 +17,10 @@ from meal_planner.models.schemas import (
     UserProfile,
     WeeklyPlan,
 )
+
+InterpretationMode = Literal[
+    "constraint", "stored_preference", "current_plan_preference"
+]
 
 
 def _render_member_targets(
@@ -36,6 +43,55 @@ def _render_member_targets(
     )
 
 
+def _render_constraint_entries(entries: list[ConstraintEntry]) -> str:
+    """Render saved constraint wording without exposing storage details."""
+    return ", ".join(entry.source_text for entry in entries) or "None"
+
+
+def _render_preference_entries(
+    entries: list[DietaryPreferenceEntry],
+) -> str:
+    """Render saved preference wording without losing raw user language."""
+    return ", ".join(entry.source_text for entry in entries) or "None"
+
+
+def _render_rule(rule: DietaryRule | PreferenceRequirement) -> str:
+    """Render one structured or legacy rule with bounded detail."""
+    scope = rule.meal_type.value if rule.meal_type else "any meal"
+    if isinstance(rule, DietaryRule):
+        weekdays = ", ".join(str(day.value) for day in rule.weekdays)
+        return (
+            f"- {rule.id}: source_text: {rule.source_text}; "
+            f"foods_any_of: {', '.join(rule.foods_any_of)}; "
+            f"meal_type: {scope}; operator: {rule.operator.value}; "
+            f"count: {rule.count}; strength: {rule.strength.value}; "
+            f"weekdays: {weekdays or 'all days'}"
+        )
+    return (
+        f"- {rule.id}: source_text: {rule.source_text}; "
+        f"foods_any_of: {', '.join(rule.foods_any_of)}; "
+        f"meal_type: {scope}; exact_count: {rule.exact_count}"
+    )
+
+
+def _render_rules(
+    rules: Sequence[DietaryRule | PreferenceRequirement],
+) -> str:
+    """Render rules in stable order, or a bounded empty marker."""
+    return "\n".join(_render_rule(rule) for rule in rules) or "None."
+
+
+def _render_constraint_rules(entries: Sequence[ConstraintEntry]) -> str:
+    """Render independent constraints for the planner prompt."""
+    if not entries:
+        return "None."
+    return "\n".join(
+        f"- {entry.id}: {entry.source_text}; forbidden_terms: "
+        f"{', '.join(entry.forbidden_terms)}"
+        for entry in entries
+    )
+
+
 def _profile_text(profile: UserProfile | None) -> str:
     """Render the trusted household profile for planner prompts."""
     if profile is None:
@@ -52,10 +108,9 @@ def _profile_text(profile: UserProfile | None) -> str:
         f"People Count: {profile.people_count}\n"
         f"Family Members: {members}\n"
         f"Dietary constraints: "
-        f"{', '.join(profile.dietary_constraints) or 'None'}\n"
+        f"{_render_constraint_entries(profile.dietary_constraints)}\n"
         f"Dietary Preferences: "
-        f"{', '.join(profile.dietary_preferences) or 'None'}\n"
-        f"Goals: {', '.join(profile.goals) or 'None'}"
+        f"{_render_preference_entries(profile.dietary_preferences)}"
     )
 
 
@@ -74,18 +129,16 @@ def build_conversational_prompt(
             ", ".join(_render_member_targets(m) for m in profile.family_members)
             or "None specified"
         )
-        dietary_str = ", ".join(profile.dietary_preferences) or "None"
-        dietary_constraints_str = (
-            ", ".join(profile.dietary_constraints) or "None"
+        dietary_str = _render_preference_entries(profile.dietary_preferences)
+        dietary_constraints_str = _render_constraint_entries(
+            profile.dietary_constraints
         )
-        goals_str = ", ".join(profile.goals) or "None"
         profile_text = (
             f"Family Name: {profile.name}\n"
             f"People Count: {profile.people_count}\n"
             f"Family Members: {members_str}\n"
             f"Dietary constraints: {dietary_constraints_str}\n"
-            f"Dietary Preferences: {dietary_str}\n"
-            f"Goals: {goals_str}"
+            f"Dietary Preferences: {dietary_str}"
         )
 
     pending_profile_text = "No pending profile updates."
@@ -97,7 +150,6 @@ def build_conversational_prompt(
             "family_members",
             "dietary_constraints",
             "dietary_preferences",
-            "goals",
         )
         for field in pending_fields:
             value = getattr(profile_draft, field)
@@ -115,6 +167,10 @@ def build_conversational_prompt(
                     )
                     or "None specified"
                 )
+            elif field == "dietary_constraints":
+                rendered = _render_constraint_entries(value)
+            elif field == "dietary_preferences":
+                rendered = _render_preference_entries(value)
             elif isinstance(value, list):
                 rendered = ", ".join(value) or "None specified"
             else:
@@ -185,7 +241,7 @@ def build_conversational_prompt(
         "fields, and never invent, infer, or default their values. Protein "
         "and fibre targets are optional and must never be treated as "
         "profile completion or planning prerequisites. Also extract "
-        "dietary_constraints, dietary_preferences, and goals. Never use "
+        "dietary_constraints and dietary_preferences. Never use "
         "an individual member's name as the family name unless the user "
         "explicitly provides it. Meal dates must use "
         "YYYY-MM-DD. Today's date is "
@@ -212,7 +268,12 @@ def build_plan_prompt(
     previous_plan: Optional[WeeklyPlan] = None,
     week_start: str = "2026-08-10",
     preference: str | None = None,
-    requirements: list[PreferenceRequirement] | None = None,
+    requirements: Sequence[PreferenceRequirement | DietaryRule] | None = None,
+    stored_rules: Sequence[DietaryRule] | None = None,
+    current_rules: Sequence[DietaryRule] | None = None,
+    effective_rules: Sequence[DietaryRule] | None = None,
+    constraint_rules: Sequence[ConstraintEntry] | None = None,
+    constraints: Sequence[ConstraintEntry] | None = None,
     repair_feedback: str | None = None,
 ) -> str:
     """Build 7-day meal plan generation prompt."""
@@ -225,18 +286,16 @@ def build_plan_prompt(
             )
             or f"1 person ({profile.name})"
         )
-        dietary_str = ", ".join(profile.dietary_preferences) or "None"
-        dietary_constraints_str = (
-            ", ".join(profile.dietary_constraints) or "None"
+        dietary_str = _render_preference_entries(profile.dietary_preferences)
+        dietary_constraints_str = _render_constraint_entries(
+            profile.dietary_constraints
         )
-        goals_str = ", ".join(profile.goals) or "None"
         profile_text = (
             f"Family Name: {profile.name}\n"
             f"Total People Count: {profile.people_count}\n"
             f"Family Members & Calorie Targets: {members_str}\n"
             f"Dietary constraints: {dietary_constraints_str}\n"
-            f"Dietary Preferences: {dietary_str}\n"
-            f"Goals: {goals_str}"
+            f"Dietary Preferences: {dietary_str}"
         )
 
     history_text = "None."
@@ -266,23 +325,24 @@ def build_plan_prompt(
             f"Swapped: {', '.join(swapped_meals) or 'None'}"
         )
 
-    requirement_text = "No interpreted measurable requirements."
-    if requirements:
-        requirement_lines = []
-        for requirement in requirements:
-            scope = (
-                requirement.meal_type.value
-                if requirement.meal_type
-                else "any meal"
-            )
-            requirement_lines.append(
-                f"- {requirement.id}: source_text: "
-                f"{requirement.source_text}; "
-                f"foods_any_of: {', '.join(requirement.foods_any_of)}; "
-                f"meal_type: {scope}; "
-                f"exact_count: {requirement.exact_count}"
-            )
-        requirement_text = "\n".join(requirement_lines)
+    effective = list(effective_rules or requirements or [])
+    strict_rules = [
+        rule
+        for rule in effective
+        if not isinstance(rule, DietaryRule) or rule.strength.value == "strict"
+    ]
+    best_effort_rules = [
+        rule
+        for rule in effective
+        if isinstance(rule, DietaryRule)
+        and rule.strength.value == "best_effort"
+    ]
+    requirement_text = _render_rules(effective)
+    stored_text = _render_rules(stored_rules or [])
+    current_text = preference.strip() if preference else "None."
+    selected_constraints = list(
+        constraint_rules if constraint_rules is not None else constraints or []
+    )
     repair_text = ""
     if repair_feedback:
         repair_text = (
@@ -305,6 +365,20 @@ def build_plan_prompt(
         "profile constraints below. Dietary constraints and safety "
         "requirements always take precedence over calorie, protein, "
         "fibre, and request-specific preferences.\n\n"
+        "=== STORED PREFERENCE WORDING (LOWER PRIORITY) ===\n"
+        f"{stored_text}\n\n"
+        "=== CURRENT PLAN PREFERENCE (HIGHER THAN STORED) ===\n"
+        f"{current_text}\n\n"
+        "=== DIETARY CONSTRAINTS (HIGHEST PRIORITY) ===\n"
+        f"{_render_constraint_rules(selected_constraints)}\n"
+        "Never weaken, replace, or reinterpret these constraints.\n\n"
+        "=== EFFECTIVE STRICT RULES ===\n"
+        f"{_render_rules(strict_rules)}\n"
+        "Every strict rule must be satisfied by the generated plan.\n\n"
+        "=== EFFECTIVE BEST-EFFORT RULES ===\n"
+        f"{_render_rules(best_effort_rules)}\n"
+        "Best-effort rules may be omitted when they conflict with a higher "
+        "priority rule.\n\n"
         "=== PER-MEMBER NUTRITION TARGET GUIDANCE ===\n"
         "Use every supplied per-member calorie, protein, and fibre target "
         "to guide meal choices and portions. This is best-effort guidance; "
@@ -314,7 +388,8 @@ def build_plan_prompt(
         "per-member portions.\n\n"
         "=== INTERPRETED PREFERENCE RULES (EXACT COMPLIANCE) ===\n"
         f"{requirement_text}\n"
-        "Treat each exact_count as an exact weekly count. Do not omit, "
+        "Treat each structured rule as an application-owned obligation. "
+        "Do not omit, "
         "weaken, or reinterpret any listed rule. Permanent profile "
         "constraints remain higher priority.\n\n"
         "=== GENERATED PLAN CONTRACT ===\n"
@@ -350,18 +425,46 @@ def build_plan_prompt(
     )
 
 
-def build_preference_interpretation_prompt(preference: str) -> str:
-    """Build a prompt for interpreting measurable plan preferences."""
+def build_preference_interpretation_prompt(
+    preference: str,
+    *,
+    mode: InterpretationMode = "current_plan_preference",
+) -> str:
+    """Build a prompt for interpreting one bounded dietary-rule mode."""
+    mode_description = {
+        "constraint": (
+            "a non-negotiable dietary constraint. Emit forbidden food terms "
+            "in exclusions and do not emit positive requirements."
+        ),
+        "stored_preference": (
+            "a persistent stored dietary preference whose wording determines "
+            "strictness."
+        ),
+        "current_plan_preference": (
+            "a current plan preference that may override only conflicting "
+            "stored preferences."
+        ),
+    }[mode]
     return (
-        "You interpret a user's request-specific meal-plan preference into "
-        "safe, measurable weekly rules. Do not generate a meal plan.\n\n"
+        "You interpret one dietary request into the shared, typed rule "
+        "contract. Do not generate a meal plan.\n\n"
+        f"Interpretation mode: {mode_description}\n"
         "=== USER PREFERENCE ===\n"
         f"{preference.strip()}\n\n"
         "=== INTERPRETATION RULES ===\n"
         "Return one requirement for each meaningful, supported clause. "
         "Every meaningful clause must be represented by a requirement or "
         "listed in unparsed_text; never silently discard a clause.\n"
-        "Each requirement must express a positive exact weekly count. "
+        "For preference modes, each requirement must use operator exactly, "
+        "at_least, or at_most and a non-negative count. Zero is valid for "
+        "an explicit exclusion such as 'no eggs this week'. Use strict by "
+        "default.\n"
+        "The legacy exact_count field is accepted only for compatibility; "
+        "new responses must use operator and count.\n"
+        "The phrase 'I'd like' means strict at_least 1 when no count is "
+        "provided; it is never prompt-only guidance. Phrases such as 'if "
+        "convenient', 'if possible', or 'when practical' mean best_effort. "
+        "Do not invent a count, food, scope, weekday, or strength.\n"
         "Combine alternative foods that satisfy one rule together in "
         "foods_any_of; "
         "alternatives count as one union, not separate requirements.\n"
@@ -369,7 +472,11 @@ def build_preference_interpretation_prompt(preference: str) -> str:
         "or snack. Omit the scope with null when the rule applies to any "
         "meal.\n"
         "Use source_text for the user's bounded clause. Do not invent a "
-        "count, food, scope, or interpretation that the user did not give.\n"
+        "count, food, scope, or interpretation that the user did not give. "
+        "Represent weekdays as ISO numbers Monday=1 through Sunday=7.\n"
+        "In constraint mode, use exclusions with normalized forbidden_terms "
+        "and preserve the source_text. Unknown or unmatchable constraint "
+        "terms must be placed in unparsed_text for clarification.\n"
         "If wording is ambiguous, conflicting, impossible to count, or "
         "unsupported subjective wording, return a focused clarification. "
         "Unsupported or subjective requests such as 'make it healthy and "
@@ -378,15 +485,20 @@ def build_preference_interpretation_prompt(preference: str) -> str:
         "=== OUTPUT JSON SCHEMA ===\n"
         "Return only one JSON object with all three keys:\n"
         "{\n"
+        f'  "mode": "{mode}",\n'
         '  "requirements": [\n'
         "    {\n"
         '      "id": "r1",\n'
         '      "source_text": "eggs three times for breakfast",\n'
         '      "foods_any_of": ["eggs"],\n'
         '      "meal_type": "breakfast",\n'
-        '      "exact_count": 3\n'
+        '      "weekdays": [1, 3],\n'
+        '      "operator": "at_least",\n'
+        '      "count": 3,\n'
+        '      "strength": "strict"\n'
         "    }\n"
         "  ],\n"
+        '  "exclusions": [],\n'
         '  "clarification": null,\n'
         '  "unparsed_text": []\n'
         "}\n"

@@ -66,6 +66,8 @@ class ProfileCallbackAction(str, Enum):
     BACK = "back"
     DONE = "done"
     CLOSE = "close"
+    CONFIRM = "confirm"
+    CANCEL = "cancel"
 
 
 class ProfileCallback(BaseModel):
@@ -74,6 +76,7 @@ class ProfileCallback(BaseModel):
     action: ProfileCallbackAction
     category: ProfileEditCategory | None = None
     operation: ProfileEditOperation | None = None
+    token: str | None = None
 
     @model_validator(mode="after")
     def validate_payload_shape(self) -> "ProfileCallback":
@@ -90,7 +93,23 @@ class ProfileCallback(BaseModel):
             if not self.operation.is_valid_for(self.category):
                 raise ValueError("operation is invalid for its category")
             return self
-        if self.category is not None or self.operation is not None:
+        if self.action in {
+            ProfileCallbackAction.CONFIRM,
+            ProfileCallbackAction.CANCEL,
+        }:
+            if (
+                self.category is not None
+                or self.operation is not None
+                or self.token is None
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", self.token)
+            ):
+                raise ValueError("rule callbacks require one bounded token")
+            return self
+        if (
+            self.category is not None
+            or self.operation is not None
+            or self.token is not None
+        ):
             raise ValueError("navigation callbacks cannot contain selections")
         return self
 
@@ -256,6 +275,13 @@ def parse_profile_callback(data: str) -> ProfileCallback | None:
             if len(parts) != 2:
                 return None
             return ProfileCallback(action=action)
+        if action in {
+            ProfileCallbackAction.CONFIRM,
+            ProfileCallbackAction.CANCEL,
+        }:
+            if len(parts) != 3:
+                return None
+            return ProfileCallback(action=action, token=parts[2])
         if action is ProfileCallbackAction.CATEGORY:
             if len(parts) != 3:
                 return None

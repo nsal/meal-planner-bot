@@ -24,21 +24,27 @@ Include at most four meals per day.
 Profile & Constraints:
 {family name, people count, family members, calorie targets,
  optional protein/fibre targets in grams/day ("not set" when absent),
- allergies, dietary preferences, restrictions, goals}
+ dietary constraints, dietary preferences}
 
-=== REQUEST-SPECIFIC PREFERENCE (HIGH PRIORITY) ===
+=== REQUEST-SPECIFIC PREFERENCE (HIGHER THAN STORED) ===
 {user's preference, or "No additional preference."}
 
-Use this request preference when compatible with the permanent
-profile constraints below. Allergies, restrictions, calorie
-targets, and safety requirements always take precedence.
+Use this request preference only to override conflicting stored dietary
+preferences. Dietary constraints and safety requirements always take
+precedence and cannot be overridden.
 
-=== INTERPRETED PREFERENCE RULES (EXACT COMPLIANCE) ===
-{measurable rules extracted from the preference}
+=== DIETARY CONSTRAINTS (HIGHEST PRIORITY) ===
+{normalized forbidden terms and source wording}
 
-Treat each exact_count as an exact weekly count. Do not omit,
-weaken, or reinterpret any listed rule. Permanent profile
-constraints remain higher priority.
+=== EFFECTIVE STRICT RULES ===
+{resolved strict rules from stored and current preferences}
+
+=== EFFECTIVE BEST-EFFORT RULES ===
+{resolved best-effort rules from stored and current preferences}
+
+Treat every strict rule as an application-owned obligation. Best-effort rules
+may be omitted when they conflict with a higher-priority rule. Do not omit,
+weaken, or reinterpret constraints or strict rules.
 
 === GENERATED PLAN CONTRACT ===
 Include exactly one breakfast, one lunch, and one dinner on each
@@ -80,6 +86,12 @@ The real prompt replaces the placeholders with the user's profile,
 requested week, preference, interpreted requirements, meal history, and
 previous-plan feedback. The complete schema requires all seven days.
 
+The application validates the generated plan in priority order: constraints,
+strict rules, then completeness. It checks declared meal names and ingredient
+items using normalized whole-word or phrase matching. This validates only what
+the plan declares; it is not medical cross-contamination certification and
+does not detect undeclared manufacturing or preparation contamination.
+
 Each supplied per-member calorie, protein, and fibre target is included in the
 rendered profile context. For example:
 
@@ -101,17 +113,27 @@ or automatically repair a plan for missing target compliance.
 
 ## Preference interpretation
 
-When the user provides a preference, a separate LLM call first converts it
-into measurable rules. For example, “eggs three times for breakfast” becomes
-a requirement with:
+When the user provides a constraint or preference, a separate LLM call first
+converts it into the shared structured rule contract. For example, “I'd like
+eggs for breakfast” becomes a strict minimum of one:
 
 ```json
 {
-  "foods_any_of": ["eggs"],
+  "mode": "stored_preference",
+  "source_text": "I'd like eggs for breakfast",
+  "foods_any_of": ["egg"],
   "meal_type": "breakfast",
-  "exact_count": 3
+  "operator": "at_least",
+  "count": 1,
+  "strength": "strict"
 }
 ```
+
+Wording such as “if convenient” produces a `best_effort` rule. The
+interpreter also supports constraint mode and current-plan-preference mode;
+each interpretation is shown with its source wording and meaning for user
+confirmation before persistence. Ambiguous or partially interpreted input is
+clarified instead of guessed.
 
 This prompt is built by `build_preference_interpretation_prompt()` in
 [`src/meal_planner/llm/prompts.py`](../src/meal_planner/llm/prompts.py).
@@ -126,12 +148,15 @@ same generation prompt receives an additional section:
 === BOUNDED REPAIR FEEDBACK ===
 {validation errors, maximum 800 characters}
 
-Correct the feedback while preserving all permanent profile constraints
-and the exact rules above.
+Correct the feedback while preserving all dietary constraints and strict
+rules above. Do not weaken a constraint to make the candidate pass.
 ```
 
 The application parses and validates the returned JSON after generation; it
 does not trust the model output solely because the prompt requests valid JSON.
+If the repair also fails, the result is terminal: the candidate is not saved
+or displayed, the previous draft remains unchanged, and the request preference
+is retained for a manual retry.
 
 ## LLM request settings
 

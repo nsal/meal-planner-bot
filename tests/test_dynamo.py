@@ -20,6 +20,7 @@ from meal_planner.models.schemas import (
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
+    DietaryRule,
     GrocerySection,
     GroceryStatus,
     MealLogDraft,
@@ -29,10 +30,18 @@ from meal_planner.models.schemas import (
     ProfileEditCategory,
     ProfileEditOperation,
     ProfileUpdateEntities,
+    RuleOperator,
     UserProfile,
+    canonicalize_profile_rule_ids,
 )
 from meal_planner.router import RouteResult, RouteType
-from tests.factories import make_plan, make_profile
+from tests.factories import (
+    make_constraint,
+    make_legacy_profile_item,
+    make_plan,
+    make_preference,
+    make_profile,
+)
 
 
 @pytest.fixture
@@ -68,10 +77,230 @@ def test_profile_and_onboarding_draft_round_trip(
     repo.save_profile_draft("user", draft)
     assert repo.get_profile_draft("user").name == "Alex"
     profile = make_profile()
-    repo.save_profile("user", profile)
-    assert repo.get_profile("user") == profile
+    repo.save_profile("user", profile, expected_revision=None)
+    assert repo.get_profile("user") == canonicalize_profile_rule_ids(profile)
     repo.delete_profile_draft("user")
     assert repo.get_profile_draft("user") is None
+
+
+def test_canonical_profile_round_trip_discards_goals_on_read_and_write(
+    repo: DynamoRepository,
+) -> None:
+    """Structured entries survive a round trip and goals never persist."""
+    profile = UserProfile(
+        name="Alex",
+        dietary_constraints=[make_constraint()],
+        dietary_preferences=[make_preference()],
+    )
+
+    repo.table.put_item(
+        Item={
+            "PK": "USER#user",
+            "SK": "PROFILE",
+            **profile.model_dump(mode="json"),
+            "goals": ["lose weight"],
+        }
+    )
+
+    loaded = repo.get_profile("user")
+    assert loaded == canonicalize_profile_rule_ids(profile)
+    repo.save_profile("user", loaded, expected_revision=loaded.profile_revision)
+
+    item = repo.table.get_item(Key={"PK": "USER#user", "SK": "PROFILE"})["Item"]
+    expected = canonicalize_profile_rule_ids(profile)
+    assert item["dietary_constraints"] == [
+        expected.dietary_constraints[0].model_dump(mode="json")
+    ]
+    assert item["dietary_preferences"] == [
+        expected.dietary_preferences[0].model_dump(mode="json")
+    ]
+    assert "goals" not in item
+
+
+def test_legacy_profile_entries_are_normalized_without_retaining_goals(
+    repo: DynamoRepository,
+) -> None:
+    """Raw legacy entries remain visible as deterministic canonical entries."""
+    repo.table.put_item(
+        Item={
+            "PK": "USER#user",
+            "SK": "PROFILE",
+            **make_legacy_profile_item(),
+        }
+    )
+
+    profile = repo.get_profile("user")
+    assert profile is not None
+    assert profile.dietary_constraints[0].source_text == "Peanuts"
+    assert profile.dietary_preferences[0].source_text == "More vegetables"
+    repo.save_profile("user", profile, expected_revision=0)
+
+    item = repo.table.get_item(Key={"PK": "USER#user", "SK": "PROFILE"})["Item"]
+    assert item["dietary_constraints"][0]["source_text"] == "Peanuts"
+    assert item["dietary_preferences"][0]["source_text"] == ("More vegetables")
+    assert "goals" not in item
+
+
+def test_profile_transaction_rejects_conflicting_preference_atomically(
+    repo: DynamoRepository,
+) -> None:
+    """A preference conflicting with a constraint cannot consume state."""
+    original = UserProfile(
+        name="Alex",
+        dietary_constraints=[make_constraint()],
+        dietary_preferences=[],
+    )
+    conflicting = original.model_copy(
+        update={
+            "dietary_preferences": [
+                make_preference(
+                    "peanuts for breakfast",
+                    rule=DietaryRule(
+                        id="preference-peanuts",
+                        source_text="peanuts for breakfast",
+                        foods_any_of=["peanuts"],
+                        meal_type="breakfast",
+                        operator=RuleOperator.AT_LEAST,
+                        count=1,
+                    ),
+                )
+            ]
+        }
+    )
+    observed = _profile_edit_state(
+        operation=ProfileEditOperation.ADD,
+    ).model_copy(
+        update={"profile_category": ProfileEditCategory.DIETARY_PREFERENCES}
+    )
+    repo.save_profile("user", original, expected_revision=None)
+    assert repo.save_conversation_state("user", observed)
+
+    assert not repo.save_profile_and_transition_state(
+        "user", conflicting, _profile_menu_state(observed), observed
+    )
+    assert repo.get_profile("user") == canonicalize_profile_rule_ids(original)
+    assert repo.get_conversation_state("user") == observed
+
+
+def test_constraint_transaction_removes_only_conflicting_preferences(
+    repo: DynamoRepository,
+) -> None:
+    """A new constraint atomically removes conflicting stored rules only."""
+    original = UserProfile(
+        name="Alex",
+        dietary_constraints=[],
+        dietary_preferences=[
+            make_preference(
+                "peanuts for breakfast",
+                identifier="preference-peanuts",
+                rule=DietaryRule(
+                    id="preference-peanuts",
+                    source_text="peanuts for breakfast",
+                    foods_any_of=["peanuts"],
+                    meal_type="breakfast",
+                    count=1,
+                ),
+            ),
+            make_preference(
+                "eggs for breakfast",
+                identifier="preference-eggs",
+            ),
+        ],
+    )
+    updated = original.model_copy(
+        update={"dietary_constraints": [make_constraint()]}
+    )
+    observed = _profile_edit_state()
+    repo.save_profile("user", original, expected_revision=None)
+    assert repo.save_conversation_state("user", observed)
+
+    assert repo.save_profile_and_transition_state(
+        "user", updated, _profile_menu_state(observed), observed
+    )
+    saved = repo.get_profile("user")
+    assert saved is not None
+    expected = canonicalize_profile_rule_ids(
+        original.model_copy(
+            update={"dietary_preferences": [original.dietary_preferences[1]]}
+        )
+    )
+    assert saved.dietary_preferences == expected.dietary_preferences
+    assert (
+        saved.dietary_constraints
+        == canonicalize_profile_rule_ids(updated).dietary_constraints
+    )
+
+
+def test_profile_write_deduplicates_structured_entries_deterministically(
+    repo: DynamoRepository,
+) -> None:
+    """The first canonical entry wins when source text repeats."""
+    profile = UserProfile(
+        name="Alex",
+        dietary_constraints=[
+            make_constraint("Peanuts", identifier="constraint-first"),
+            make_constraint("peanuts", identifier="constraint-second"),
+        ],
+        dietary_preferences=[
+            make_preference("Eggs", identifier="preference-first"),
+            make_preference(" eggs ", identifier="preference-second"),
+        ],
+    )
+
+    repo.save_profile("user", profile, expected_revision=None)
+    saved = repo.get_profile("user")
+    assert saved is not None
+    expected = canonicalize_profile_rule_ids(
+        profile.model_copy(
+            update={
+                "dietary_constraints": [profile.dietary_constraints[0]],
+                "dietary_preferences": [profile.dietary_preferences[0]],
+            }
+        )
+    )
+    assert saved.dietary_constraints == expected.dietary_constraints
+    assert saved.dietary_preferences == expected.dietary_preferences
+
+
+def test_profile_canonicalization_repairs_duplicate_provider_rule_ids(
+    repo: DynamoRepository,
+) -> None:
+    """Distinct profile rules do not retain a shared provider ID."""
+    profile = UserProfile(
+        name="Alex",
+        dietary_preferences=[
+            make_preference(
+                "eggs for breakfast",
+                identifier="r1",
+                rule=DietaryRule(
+                    id="r1",
+                    source_text="eggs for breakfast",
+                    foods_any_of=["eggs"],
+                    meal_type="breakfast",
+                    count=1,
+                ),
+            ),
+            make_preference(
+                "tofu for dinner",
+                identifier="r1",
+                rule=DietaryRule(
+                    id="r1",
+                    source_text="tofu for dinner",
+                    foods_any_of=["tofu"],
+                    meal_type="dinner",
+                    count=1,
+                ),
+            ),
+        ],
+    )
+
+    canonical = repo._canonical_profile(profile)
+    reread = repo._canonical_profile(canonical)
+
+    ids = [entry.rule.id for entry in canonical.dietary_preferences]
+    assert len(ids) == len(set(ids))
+    assert all(identifier != "r1" for identifier in ids)
+    assert reread == canonical
 
 
 def test_profile_read_consistency_is_opt_in(mocker: Any) -> None:
@@ -87,12 +316,14 @@ def test_profile_read_consistency_is_opt_in(mocker: Any) -> None:
     }
     repo = DynamoRepository(table)
 
-    assert repo.get_profile("user") == profile
+    assert repo.get_profile("user") == canonicalize_profile_rule_ids(profile)
     assert table.get_item.call_args.kwargs == {
         "Key": {"PK": "USER#user", "SK": "PROFILE"}
     }
 
-    assert repo.get_profile("user", consistent_read=True) == profile
+    assert repo.get_profile("user", consistent_read=True) == (
+        canonicalize_profile_rule_ids(profile)
+    )
     assert table.get_item.call_args.kwargs == {
         "Key": {"PK": "USER#user", "SK": "PROFILE"},
         "ConsistentRead": True,
@@ -124,8 +355,12 @@ def test_profile_read_consistency_selects_current_table_response(
     table.get_item.side_effect = get_item
     repo = DynamoRepository(table)
 
-    assert repo.get_profile("user") == stale_profile
-    assert repo.get_profile("user", consistent_read=True) == current_profile
+    assert repo.get_profile("user") == canonicalize_profile_rule_ids(
+        stale_profile
+    )
+    assert repo.get_profile("user", consistent_read=True) == (
+        canonicalize_profile_rule_ids(current_profile)
+    )
 
 
 def _profile_edit_state(
@@ -161,22 +396,82 @@ def _profile_menu_state(state: ConversationState) -> ConversationState:
     )
 
 
+def test_profile_confirmation_rejects_concurrent_profile_mutation(
+    repo: DynamoRepository,
+) -> None:
+    """A stale confirmation cannot overwrite a profile changed after read."""
+    original = make_profile()
+    observed = _profile_edit_state()
+    next_state = _profile_menu_state(observed)
+    repo.save_profile("user", original, expected_revision=None)
+    assert repo.save_conversation_state("user", observed)
+
+    snapshot = repo.get_profile("user", consistent_read=True)
+    assert snapshot is not None
+    stale_update = snapshot.model_copy(
+        update={"dietary_constraints": [make_constraint("peanuts")]}
+    )
+
+    concurrent_update = snapshot.model_copy(
+        update={
+            "dietary_constraints": [
+                make_constraint("shellfish", identifier="constraint-shellfish")
+            ],
+            "dietary_preferences": [],
+        }
+    )
+    repo.save_profile(
+        "user", concurrent_update, expected_revision=snapshot.profile_revision
+    )
+    assert not repo.save_profile_and_transition_state(
+        "user", stale_update, next_state, observed
+    )
+    assert repo.get_profile("user", consistent_read=True) == (
+        canonicalize_profile_rule_ids(
+            concurrent_update.model_copy(update={"profile_revision": 1})
+        )
+    )
+    assert repo.get_conversation_state("user", consistent_read=True) == observed
+
+
+def test_profile_confirmation_rejects_missing_profile(
+    repo: DynamoRepository,
+) -> None:
+    """A confirmation cannot create a profile that disappeared meanwhile."""
+    original = make_profile()
+    updated = original.model_copy(
+        update={"dietary_constraints": [make_constraint("peanuts")]}
+    )
+    observed = _profile_edit_state()
+    repo.save_conversation_state("user", observed)
+
+    assert not repo.save_profile_and_transition_state(
+        "user", updated, _profile_menu_state(observed), observed
+    )
+    assert repo.get_profile("user", consistent_read=True) is None
+    assert repo.get_conversation_state("user", consistent_read=True) == observed
+
+
 def test_profile_amendment_transaction_commits_matching_profile_and_state(
     repo: DynamoRepository,
 ) -> None:
     """A matching profile edit commits both documents atomically."""
     original = make_profile()
-    updated = original.model_copy(update={"dietary_constraints": ["peanuts"]})
+    updated = original.model_copy(
+        update={"dietary_constraints": [make_constraint()]}
+    )
     observed = _profile_edit_state()
     next_state = _profile_menu_state(observed)
-    repo.save_profile("user", original)
+    repo.save_profile("user", original, expected_revision=None)
     assert repo.save_conversation_state("user", observed)
 
     assert repo.save_profile_and_transition_state(
         "user", updated, next_state, observed
     )
 
-    assert repo.get_profile("user") == updated
+    assert repo.get_profile("user") == canonicalize_profile_rule_ids(
+        updated.model_copy(update={"profile_revision": 1})
+    )
     assert repo.get_conversation_state("user") == next_state
 
 
@@ -189,7 +484,7 @@ def test_profile_amendment_transaction_conflicts_leave_documents_unchanged(
     original = make_profile()
     updated = original.model_copy(update={"dietary_constraints": ["peanuts"]})
     observed = _profile_edit_state()
-    repo.save_profile("user", original)
+    repo.save_profile("user", original, expected_revision=None)
     assert repo.save_conversation_state("user", observed)
     if conflict == "deleted":
         assert repo.delete_conversation_state("user")
@@ -210,7 +505,7 @@ def test_profile_amendment_transaction_conflicts_leave_documents_unchanged(
         "user", updated, _profile_menu_state(observed), observed
     )
 
-    assert repo.get_profile("user") == original
+    assert repo.get_profile("user") == canonicalize_profile_rule_ids(original)
     assert repo.get_conversation_state("user") == replacement
 
 
@@ -230,7 +525,7 @@ def test_profile_amendment_transaction_replacement_reuses_revision_safely(
         updated_at=observed.updated_at + timedelta(seconds=1),
         expires_at=observed.expires_at,
     )
-    repo.save_profile("user", original)
+    repo.save_profile("user", original, expected_revision=None)
     assert repo.save_conversation_state("user", observed)
     repo.table.put_item(
         Item={
@@ -244,7 +539,7 @@ def test_profile_amendment_transaction_replacement_reuses_revision_safely(
         "user", updated, _profile_menu_state(observed), observed
     )
 
-    assert repo.get_profile("user") == original
+    assert repo.get_profile("user") == canonicalize_profile_rule_ids(original)
     assert repo.get_conversation_state("user") == replacement
 
 
@@ -282,7 +577,7 @@ def test_profile_amendment_transaction_rejects_replacement_workflows(
         replacement = _profile_edit_state(
             revision=observed.revision, created_at=replacement_time
         )
-    repo.save_profile("user", original)
+    repo.save_profile("user", original, expected_revision=None)
     assert repo.save_conversation_state("user", observed)
     assert repo.save_conversation_state(
         "user", replacement, expected_revision=observed.revision
@@ -292,7 +587,7 @@ def test_profile_amendment_transaction_rejects_replacement_workflows(
         "user", updated, _profile_menu_state(observed), observed
     )
 
-    assert repo.get_profile("user") == original
+    assert repo.get_profile("user") == canonicalize_profile_rule_ids(original)
     assert repo.get_conversation_state("user") == replacement
 
 
@@ -302,13 +597,17 @@ def test_profile_amendment_transaction_duplicate_input_is_idempotently_rejected(
     """A second submission using the consumed state changes nothing."""
     original = make_profile()
     first_update = original.model_copy(
-        update={"dietary_constraints": ["peanuts"]}
+        update={"dietary_constraints": [make_constraint()]}
     )
     duplicate_update = original.model_copy(
-        update={"dietary_constraints": ["shellfish"]}
+        update={
+            "dietary_constraints": [
+                make_constraint("shellfish", identifier="constraint-shellfish")
+            ]
+        }
     )
     observed = _profile_edit_state()
-    repo.save_profile("user", original)
+    repo.save_profile("user", original, expected_revision=None)
     assert repo.save_conversation_state("user", observed)
     next_state = _profile_menu_state(observed)
     assert repo.save_profile_and_transition_state(
@@ -319,7 +618,9 @@ def test_profile_amendment_transaction_duplicate_input_is_idempotently_rejected(
         "user", duplicate_update, next_state, observed
     )
 
-    assert repo.get_profile("user") == first_update
+    assert repo.get_profile("user") == canonicalize_profile_rule_ids(
+        first_update.model_copy(update={"profile_revision": 1})
+    )
     assert repo.get_conversation_state("user") == next_state
 
 
@@ -435,11 +736,17 @@ def test_legacy_profile_resave_removes_aliases_and_keeps_constraints(
 
     profile = repo.get_profile("user")
     assert profile is not None
-    repo.save_profile("user", profile)
+    repo.save_profile("user", profile, expected_revision=0)
 
     item = repo.table.get_item(Key={"PK": "USER#user", "SK": "PROFILE"})["Item"]
-    assert profile.dietary_constraints == ["Peanuts", "Vegan"]
-    assert item["dietary_constraints"] == ["Peanuts", "Vegan"]
+    assert [entry.source_text for entry in profile.dietary_constraints] == [
+        "Peanuts",
+        "Vegan",
+    ]
+    assert [entry["source_text"] for entry in item["dietary_constraints"]] == [
+        "Peanuts",
+        "Vegan",
+    ]
     assert "allergies" not in item
     assert "restrictions" not in item
 
@@ -453,11 +760,11 @@ def test_save_profile_creates_canonical_revisionless_item(
         dietary_constraints=["peanuts"],
     )
 
-    repo.save_profile("user", profile)
+    repo.save_profile("user", profile, expected_revision=None)
 
     item = repo.table.get_item(Key={"PK": "USER#user", "SK": "PROFILE"})["Item"]
     assert "revision" not in item
-    assert item["dietary_constraints"] == ["peanuts"]
+    assert item["dietary_constraints"][0]["source_text"] == "peanuts"
     assert "allergies" not in item
     assert "restrictions" not in item
 
@@ -465,16 +772,173 @@ def test_save_profile_creates_canonical_revisionless_item(
 def test_save_profile_replaces_existing_document_without_revision(
     repo: DynamoRepository,
 ) -> None:
-    """A normal profile save directly replaces the existing document."""
+    """A normal profile save advances the observed profile revision."""
     initial = UserProfile(name="Alex", dietary_constraints=["peanuts"])
-    updated = UserProfile(name="Alex", dietary_constraints=["dairy-free"])
-    repo.save_profile("user", initial)
+    assert repo.save_profile("user", initial, expected_revision=None)
 
-    repo.save_profile("user", updated)
+    saved_initial = repo.get_profile("user", consistent_read=True)
+    assert saved_initial is not None
+    assert saved_initial.profile_revision == 0
+    updated = saved_initial.model_copy(
+        update={"dietary_constraints": ["dairy-free"]}
+    )
+    assert repo.save_profile(
+        "user", updated, expected_revision=saved_initial.profile_revision
+    )
 
     saved = repo.get_profile("user")
     assert saved is not None
-    assert saved.dietary_constraints == ["dairy-free"]
+    assert [entry.source_text for entry in saved.dietary_constraints] == [
+        "dairy-free"
+    ]
+    assert saved.profile_revision == 1
+
+
+def test_stale_ordinary_save_cannot_overwrite_confirmation_winner(
+    repo: DynamoRepository,
+) -> None:
+    """An ordinary stale writer loses to a later profile transaction."""
+    initial = UserProfile(name="Alex", dietary_constraints=["peanuts"])
+    assert repo.save_profile("user", initial, expected_revision=None)
+    stale = repo.get_profile("user", consistent_read=True)
+    assert stale is not None
+
+    observed = _profile_edit_state()
+    next_state = _profile_menu_state(observed)
+    assert repo.save_conversation_state("user", observed)
+    stale_update = stale.model_copy(
+        update={"dietary_constraints": [make_constraint("dairy")]}
+    )
+    winner = stale.model_copy(
+        update={"dietary_constraints": [make_constraint("shellfish")]}
+    )
+    assert repo.save_profile_and_transition_state(
+        "user", winner, next_state, observed
+    )
+    assert not repo.save_profile(
+        "user", stale_update, expected_revision=stale.profile_revision
+    )
+
+    saved = repo.get_profile("user", consistent_read=True)
+    assert saved is not None
+    assert [entry.source_text for entry in saved.dietary_constraints] == [
+        "shellfish"
+    ]
+    assert saved.profile_revision == 1
+
+
+def test_competing_ordinary_saves_allow_only_one_revision_owner(
+    repo: DynamoRepository,
+) -> None:
+    """Two writers from one snapshot cannot both commit."""
+    initial = UserProfile(name="Alex", dietary_constraints=["peanuts"])
+    assert repo.save_profile("user", initial, expected_revision=None)
+    snapshot = repo.get_profile("user", consistent_read=True)
+    assert snapshot is not None
+
+    first = snapshot.model_copy(update={"name": "First"})
+    second = snapshot.model_copy(update={"name": "Second"})
+    writes = Barrier(2)
+
+    def save_competing(profile: UserProfile) -> bool:
+        writes.wait(timeout=5)
+        return repo.save_profile(
+            "user", profile, expected_revision=snapshot.profile_revision
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(save_competing, [first, second]))
+
+    assert sorted(outcomes) == [False, True]
+    saved = repo.get_profile("user", consistent_read=True)
+    assert saved is not None
+    assert saved.name in {"First", "Second"}
+    assert saved.profile_revision == 1
+
+
+def test_new_profile_creation_is_race_safe(repo: DynamoRepository) -> None:
+    """Only one writer can create a missing profile item."""
+    first = UserProfile(name="First")
+    second = UserProfile(name="Second")
+    writes = Barrier(2)
+
+    def save_competing(profile: UserProfile) -> bool:
+        writes.wait(timeout=5)
+        return repo.save_profile("user", profile, expected_revision=None)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(save_competing, [first, second]))
+
+    assert sorted(outcomes) == [False, True]
+
+    saved = repo.get_profile("user", consistent_read=True)
+    assert saved is not None
+    assert saved.name in {"First", "Second"}
+    assert saved.profile_revision == 0
+
+
+def test_observed_absence_cannot_overwrite_staggered_creator(
+    repo: DynamoRepository,
+) -> None:
+    """A delayed creator loses after another observed-absence save wins."""
+    first = UserProfile(name="First")
+    second = UserProfile(name="Second")
+
+    assert repo.get_profile("user", consistent_read=True) is None
+    assert repo.get_profile("user", consistent_read=True) is None
+    assert repo.save_profile("user", first, expected_revision=None)
+    assert not repo.save_profile("user", second, expected_revision=None)
+
+    saved = repo.get_profile("user", consistent_read=True)
+    assert saved is not None
+    assert saved.name == "First"
+    assert saved.profile_revision == 0
+
+
+def test_legacy_revision_zero_profile_can_be_updated(
+    repo: DynamoRepository,
+) -> None:
+    """A legacy item without a revision is treated as revision zero."""
+    profile = UserProfile(name="Alex")
+    repo.table.put_item(
+        Item={
+            "PK": "USER#user",
+            "SK": "PROFILE",
+            **profile.model_dump(mode="json", exclude={"profile_revision"}),
+        }
+    )
+    observed = repo.get_profile("user", consistent_read=True)
+    assert observed is not None
+    assert observed.profile_revision == 0
+
+    updated = observed.model_copy(update={"name": "Updated"})
+    assert repo.save_profile("user", updated, expected_revision=0)
+    saved = repo.get_profile("user", consistent_read=True)
+    assert saved is not None
+    assert saved.name == "Updated"
+    assert saved.profile_revision == 1
+
+
+def test_save_profile_propagates_nonconditional_client_error(
+    mocker: Any,
+) -> None:
+    """Unexpected DynamoDB failures remain visible to application callers."""
+    table = mocker.MagicMock()
+    table.put_item.side_effect = ClientError(
+        {
+            "Error": {
+                "Code": "ProvisionedThroughputExceededException",
+                "Message": "capacity exceeded",
+            }
+        },
+        "PutItem",
+    )
+    repo = DynamoRepository(table)
+
+    with pytest.raises(ClientError, match="capacity exceeded"):
+        repo.save_profile(
+            "user", UserProfile(name="Alex"), expected_revision=None
+        )
 
 
 def test_save_profile_omits_legacy_revision_on_first_write(
@@ -501,11 +965,14 @@ def test_save_profile_omits_legacy_revision_on_first_write(
         update={"dietary_constraints": ["Peanuts", "vegan"]}
     )
 
-    repo.save_profile("user", canonical)
+    repo.save_profile("user", canonical, expected_revision=0)
 
     item = repo.table.get_item(Key={"PK": "USER#user", "SK": "PROFILE"})["Item"]
     assert "revision" not in item
-    assert item["dietary_constraints"] == ["Peanuts", "vegan"]
+    assert [entry["source_text"] for entry in item["dietary_constraints"]] == [
+        "Peanuts",
+        "vegan",
+    ]
     assert "allergies" not in item
     assert "restrictions" not in item
 

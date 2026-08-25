@@ -5,10 +5,15 @@ from datetime import date
 import pytest
 
 from meal_planner.models import (
+    ConstraintEntry,
+    DietaryRule,
     Ingredient,
     PlanDay,
     PlannedMeal,
     PreferenceRequirement,
+    RuleOperator,
+    RuleStrength,
+    Weekday,
     WeeklyPlan,
 )
 from meal_planner.models.schemas import MealType
@@ -16,6 +21,7 @@ from meal_planner.preferences import (
     PlanValidationResult,
     RequirementValidation,
     ValidationIssue,
+    format_best_effort_summary,
     format_satisfaction_summary,
     format_unmet_preference_clauses,
     match_requirement,
@@ -56,6 +62,40 @@ def requirement(
         foods_any_of=food_terms,
         meal_type=meal_type,
         exact_count=exact_count,
+    )
+
+
+def rule(
+    food_terms: list[str],
+    count: int,
+    *,
+    identifier: str = "rule-1",
+    operator: RuleOperator = RuleOperator.EXACTLY,
+    meal_type: MealType | None = None,
+    weekdays: list[Weekday] | None = None,
+    strength: RuleStrength = RuleStrength.STRICT,
+) -> DietaryRule:
+    """Build a generalized rule for preference validation tests."""
+    return DietaryRule(
+        id=identifier,
+        source_text=" or ".join(food_terms),
+        foods_any_of=food_terms,
+        count=count,
+        operator=operator,
+        meal_type=meal_type,
+        weekdays=weekdays or [],
+        strength=strength,
+    )
+
+
+def constraint(
+    terms: list[str], identifier: str = "constraint-1"
+) -> ConstraintEntry:
+    """Build a constraint for validation tests."""
+    return ConstraintEntry(
+        id=identifier,
+        source_text=" or ".join(terms),
+        forbidden_terms=terms,
     )
 
 
@@ -629,3 +669,358 @@ def test_format_satisfaction_summary_uses_validated_evidence_counts() -> None:
     assert format_satisfaction_summary(result, [egg_requirement]) == (
         "Preferences satisfied:\n• Eggs: 7 breakfasts"
     )
+
+
+def test_constraints_match_names_ingredients_aliases_and_alternatives() -> None:
+    """Constraints inspect declared evidence with reviewed aliases."""
+    meals = {
+        1: [
+            meal(MealType.BREAKFAST, "Dairy-free oats", ["oat milk"]),
+            meal(MealType.LUNCH, "Cheese-free salad", ["greens"]),
+            meal(MealType.DINNER, "Tofu bowl", ["tofu"]),
+        ],
+        2: [
+            meal(MealType.BREAKFAST, "Berry bowl", ["berries"]),
+            meal(MealType.LUNCH, "Chicken wrap", ["chicken"]),
+            meal(MealType.DINNER, "Butter beans", ["beans"]),
+        ],
+    }
+
+    result = validate_generated_plan(
+        plan_with(meals),
+        rules=[rule(["salmon", "trout"], 1, identifier="fish")],
+        constraints=[constraint(["dairy"], "no-dairy")],
+    )
+
+    assert not result.is_valid
+    assert result.constraints[0].matched_terms == (
+        "milk",
+        "cheese",
+        "butter",
+    )
+    assert [
+        (item.day, item.meal_type)
+        for item in result.constraints[0].matched_meals
+    ] == [
+        (1, MealType.BREAKFAST),
+        (1, MealType.LUNCH),
+        (2, MealType.DINNER),
+    ]
+
+
+def test_constraint_matching_avoids_substring_false_positives() -> None:
+    """Constraint evidence does not match substrings or punctuation noise."""
+    meals = {
+        1: [
+            meal(MealType.BREAKFAST, "Eggplant parmesan", ["eggplant"]),
+            meal(MealType.LUNCH, "Salmonella rice", ["rice"]),
+            meal(MealType.DINNER, "Café salad", ["cafe\u0301"]),
+        ],
+    }
+
+    result = validate_generated_plan(
+        plan_with(meals),
+        constraints=[constraint(["egg", "salmon", "café"])],
+    )
+
+    assert not result.is_valid
+    assert [item.meal_type for item in result.constraints[0].matched_meals] == [
+        MealType.DINNER
+    ]
+    assert result.constraints[0].matched_terms == ("café",)
+
+
+@pytest.mark.parametrize(
+    ("operator", "count", "matched", "expected_valid"),
+    [
+        (RuleOperator.EXACTLY, 2, 2, True),
+        (RuleOperator.EXACTLY, 2, 3, False),
+        (RuleOperator.AT_LEAST, 2, 3, True),
+        (RuleOperator.AT_LEAST, 2, 1, False),
+        (RuleOperator.AT_MOST, 2, 1, True),
+        (RuleOperator.AT_MOST, 2, 3, False),
+        (RuleOperator.EXACTLY, 0, 0, True),
+        (RuleOperator.EXACTLY, 0, 1, False),
+    ],
+)
+def test_generalized_rule_operators_use_distinct_meal_evidence(
+    operator: RuleOperator,
+    count: int,
+    matched: int,
+    expected_valid: bool,
+) -> None:
+    """Exact, minimum, maximum, and zero rules count each meal once."""
+    meals = {
+        day: [
+            meal(
+                MealType.BREAKFAST,
+                "Egg toast" if day <= matched else "Oat toast",
+                ["egg"] if day <= matched else ["oat"],
+            ),
+            meal(MealType.LUNCH, "Soup", ["beans"]),
+            meal(MealType.DINNER, "Rice", ["rice"]),
+        ]
+        for day in range(1, 8)
+    }
+    result = validate_generated_plan(
+        plan_with(meals),
+        rules=[
+            rule(
+                ["egg"],
+                count,
+                operator=operator,
+                meal_type=MealType.BREAKFAST,
+            )
+        ],
+    )
+
+    assert result.is_valid is expected_valid
+    assert result.rules[0].actual_count == matched
+    assert len(result.rules[0].matched_meals) == matched
+
+
+def test_rule_weekday_and_meal_scope_filter_eligible_distinct_meals() -> None:
+    """Weekday and meal scopes constrain both evidence and capacity."""
+    meals = {
+        day: [
+            meal(MealType.BREAKFAST, "Egg toast", ["egg"]),
+            meal(MealType.LUNCH, "Egg salad", ["egg"]),
+            meal(MealType.DINNER, "Rice", ["rice"]),
+        ]
+        for day in range(1, 8)
+    }
+    result = validate_generated_plan(
+        plan_with(meals),
+        rules=[
+            rule(
+                ["egg"],
+                1,
+                meal_type=MealType.LUNCH,
+                weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY],
+            )
+        ],
+    )
+
+    assert result.is_valid
+    assert [
+        (item.day, item.meal_type) for item in result.rules[0].matched_meals
+    ] == [
+        (1, MealType.LUNCH),
+        (3, MealType.LUNCH),
+    ]
+    assert result.rules[0].possible_count == 2
+
+
+def test_weekday_rule_uses_bounded_daily_capacity_for_unscoped_rules() -> None:
+    """Accepted unscoped weekday counts fit four supported daily meals."""
+    meals = {
+        day: [
+            meal(MealType.BREAKFAST, "Egg toast", ["egg"]),
+            meal(MealType.LUNCH, "Egg salad", ["egg"]),
+            meal(MealType.DINNER, "Egg rice", ["egg"]),
+            meal(MealType.SNACK, "Egg snack", ["egg"]),
+        ]
+        for day in range(1, 8)
+    }
+    result = validate_generated_plan(
+        plan_with(meals),
+        rules=[
+            rule(
+                ["egg"],
+                4,
+                weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY],
+            )
+        ],
+    )
+
+    assert result.is_valid
+    assert result.rules[0].weekday_counts == (
+        (Weekday.MONDAY, 4),
+        (Weekday.WEDNESDAY, 4),
+    )
+    assert not any(
+        issue.code == "impossible_rule_count" for issue in result.issues
+    )
+
+
+def test_strict_weekday_rule_requires_evidence_on_every_named_day() -> None:
+    """A strict weekday rule reports each named day without evidence."""
+    meals = {
+        1: [
+            meal(MealType.BREAKFAST, "Egg toast", ["egg"]),
+            meal(MealType.LUNCH, "Soup", ["beans"]),
+            meal(MealType.DINNER, "Rice", ["rice"]),
+        ],
+        3: [
+            meal(MealType.BREAKFAST, "Oat toast", ["oats"]),
+            meal(MealType.LUNCH, "Soup", ["beans"]),
+            meal(MealType.DINNER, "Rice", ["rice"]),
+        ],
+    }
+    result = validate_generated_plan(
+        plan_with(meals),
+        rules=[
+            rule(
+                ["egg"],
+                1,
+                operator=RuleOperator.AT_LEAST,
+                meal_type=MealType.BREAKFAST,
+                weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY],
+            )
+        ],
+    )
+
+    assert not result.is_valid
+    assert result.rules[0].missing_weekdays == (Weekday.WEDNESDAY,)
+    assert any(
+        issue.code == "strict_rule_mismatch"
+        and issue.day == Weekday.WEDNESDAY
+        and "Wednesday" in issue.message
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("operator", "count", "matched_days"),
+    [
+        (RuleOperator.EXACTLY, 1, [1, 3]),
+        (RuleOperator.AT_LEAST, 1, [1, 3]),
+        (RuleOperator.AT_MOST, 1, [1, 3]),
+        (RuleOperator.EXACTLY, 0, []),
+    ],
+)
+def test_weekday_rule_operator_is_applied_per_named_day(
+    operator: RuleOperator,
+    count: int,
+    matched_days: list[int],
+) -> None:
+    """Each named weekday independently satisfies its count operator."""
+    meals = {
+        day: [
+            meal(
+                MealType.BREAKFAST,
+                "Egg toast" if day in matched_days else "Oat toast",
+                ["egg"] if day in matched_days else ["oats"],
+            ),
+            meal(MealType.LUNCH, "Soup", ["beans"]),
+            meal(MealType.DINNER, "Rice", ["rice"]),
+        ]
+        for day in range(1, 8)
+    }
+    result = validate_generated_plan(
+        plan_with(meals),
+        rules=[
+            rule(
+                ["egg"],
+                count,
+                operator=operator,
+                meal_type=MealType.BREAKFAST,
+                weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY],
+            )
+        ],
+    )
+
+    assert result.is_valid
+    assert result.rules[0].is_satisfied
+    assert result.rules[0].missing_weekdays == ()
+
+
+def test_best_effort_weekday_miss_is_non_blocking_and_reported() -> None:
+    """Best-effort weekday omissions remain summarized without invalidation."""
+    meals = {
+        day: [
+            meal(
+                MealType.BREAKFAST,
+                "Egg toast" if day == 1 else "Oat toast",
+                ["egg"] if day == 1 else ["oats"],
+            ),
+            meal(MealType.LUNCH, "Soup", ["beans"]),
+            meal(MealType.DINNER, "Rice", ["rice"]),
+        ]
+        for day in range(1, 8)
+    }
+    result = validate_generated_plan(
+        plan_with(meals),
+        rules=[
+            rule(
+                ["egg"],
+                1,
+                operator=RuleOperator.AT_LEAST,
+                meal_type=MealType.BREAKFAST,
+                weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY],
+                strength=RuleStrength.BEST_EFFORT,
+            )
+        ],
+    )
+
+    assert result.is_valid
+    assert result.rules[0].missing_weekdays == (Weekday.WEDNESDAY,)
+    assert "not met" in format_best_effort_summary(result)
+
+
+def test_best_effort_miss_is_reported_but_does_not_invalidate_plan() -> None:
+    """Best-effort rules retain typed evidence without triggering failure."""
+    meals = {
+        day: [
+            meal(MealType.BREAKFAST, "Oats", ["oats"]),
+            meal(MealType.LUNCH, "Soup", ["beans"]),
+            meal(MealType.DINNER, "Rice", ["rice"]),
+        ]
+        for day in range(1, 8)
+    }
+    result = validate_generated_plan(
+        plan_with(meals),
+        rules=[
+            rule(
+                ["salmon"],
+                1,
+                strength=RuleStrength.BEST_EFFORT,
+            )
+        ],
+    )
+
+    assert result.is_valid
+    assert not result.rules[0].is_satisfied
+    assert result.rules[0].strength is RuleStrength.BEST_EFFORT
+    assert result.issues == ()
+
+
+def test_rule_summaries_are_bounded_and_do_not_include_raw_source_text() -> (
+    None
+):
+    """User summaries expose bounded labels rather than untrusted payloads."""
+    long_source = "private source " + ("x" * 480)
+    strict_rule = DietaryRule(
+        id="strict-long",
+        source_text=long_source,
+        foods_any_of=["salmon", "trout", "tuna", "cod"],
+        count=7,
+    )
+    best_effort_rule = rule(
+        ["sardine"],
+        1,
+        identifier="best-long",
+        strength=RuleStrength.BEST_EFFORT,
+    )
+    meals = {
+        day: [
+            meal(MealType.BREAKFAST, "Salmon", ["salmon"]),
+            meal(MealType.LUNCH, "Soup", ["beans"]),
+            meal(MealType.DINNER, "Rice", ["rice"]),
+        ]
+        for day in range(1, 8)
+    }
+    result = validate_generated_plan(
+        plan_with(meals),
+        rules=[strict_rule, best_effort_rule],
+    )
+
+    summary = format_satisfaction_summary(result, [])
+
+    assert len(summary) <= MAX_REQUIREMENT_OUTPUT_LENGTH
+    assert long_source not in summary
+    assert "Strict-long" in summary
+    best_effort_summary = format_best_effort_summary(result)
+    assert len(best_effort_summary) <= MAX_REQUIREMENT_OUTPUT_LENGTH
+    assert "Best-long" in best_effort_summary
+    assert long_source not in best_effort_summary
