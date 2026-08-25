@@ -1,7 +1,7 @@
 # Meal Planner Bot
 
 A Telegram assistant that collects a household nutrition profile, generates a
-seven-day meal plan through LiteLLM, confirms edits, builds groceries
+variable-length meal plan through LiteLLM, confirms edits, builds groceries
 asynchronously, records actual meals, and records cooked, skipped, or swapped
 meal outcomes.
 
@@ -23,17 +23,71 @@ the locked `uv` environment.
 
 ## Telegram workflows
 
-- `/submit_meals` starts guided actual-meal logging. It collects a date from
-  today through the previous seven days, a meal type, and a description one
-  at a time. Repeated meals of the same type and date are retained.
+- `/submit_meals` starts deterministic actual-meal logging. It first shows
+  meals recorded for UTC today and yesterday, then asks for one entry in the
+  form `when, meal type, what you ate`. Repeated meals of the same type and
+  date are retained.
 - `/checkin` shows buttons for cooked, skipped, or swapped outcomes on today's
   confirmed plan. `/submit_meals` does not require an active plan.
 - `/cancel` clears an unfinished meal or plan workflow. Starting `/submit_meals`
-  or `/plan` replaces an older unfinished workflow.
-- `/plan` asks for a request-specific preference before starting asynchronous
-  generation. `no preference` and `anything` remove the extra constraint; the
-  saved family profile is never changed. A failed request retains the
-  preference so `/plan` can retry it.
+  or `/plan` replaces an older unfinished workflow. `/profile` also replaces
+  an older unfinished workflow when it opens the profile editor.
+- `/profile` lets you view and amend the saved household profile. Tap `Amend profile`, choose
+  `Family`, `Dietary constraints`, or `Dietary preferences`, then
+  choose an operation. Each operation accepts one guided message: use
+  `John 1500` to add a family member or change a member's calories, the exact
+  member name to remove someone, or one item such as `dairy` or `eat more
+  vegetables` to add or remove a constraint or preference. After a
+  successful change the category menu returns so you can make another
+  amendment. Use `Back` to navigate, `Done` to finish and save the session,
+  `Close` to leave it, or `/cancel` to clear the active edit.
+- The canonical profile has two dietary fields: `dietary_constraints` and
+  `dietary_preferences`. A new dietary rule is interpreted and shown for
+  confirmation; review the interpreted meaning before saving. Priority is
+  dietary constraints > current plan preferences > stored dietary
+  preferences. Constraints cannot be overridden, and a preference that
+  conflicts with one is rejected.
+- `/plan` asks for a duration and request-specific preference before starting
+  asynchronous generation. Reply in the form `N, preference`, such as
+  `1, no preference` or `3, fish for dinner`; only the first comma separates
+  the duration, so later commas remain part of the preference. `no
+  preference` and `anything` remove the extra constraint; the saved family
+  profile is never changed. After the initial reply, clarification messages
+  are treated as preference text and retain the selected duration. Historical
+  in-progress seven-day requests continue to accept preference-only replies.
+  A failed request retains the preference so `/plan` can retry it.
+- Request-specific preferences support structured natural-language rules.
+  `I'd like eggs for breakfast` becomes a strict minimum of one, while
+  `beans for breakfast if convenient` is best effort and may be omitted.
+  A current plan preference overrides only conflicting stored preferences:
+  three stored egg breakfasts plus a current maximum of two resolves to
+  exactly two preferred days rather than permitting zero. The conversational
+  LLM asks a focused clarification question when a clause is ambiguous,
+  unsupported, conflicting, or incomplete. The original wording stays
+  attached to the same `/plan` workflow, and your next reply is combined with
+  it. Positive exact-count or minimum obligations are also clarified when the
+  selected date horizon cannot provide enough eligible weekday or meal slots;
+  maximum rules and an exact count of zero remain feasible when no matching
+  slots exist.
+- The application validates constraints first, then strict rules and plan
+  completeness. It matches whole words or phrases in declared meal names and
+  ingredient items, ignoring case, punctuation, whitespace, and conservative
+  singular/plural differences. Alternative foods share one count, and each
+  distinct day and meal type counts at most once; culinary knowledge alone is
+  not evidence. Best-effort misses do not invalidate a plan. The candidate is
+  checked before anything is persisted or displayed. The Planner never saves
+  or displays a failing candidate: it makes one automatic repair in a fresh
+  asynchronous invocation. A second invalid result is terminal, leaves the
+  previous draft unchanged, retains the preference, and can be retried
+  manually with `/plan`.
+- Profile changes apply only to newly generated plans. Existing meal plans
+  are not revalidated or altered after a constraint changes, and users are
+  responsible for regenerating them. Declared-ingredient validation does not
+  detect undeclared product cross-contamination and is not medical
+  cross-contamination certification.
+  For an in-progress request, publication and release of that request happen
+  together, so a cancelled or replaced request cannot save or display a stale
+  result.
 - After a draft is displayed, describe whole-plan changes in natural language
   to start an asynchronous revision. The bot replaces the complete draft for
   the same week, preserves earlier plan-specific instructions, and leaves the
@@ -106,8 +160,9 @@ wait (5 seconds per retry), each sequential Telegram allowance, and a handler
 safety margin. Each function's worst-case budget must fit its configured
 deadline; the Planner now has a five-minute (300-second) application deadline
 while using one 240-second whole-plan provider attempt. The configured Planner
-budget is 280 seconds: 240 seconds for LiteLLM, two sequential 10-second
-Telegram allowances, and a 20-second safety margin. Its Lambda timeout is 310
+budget is 290 seconds: 240 seconds for LiteLLM, three sequential 10-second
+Telegram allowances for the plan, bounded summary, and review follow-up, and a
+20-second safety margin. Its Lambda timeout is 310
 seconds, reserving ten seconds for the application to return after the
 300-second Planner application deadline. Grocery generation retains two
 120-second provider attempts; including its maximum five-second retry wait,
@@ -125,10 +180,21 @@ use the function-specific settings above.
 
 Never commit `.env` or secret values.
 
-Planner generation makes one whole-week provider request. A timeout failure is
-reported separately from invalid structured output, and neither failure
-persists a partial plan. A failed initial generation retains the saved
-preference so the user can retry with `/plan`.
+Planner generation makes one whole-plan provider request per invocation. An
+invalid first result can trigger one bounded repair in a fresh asynchronous
+Planner invocation; each invocation still makes only one provider request. A
+timeout failure is reported separately from invalid structured output, and
+neither failure persists a partial plan. A failed or terminally invalid
+generation retains the saved preference so the user can retry with `/plan`.
+
+Preference interpretation is LLM-assisted: the conversational model maps the
+user's natural-language clauses to supported food alternatives, counts, and
+meal scopes, or requests clarification. Application code is authoritative for
+the measurable parts. It validates the generated plan's structure, exact
+counts, and evidence from generated meal names and ingredient items before
+anything is persisted or displayed. The Planner model receives the interpreted
+rules as generation guidance, but its response is not trusted as proof of
+compliance.
 
 Planner LLM failures produce one sanitized CloudWatch warning per failed typed
 provider attempt. The record includes `attempt`, `elapsed_ms`, `model`, and a
@@ -185,18 +251,22 @@ TELEGRAM_BOT_TOKEN=replace-with-token
 TELEGRAM_WEBHOOK_SECRET=replace-with-webhook-secret
 LLM_API_KEY=replace-with-llm-key
 TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
-TELEGRAM_BOT_TOKEN_SECRET_NAME=meal-planner/bot-token
-TELEGRAM_WEBHOOK_SECRET_NAME=meal-planner/webhook-secret
-LLM_API_KEY_SECRET_NAME=meal-planner/llm-key
+APP_SECRETS_SECRET_NAME=meal-planner/app-secrets
 SYNC_SECRETS=false
 ```
 
 The routine workflow prints numbered stage headings as it checks prerequisites,
-authenticates and confirms the AWS identity, checks that all three named
-Secrets Manager secrets exist, runs `sam validate --lint` and
+authenticates and confirms the AWS identity, checks that the configured JSON
+Secrets Manager secret exists, runs `sam validate --lint` and
 `sam build --beta-features`, deploys with a generated refresh token, resolves
 the required stack outputs, registers the canonical Telegram command menu,
 sets the webhook, and verifies the webhook:
+
+Webhook verification confirms that Telegram reports the exact deployed
+`WebhookUrl`. Telegram can retain delivery error metadata from an earlier
+attempt; that metadata is reported as a warning and does not by itself fail
+the deployment. For an actual delivery problem, inspect the current webhook
+status and the Bot Lambda logs.
 
 The routine announcements are, in order:
 
@@ -226,8 +296,10 @@ uv run python scripts/deploy.py --guided
 
 Secret synchronization is a deliberate external mutation and requires both
 `SYNC_SECRETS=true` in `.env` and the command-line `--sync-secrets` flag. The
-orchestrator creates missing secrets or updates existing ones, but never puts
-secret values in command arguments, logs, errors, or summaries:
+orchestrator creates or replaces one JSON secret containing the stable fields
+`telegram_bot_token`, `telegram_webhook_secret`, and `llm_api_key`. Secret
+updates replace the complete object; individual field updates are not merged.
+Secret values never appear in command arguments, logs, errors, or summaries:
 
 ```bash
 uv run python scripts/deploy.py --sync-secrets
@@ -248,6 +320,10 @@ and webhook verification. It announces and skips secret checks, SAM
 validation, SAM building, deployment, and IAM simulation; it never checks or
 changes secrets. The same recovery mode can be used after a Telegram API
 failure without repeating an AWS deployment.
+Recovery uses the same webhook contract: verification requires Telegram's
+reported URL to match the deployed `WebhookUrl`; retained delivery errors are
+warnings, while current delivery problems require inspecting the current
+webhook status and Bot Lambda logs.
 The stack outputs `WebhookUrl`, `MealPlannerTableName`, `BotFunctionName`, and
 `PlannerFunctionName`; malformed or missing outputs are failures. The direct
 read-only IAM verifier remains available as a troubleshooting command and
@@ -286,28 +362,37 @@ plan confirmation and a meal check-in callback to exercise the other Bot
 transaction paths. Remove the webhook and delete the test stack only after
 preserving any data needed for investigation.
 
-To rotate a secret, update one secret at a time, then deploy with a new unique
-`SecretRefreshToken`. The marker changes both Lambda resources, forcing
-CloudFormation to re-resolve the versionless Secrets Manager references. For
-an LLM key or bot token:
+To rotate a credential, write the complete JSON object to a restricted local
+file, publish it, and deploy with a new unique `SecretRefreshToken`. The
+deployment script generates that refresh token and changes both Lambda
+resources, forcing CloudFormation to re-resolve the versionless field
+references:
 
 ```bash
-aws secretsmanager put-secret-value --secret-id meal-planner/llm-key \
-  --secret-string "$NEW_LLM_API_KEY"
-uvx --from aws-sam-cli sam deploy --parameter-overrides \
-  TelegramBotTokenSecretName=meal-planner/bot-token \
-  TelegramWebhookSecretName=meal-planner/webhook-secret \
-  LlmApiKeySecretName=meal-planner/llm-key \
-  SecretRefreshToken="$(date +%s)"
+umask 077
+cat > /tmp/meal-planner-app-secrets.json <<'JSON'
+{"telegram_bot_token":"replace-with-token","telegram_webhook_secret":"replace-with-webhook-secret","llm_api_key":"replace-with-llm-key"}
+JSON
+aws secretsmanager put-secret-value \
+  --secret-id "$APP_SECRETS_SECRET_NAME" \
+  --secret-string file:///tmp/meal-planner-app-secrets.json \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION"
+uv run python scripts/deploy.py
+rm -f /tmp/meal-planner-app-secrets.json
 ```
 
-For webhook-secret rotation, update the secret and deploy the Lambda before
-registering the new Telegram webhook secret, then verify the webhook. A single
-accepted secret necessarily has a brief coordinated transition window; dual
-secret acceptance is outside this remediation. CloudFormation resolves
-dynamic references on resource updates, while a secret-value-only change does
-not refresh an existing Lambda environment ([dynamic reference rotation
-behavior](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/dynamic-references-secretsmanager.html)).
+For webhook-secret rotation, publish the complete JSON object first, deploy the
+Lambda with the new refresh token second, then register and verify the Telegram
+webhook with the new webhook-secret field. A single accepted secret necessarily
+has a brief coordinated transition window; dual-secret acceptance is outside
+this remediation. CloudFormation resolves dynamic references on resource
+updates, while a secret-value-only change does not refresh an existing Lambda
+environment ([dynamic reference rotation behavior](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/dynamic-references-secretsmanager.html)).
+
+Keep the three legacy Secrets Manager secrets until the new deployment and
+webhook have passed live verification. Remove or schedule deletion of those
+legacy secrets manually through the approved AWS process; this repository does
+not automate that destructive cleanup.
 
 For rollback, identify the last known-good commit, rebuild it, and redeploy the
 same stack parameters. DynamoDB uses on-demand billing and is retained only as
@@ -331,26 +416,40 @@ The Telegram command menu and `/help` show the same command reference:
 
 - `/start` — Start onboarding or view what to do next.
 - `/help` — Show the available commands.
-- `/profile` — View the household profile.
-- `/plan` — Create or retry a weekly meal plan.
+- `/profile` — View and amend the household profile.
+- `/plan` — Create or retry a meal plan.
 - `/grocery` — View the active grocery list.
 - `/today` — View today's planned meals.
-- `/submit_meals` — Log meals eaten in the past week.
+- `/submit_meals` — Submit one meal eaten in the past seven UTC calendar days.
 - `/checkin` — Record today's planned meal outcomes.
 - `/cancel` — Cancel an unfinished workflow.
 
 - `/start` begins onboarding. Supply the family name separately from the
-  household size, every household member's name and calorie target, allergies,
-  preferences, restrictions, and goals. Known onboarding fields carry across
+  household size, every household member's name and calorie target, dietary
+  constraints, and dietary preferences. Known onboarding fields carry across
   conversational turns, so provide only the fields the bot still requests.
-- `/profile` shows the persisted family name and individual member details.
+- `/profile` shows the persisted family name and individual member details,
+  with button-led amendment navigation for family members, dietary
+  constraints, and dietary preferences. Family add and calorie changes
+  use one message such as `John 1500`; list changes use one item such as
+  `dairy` or `eat more vegetables`.
 - Natural-language no-value answers such as `none`, `nothing`, `no allergies`,
   and `no restrictions` are stored as empty categories. They count as answers,
   while omitted fields remain missing until supplied.
-- `/plan` asks for a one-time request preference before asynchronously
-  generating a complete seven-day draft. The draft is persisted before
-  Telegram delivery; failed generation retains the preference for `/plan` to
-  retry.
+- `/plan` asks for a duration and request-specific preference in the form
+  `N, preference`, for example `1, no preference` or `3, fish for dinner`.
+  Split only at the first comma when the preference contains more commas.
+  After the initial response, clarification replies are preference-only and
+  retain the selected duration. If the request cannot be interpreted
+  completely, the bot asks one focused clarification and keeps the raw
+  preference in the same workflow; your next reply is combined with it.
+  Historical in-progress seven-day requests continue to accept
+  preference-only replies. The draft is persisted before Telegram delivery
+  only after application validation. An invalid first result receives one
+  automatic repair in a separate Planner invocation. If that repair also
+  fails, no draft is saved, the preference is retained, and `/plan` is the
+  manual retry. Cancelling or replacing an in-progress request prevents its
+  older asynchronous result from being published.
 - Ask conversationally to edit an existing meal; missing days or meal types
   are rejected rather than silently created.
 - Tell the bot to confirm the draft. Confirmation starts grocery generation.
@@ -362,11 +461,55 @@ The Telegram command menu and `/help` show the same command reference:
   previous grocery attempt is in `error`; `pending` and `ready` are not reset.
 - `/grocery` reports `pending`, `ready`, or `error`, and shows ready sections.
 - `/today` shows the active confirmed plan's meals for today.
-- `/submit_meals` guides actual meal logging, including multiple meals of the
-  same type on one date. `/checkin` sends plan-specific buttons for `cooked`,
+- `/submit_meals` sends the recent history first, grouped under UTC `Today`
+  and `Yesterday`, followed by a separate input prompt. Enter exactly three
+  comma-separated fields:
+
+  ```text
+  when, meal type, what you ate
+  ```
+
+  Only the first two commas are separators, so later commas remain part of
+  the description. For `when`, use `today`, `yesterday`, or a strict
+  `YYYY-MM-DD` date. The bot interprets aliases and dates in UTC and accepts
+  only the inclusive seven-calendar-day range from six days ago through
+  today. The four valid meal types are `breakfast`, `lunch`, `snack`, and
+  `dinner`, case-insensitively. For example:
+
+  ```text
+  today, lunch, vegetable soup, with bread
+  ```
+
+  Invalid entries are rejected with an explanation and the full input
+  instructions again; they do not save anything. A valid entry is echoed in
+  a review message with `✅ Confirm` and `❌ Cancel`. Confirm saves exactly one
+  meal and shows `➕ Add more` and `✅ Done`; `Add more` starts another empty
+  submission, while `Done` ends meal logging. `Cancel` discards the
+  unconfirmed meal. Old or repeated buttons cannot change a newer submission
+  or save a duplicate. `/checkin` sends plan-specific buttons for `cooked`,
   `skipped`, and `swapped`. Old, draft, expired, malformed, and superseded
   overlapping-plan callbacks are rejected, even if the older plan still
   covers today.
+
+### Per-member nutrition targets
+
+Protein and fibre targets are optional grams/day values per member. Calories
+remain required for profile completion; the absence of optional targets does
+not block profile completion or plan generation. Add a family member with
+either `name calories` or `name calories protein fibre`, for example
+`John Smith 2000 120 30`.
+
+The Family profile menu changes protein and fibre independently. For either
+action, send `name grams`, such as `John Smith 120`. To clear an optional
+target, send `name none`; clearing is case-insensitive. Calorie, protein, and
+fibre changes preserve the other saved targets, and omitted targets remain
+`not set` rather than being inferred.
+
+Target adjustment is prompt-guided and best-effort. The generated plan keeps
+the existing calorie estimate schema; this phase does not calculate daily
+calorie, protein, or fibre totals or automatically repair them. Missed
+calorie, protein, or fibre targets are not automatically detected in this
+phase.
 
 Conversational metadata supports `log_meal`, `update_profile`, `edit_plan`,
 `confirm_plan`, `suggestion`, and `chitchat`. Mutations are validated before
@@ -401,8 +544,10 @@ non-empty section before it can become ready.
 - Incomplete profile updates are retained as a draft, including household
   size and partial member targets, so the next turn can finish onboarding
   without resubmitting known fields.
-- Telegram delivery failure: check the endpoint status in logs; logs omit bot
-  tokens and message content.
+- Telegram delivery failure: inspect the current webhook status and the Bot
+  Lambda logs; logs omit bot tokens and message content. Retained historical
+  delivery metadata is a warning during webhook verification, not a substitute
+  for checking current delivery behavior.
 - SAM smoke-test failure: rerun a clean SAM build. Tests reject stale source or
   generated templates.
 - Timeout failures: keep configured request timeouts below Lambda deadlines;

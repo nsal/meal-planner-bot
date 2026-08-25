@@ -1,7 +1,7 @@
 """Tests for the deployed transaction-permission verifier."""
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
@@ -10,7 +10,8 @@ from scripts import verify_transaction_permission as verifier
 
 STACK_NAME = "meal-planner-test"
 REGION = "us-east-1"
-ROLE_ARN = "arn:aws:iam::123456789012:role/bot-role"
+BOT_ROLE_ARN = "arn:aws:iam::123456789012:role/bot-role"
+PLANNER_ROLE_ARN = "arn:aws:iam::123456789012:role/planner-role"
 TABLE_ARN = "arn:aws:dynamodb:us-east-1:123456789012:table/test-table"
 
 
@@ -18,6 +19,7 @@ def _clients(
     *,
     outputs: list[dict[str, str]] | None = None,
     evaluation_results: list[dict[str, str]] | None = None,
+    evaluation_results_by_call: list[list[dict[str, str]]] | None = None,
 ) -> dict[str, Any]:
     cloudformation = MagicMock()
     cloudformation.describe_stacks.return_value = {
@@ -27,6 +29,10 @@ def _clients(
                 or [
                     {"OutputKey": "BotFunctionName", "OutputValue": "bot"},
                     {
+                        "OutputKey": "PlannerFunctionName",
+                        "OutputValue": "planner",
+                    },
+                    {
                         "OutputKey": "MealPlannerTableName",
                         "OutputValue": "table",
                     },
@@ -35,20 +41,27 @@ def _clients(
         ]
     }
     lambda_client = MagicMock()
-    lambda_client.get_function_configuration.return_value = {"Role": ROLE_ARN}
+    lambda_client.get_function_configuration.side_effect = [
+        {"Role": BOT_ROLE_ARN},
+        {"Role": PLANNER_ROLE_ARN},
+    ]
     dynamodb = MagicMock()
     dynamodb.describe_table.return_value = {"Table": {"TableArn": TABLE_ARN}}
     iam = MagicMock()
-    iam.simulate_principal_policy.return_value = {
-        "EvaluationResults": evaluation_results
-        or [
-            {
-                "EvalActionName": "dynamodb:TransactWriteItems",
-                "EvalResourceName": TABLE_ARN,
-                "EvalDecision": "allowed",
-            }
-        ]
+    allowed_result = {
+        "EvalActionName": "dynamodb:TransactWriteItems",
+        "EvalResourceName": TABLE_ARN,
+        "EvalDecision": "allowed",
     }
+    if evaluation_results_by_call is not None:
+        iam.simulate_principal_policy.side_effect = [
+            {"EvaluationResults": results}
+            for results in evaluation_results_by_call
+        ]
+    else:
+        iam.simulate_principal_policy.return_value = {
+            "EvaluationResults": evaluation_results or [allowed_result]
+        }
     return {
         "cloudformation": cloudformation,
         "lambda": lambda_client,
@@ -73,12 +86,26 @@ def test_allowed_transaction_permission_returns_zero(
     _patch_clients(mocker, clients)
 
     assert verifier.main(["--stack-name", STACK_NAME, "--region", REGION]) == 0
-    assert "explicitly allows" in capsys.readouterr().out
-    clients["iam"].simulate_principal_policy.assert_called_once_with(
-        PolicySourceArn=ROLE_ARN,
-        ActionNames=["dynamodb:TransactWriteItems"],
-        ResourceArns=[TABLE_ARN],
+    assert "BotFunction and PlannerFunction roles" in capsys.readouterr().out
+    clients["lambda"].get_function_configuration.assert_has_calls(
+        [call(FunctionName="bot"), call(FunctionName="planner")]
     )
+    assert clients["lambda"].get_function_configuration.call_count == 2
+    clients["iam"].simulate_principal_policy.assert_has_calls(
+        [
+            call(
+                PolicySourceArn=BOT_ROLE_ARN,
+                ActionNames=["dynamodb:TransactWriteItems"],
+                ResourceArns=[TABLE_ARN],
+            ),
+            call(
+                PolicySourceArn=PLANNER_ROLE_ARN,
+                ActionNames=["dynamodb:TransactWriteItems"],
+                ResourceArns=[TABLE_ARN],
+            ),
+        ]
+    )
+    assert clients["iam"].simulate_principal_policy.call_count == 2
 
 
 @pytest.mark.parametrize(
@@ -113,6 +140,35 @@ def test_denied_or_malformed_authorization_returns_nonzero(
     assert verifier.main(["--stack-name", STACK_NAME, "--region", REGION]) == 1
     error = capsys.readouterr().err
     assert "IAM transaction permission" in error or "malformed" in error
+
+
+def test_planner_denied_transaction_permission_returns_nonzero(
+    mocker: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A denied Planner role fails the whole deployment verification."""
+    clients = _clients(
+        evaluation_results_by_call=[
+            [
+                {
+                    "EvalActionName": "dynamodb:TransactWriteItems",
+                    "EvalResourceName": TABLE_ARN,
+                    "EvalDecision": "allowed",
+                }
+            ],
+            [
+                {
+                    "EvalActionName": "dynamodb:TransactWriteItems",
+                    "EvalResourceName": TABLE_ARN,
+                    "EvalDecision": "implicitDeny",
+                }
+            ],
+        ]
+    )
+    _patch_clients(mocker, clients)
+
+    assert verifier.main(["--stack-name", STACK_NAME, "--region", REGION]) == 1
+    assert "implicitDeny" in capsys.readouterr().err
+    assert clients["iam"].simulate_principal_policy.call_count == 2
 
 
 def test_botocore_error_returns_safe_type_and_message(
@@ -157,7 +213,10 @@ def test_missing_stack_output_returns_nonzero(
 ) -> None:
     """Missing deployment outputs are reported as verification failures."""
     clients = _clients(
-        outputs=[{"OutputKey": "BotFunctionName", "OutputValue": "bot"}]
+        outputs=[
+            {"OutputKey": "BotFunctionName", "OutputValue": "bot"},
+            {"OutputKey": "PlannerFunctionName", "OutputValue": "planner"},
+        ]
     )
     _patch_clients(mocker, clients)
 
@@ -233,4 +292,4 @@ def test_explicit_profile_uses_profile_aware_session(
     session_factory.assert_called_once_with(
         profile_name="meal-planner", region_name="eu-west-1"
     )
-    assert "explicitly allows" in capsys.readouterr().out
+    assert "BotFunction and PlannerFunction roles" in capsys.readouterr().out

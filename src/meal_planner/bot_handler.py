@@ -5,9 +5,11 @@ import hmac
 import json
 import logging
 import os
+import re
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import uuid4
 
 import boto3  # type: ignore[import-untyped]
@@ -19,35 +21,67 @@ from meal_planner.config import (
     get_webhook_secret,
 )
 from meal_planner.db.dynamo import DynamoRepository
+from meal_planner.dietary_rules import (
+    expand_constraint_entry,
+    has_constraint_conflict,
+    resolve_priority_rules,
+    validate_constraints,
+)
 from meal_planner.llm.client import LLMClient
-from meal_planner.llm.parser import parse_conversational_response
-from meal_planner.llm.prompts import build_conversational_prompt
+from meal_planner.llm.parser import (
+    parse_conversational_response,
+    parse_preference_interpretation,
+)
+from meal_planner.llm.prompts import (
+    build_conversational_prompt,
+    build_preference_interpretation_prompt,
+)
 from meal_planner.models.schemas import (
+    MAX_PLAN_REQUIREMENTS,
+    ConstraintEntry,
     ConversationIntent,
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
+    DietaryPreferenceEntry,
+    DietaryRule,
+    FamilyMember,
     GroceryStatus,
     Ingredient,
     MealLogDraft,
     MealLogEntry,
     MealOutcome,
     MealType,
+    PlanDays,
     PlannedMeal,
     PlanStatus,
+    PreferenceRequirement,
+    ProfileEditCategory,
+    ProfileEditOperation,
     ProfileUpdateEntities,
+    RuleOperator,
     UserProfile,
     WeeklyPlan,
+    canonicalize_constraint_entry,
+    canonicalize_dietary_rule,
+    canonicalize_profile_rule_ids,
 )
 from meal_planner.planner_handler import (
     FINALIZE_GROCERY,
     GENERATE_PLAN,
     REVISE_PLAN,
 )
+from meal_planner.preferences import validate_horizon_feasibility
 from meal_planner.router import (
+    MealCallback,
+    ProfileCallback,
+    ProfileCallbackAction,
     RouteResult,
     RouteType,
     parse_checkin_callback,
+    parse_meal_callback,
+    parse_meal_input,
+    parse_profile_callback,
     route_update,
 )
 from meal_planner.telegram.access import TelegramAccessPolicy
@@ -57,6 +91,22 @@ from meal_planner.telegram.commands import render_help
 logger = logging.getLogger(__name__)
 
 WEBHOOK_SECRET_HEADER = "x-telegram-bot-api-secret-token"
+MEAL_INPUT_PROMPT = (
+    "Submit one meal using this format:\n"
+    "when, meal type, what you ate\n\n"
+    "Use today or yesterday, or a strict YYYY-MM-DD date. Dates are "
+    "interpreted in UTC and must be within the last seven calendar days, "
+    "including today. Meal type must be breakfast, lunch, snack, or "
+    "dinner. Keep the description after the second comma.\n\n"
+    "Example: today, lunch, vegetable soup"
+)
+
+_COMMAND_REFERENCE_DATE: ContextVar[date | None] = ContextVar(
+    "command_reference_date", default=None
+)
+
+_PROFILE_PENDING_PREFIX = "profile-pending:"
+_MAX_PROFILE_PENDING_BYTES = 4_000
 
 
 @dataclass(frozen=True)
@@ -147,7 +197,13 @@ class BotHandler:
         }
         handler = handlers.get(route.command or "")
         if handler:
-            handler(route.chat_id, route.user_id)
+            token = _COMMAND_REFERENCE_DATE.set(
+                self._reference_date_from_route(route)
+            )
+            try:
+                handler(route.chat_id, route.user_id)
+            finally:
+                _COMMAND_REFERENCE_DATE.reset(token)
         else:
             self.telegram_api.send_message(
                 route.chat_id,
@@ -171,8 +227,12 @@ class BotHandler:
         else:
             message = (
                 "Welcome to Meal Planner Bot! Tell me your family name, "
-                "household size, each household member's name and calorie "
-                "target, allergies, preferences, restrictions, and goals. "
+                "household size, and each household member's name and "
+                "required calorie target. You may also provide optional "
+                "protein and fibre targets in grams/day for each member; "
+                "these are not required to complete setup or generate a "
+                "plan. Tell me your dietary constraints, dietary "
+                "preferences. "
                 "After setup, use /plan, /submit_meals, /checkin, or "
                 "/cancel."
             )
@@ -185,20 +245,18 @@ class BotHandler:
                 chat_id, "No complete profile found. Use /start to begin."
             )
             return
-        lines = [
-            f"Family name: {profile.name}",
-            f"People count: {profile.people_count}",
-            "Family members:",
-            *(
-                f"- {member.name} ({member.calorie_target} kcal/day)"
-                for member in profile.family_members
-            ),
-            f"Allergies: {', '.join(profile.allergies) or 'None'}",
-            f"Preferences: {', '.join(profile.dietary_preferences) or 'None'}",
-            f"Restrictions: {', '.join(profile.restrictions) or 'None'}",
-            f"Goals: {', '.join(profile.goals) or 'None'}",
-        ]
-        self.telegram_api.send_message(chat_id, "\n".join(lines))
+        previous = self._get_conversation_state(user_id)
+        profile_state = self._new_profile_state()
+        if not self._replace_conversation_state(
+            user_id, profile_state, previous
+        ):
+            self.telegram_api.send_message(
+                chat_id,
+                "That workflow changed while I was opening /profile. "
+                "Please try again.",
+            )
+            return
+        self.telegram_api.send_profile(chat_id, profile)
 
     def _cmd_plan(self, chat_id: int | str, user_id: str) -> None:
         profile = self.repo.get_profile(user_id)
@@ -227,8 +285,9 @@ class BotHandler:
         prefix = "I replaced your unfinished workflow. " if replaced else ""
         self.telegram_api.send_message(
             chat_id,
-            prefix + "Do you have any preferences for the next plan? "
-            "Reply with a preference, or say 'no preference'.",
+            prefix + "How many days should the plan cover, and what preference "
+            "should I use? Reply like '3, fish for dinner' or "
+            "'7, no preference'.",
         )
 
     def _cmd_grocery(self, chat_id: int | str, user_id: str) -> None:
@@ -265,8 +324,11 @@ class BotHandler:
         self.telegram_api.send_message(chat_id, "\n".join(lines))
 
     def _cmd_submit_meals(self, chat_id: int | str, user_id: str) -> None:
+        reference_date = (
+            _COMMAND_REFERENCE_DATE.get() or datetime.now(timezone.utc).date()
+        )
         state = self._get_conversation_state(user_id)
-        meal_state = self._new_meal_state()
+        meal_state = self._new_submission_state()
         if not self._replace_conversation_state(user_id, meal_state, state):
             self.telegram_api.send_message(
                 chat_id,
@@ -274,13 +336,15 @@ class BotHandler:
                 "Please try again.",
             )
             return
-        prefix = "I replaced your unfinished workflow. " if state else ""
+        history = self.repo.get_meal_history(
+            user_id, days=2, on_date=reference_date
+        )
+        prefix = "I replaced your unfinished workflow.\n\n" if state else ""
         self.telegram_api.send_message(
             chat_id,
-            prefix
-            + "What date was the meal? Use YYYY-MM-DD, from today through "
-            "the previous seven days.",
+            prefix + self._format_recent_meal_history(history, reference_date),
         )
+        self.telegram_api.send_message(chat_id, MEAL_INPUT_PROMPT)
 
     def _cmd_checkin(self, chat_id: int | str, user_id: str) -> None:
         """Show planned-meal outcome buttons for today's active plan."""
@@ -319,6 +383,76 @@ class BotHandler:
         return state if isinstance(state, ConversationState) else None
 
     @staticmethod
+    def _reference_date_from_route(route: RouteResult) -> date:
+        """Derive a UTC command date, falling back to processing time."""
+        message = route.raw_update.get("message")
+        timestamp = message.get("date") if isinstance(message, dict) else None
+        if isinstance(timestamp, int) and not isinstance(timestamp, bool):
+            try:
+                return datetime.fromtimestamp(timestamp, timezone.utc).date()
+            except OSError, OverflowError, TypeError, ValueError:
+                pass
+        return datetime.now(timezone.utc).date()
+
+    @staticmethod
+    def _format_recent_meal_history(
+        history: list[MealLogEntry], reference_date: date
+    ) -> str:
+        """Render the two calendar groups shown when meal logging starts."""
+        ordered = sorted(
+            history,
+            key=lambda entry: (
+                entry.date,
+                (
+                    entry.created_at.astimezone(timezone.utc)
+                    if entry.created_at.tzinfo is not None
+                    and entry.created_at.utcoffset() is not None
+                    else entry.created_at.replace(tzinfo=timezone.utc)
+                ),
+            ),
+            reverse=True,
+        )
+        groups = {
+            "Today": [
+                entry for entry in ordered if entry.date == reference_date
+            ],
+            "Yesterday": [
+                entry
+                for entry in ordered
+                if entry.date == reference_date - timedelta(days=1)
+            ],
+        }
+        lines = ["Recent meals", ""]
+        for index, (label, entries) in enumerate(groups.items()):
+            lines.append(label)
+            if entries:
+                lines.extend(
+                    f"- {entry.meal_type.value.capitalize()}: "
+                    f"{entry.description}"
+                    for entry in entries
+                )
+            else:
+                lines.append("No meals submitted.")
+            if index == 0:
+                lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _new_submission_state() -> ConversationState:
+        """Create an empty, request-identifiable meal input state."""
+        now = datetime.now(timezone.utc)
+        return ConversationState(
+            workflow_kind=ConversationWorkflowKind.MEAL_LOG,
+            step=ConversationWorkflowStep.AWAITING_MEAL_INPUT,
+            meal_draft=MealLogDraft(),
+            request_id=str(uuid4()),
+            revision=0,
+            created_at=now,
+            updated_at=now,
+            expires_at=int((now + timedelta(hours=24)).timestamp()),
+        )
+
+    @staticmethod
     def _new_meal_state() -> ConversationState:
         now = datetime.now(timezone.utc)
         return ConversationState(
@@ -337,11 +471,105 @@ class BotHandler:
         return ConversationState(
             workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
             step=ConversationWorkflowStep.AWAITING_PREFERENCE,
+            plan_days=7,
+            duration_collected=False,
             request_id=str(uuid4()),
             revision=0,
             created_at=now,
             updated_at=now,
             expires_at=int((now + timedelta(hours=24)).timestamp()),
+        )
+
+    @staticmethod
+    def _new_profile_state() -> ConversationState:
+        """Create an empty durable profile amendment menu state."""
+        now = datetime.now(timezone.utc)
+        return ConversationState(
+            workflow_kind=ConversationWorkflowKind.PROFILE_EDIT,
+            step=ConversationWorkflowStep.PROFILE_MENU,
+            revision=0,
+            created_at=now,
+            updated_at=now,
+            expires_at=int((now + timedelta(hours=24)).timestamp()),
+        )
+
+    @staticmethod
+    def _encode_pending_profile_rules(
+        mode: str,
+        source_text: str,
+        rules: list[ConstraintEntry | DietaryRule],
+    ) -> tuple[str, str]:
+        """Serialize one bounded interpretation for durable confirmation."""
+        token = uuid4().hex[:12]
+        payload = {
+            "mode": mode,
+            "source_text": source_text,
+            "rules": [rule.model_dump(mode="json") for rule in rules],
+            "token": token,
+        }
+        encoded = _PROFILE_PENDING_PREFIX + json.dumps(
+            payload, separators=(",", ":"), sort_keys=True
+        )
+        if len(encoded.encode("utf-8")) > _MAX_PROFILE_PENDING_BYTES:
+            raise ValueError("profile interpretation is too large")
+        return encoded, token
+
+    @staticmethod
+    def _decode_pending_profile_rules(
+        value: str | None,
+    ) -> tuple[str, str, list[ConstraintEntry | DietaryRule], str] | None:
+        """Validate a serialized pending interpretation before use."""
+        if value is None or not value.startswith(_PROFILE_PENDING_PREFIX):
+            return None
+        if len(value.encode("utf-8")) > _MAX_PROFILE_PENDING_BYTES:
+            return None
+        try:
+            payload = json.loads(value[len(_PROFILE_PENDING_PREFIX) :])
+        except TypeError, ValueError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        mode = payload.get("mode")
+        source_text = payload.get("source_text")
+        token = payload.get("token")
+        raw_rules = payload.get("rules")
+        if (
+            mode not in {"constraint", "stored_preference"}
+            or not isinstance(source_text, str)
+            or not source_text
+            or not isinstance(token, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", token)
+            or not isinstance(raw_rules, list)
+            or not 1 <= len(raw_rules) <= 20
+        ):
+            return None
+        rules: list[ConstraintEntry | DietaryRule] = []
+        try:
+            for raw_rule in raw_rules:
+                if not isinstance(raw_rule, dict):
+                    return None
+                rules.append(
+                    ConstraintEntry.model_validate(raw_rule)
+                    if mode == "constraint"
+                    else DietaryRule.model_validate(raw_rule)
+                )
+        except ValidationError:
+            return None
+        return mode, source_text, rules, token
+
+    @staticmethod
+    def _profile_menu_state(state: ConversationState) -> ConversationState:
+        """Return the next menu state while consuming pending input."""
+        now = datetime.now(timezone.utc)
+        return state.model_copy(
+            update={
+                "step": ConversationWorkflowStep.PROFILE_MENU,
+                "profile_category": None,
+                "profile_operation": None,
+                "last_update_id": None,
+                "revision": state.revision + 1,
+                "updated_at": now,
+            }
         )
 
     def _replace_conversation_state(
@@ -365,6 +593,11 @@ class BotHandler:
         return next((item for item in plan.days if item.day == offset), None)
 
     def handle_callback(self, route: RouteResult) -> None:
+        if route.callback_data:
+            profile_callback = parse_profile_callback(route.callback_data)
+            if profile_callback is not None:
+                self._handle_profile_callback(route, profile_callback)
+                return
         acknowledgement = "Unable to update meal"
         try:
             if (
@@ -372,6 +605,19 @@ class BotHandler:
                 or not route.user_id
                 or not route.callback_data
             ):
+                return
+            if route.callback_data.startswith("meal:"):
+                meal_callback = parse_meal_callback(route.callback_data)
+                if meal_callback is None:
+                    acknowledgement = "Invalid meal action"
+                    self._send_meal_message(
+                        route.chat_id,
+                        "That meal button is invalid or outdated.",
+                    )
+                    return
+                acknowledgement = self._handle_meal_callback(
+                    route, meal_callback
+                )
                 return
             callback = parse_checkin_callback(route.callback_data)
             if callback is None:
@@ -395,6 +641,24 @@ class BotHandler:
                 acknowledgement = "Inactive plan"
                 self.telegram_api.send_message(
                     route.chat_id, "That check-in belongs to an inactive plan."
+                )
+                return
+            target_day = next(
+                (
+                    plan_day
+                    for plan_day in snapshot.plan.days
+                    if plan_day.day == callback.day
+                ),
+                None,
+            )
+            if target_day is None or not any(
+                meal.meal_type.value == callback.meal_type.value
+                for meal in target_day.meals
+            ):
+                acknowledgement = "Invalid check-in"
+                self.telegram_api.send_message(
+                    route.chat_id,
+                    "That check-in button is invalid or outdated.",
                 )
                 return
             updated = self.repo.update_meal_outcome(
@@ -439,12 +703,596 @@ class BotHandler:
                 except TelegramAPIError:
                     logger.error("Failed to acknowledge callback query")
 
+    def _handle_profile_rule_callback(
+        self,
+        route: RouteResult,
+        callback: ProfileCallback,
+        state: ConversationState,
+    ) -> None:
+        """Confirm or cancel a pending interpreted dietary rule."""
+        assert route.chat_id is not None
+        assert route.user_id is not None
+        assert callback.token is not None
+        pending = self._decode_pending_profile_rules(state.last_update_id)
+        if pending is None or pending[3] != callback.token:
+            self.telegram_api.send_message(
+                route.chat_id,
+                "That profile confirmation is stale or outdated. Nothing was "
+                "changed.",
+            )
+            return
+        if callback.action is ProfileCallbackAction.CANCEL:
+            next_state = self._profile_menu_state(state)
+            if not self.repo.transition_conversation_state(
+                route.user_id, next_state, expected_revision=state.revision
+            ):
+                self.telegram_api.send_message(
+                    route.chat_id,
+                    "That profile confirmation changed. Please try again.",
+                )
+                return
+            self.telegram_api.send_message(
+                route.chat_id, "Cancelled the pending profile change."
+            )
+            self.telegram_api.send_profile_root(route.chat_id)
+            return
+
+        profile = self.repo.get_profile(route.user_id, consistent_read=True)
+        if profile is None:
+            self.telegram_api.send_message(
+                route.chat_id, "No complete profile found. Use /start to begin."
+            )
+            return
+        mode, _, rules, _ = pending
+        removed_sources: list[str] = []
+        if mode == "constraint":
+            constraints = list(profile.dietary_constraints)
+            constraints.extend(
+                rule for rule in rules if isinstance(rule, ConstraintEntry)
+            )
+            for preference in profile.dietary_preferences:
+                if preference.rule is not None and any(
+                    has_constraint_conflict(preference.rule, [constraint])
+                    for constraint in constraints
+                ):
+                    removed_sources.append(preference.source_text)
+            updated = self._profile_with_updates(
+                profile, {"dietary_constraints": constraints}
+            )
+        else:
+            preferences = list(profile.dietary_preferences)
+            for rule in rules:
+                if not isinstance(rule, DietaryRule):
+                    continue
+                if has_constraint_conflict(rule, profile.dietary_constraints):
+                    next_state = self._profile_menu_state(state)
+                    if self.repo.transition_conversation_state(
+                        route.user_id,
+                        next_state,
+                        expected_revision=state.revision,
+                    ):
+                        self.telegram_api.send_message(
+                            route.chat_id,
+                            "That preference conflicts with a dietary "
+                            "constraint and was not saved.",
+                        )
+                    else:
+                        self.telegram_api.send_message(
+                            route.chat_id,
+                            "That profile confirmation changed. Please try "
+                            "again.",
+                        )
+                    return
+                preferences.append(
+                    DietaryPreferenceEntry(
+                        id=rule.id,
+                        source_text=rule.source_text,
+                        rule=rule,
+                    )
+                )
+            updated = self._profile_with_updates(
+                profile, {"dietary_preferences": preferences}
+            )
+        updated = canonicalize_profile_rule_ids(updated)
+        next_state = self._profile_menu_state(state)
+        try:
+            committed = self.repo.save_profile_and_transition_state(
+                route.user_id, updated, next_state, state
+            )
+        except Exception:
+            logger.exception("Profile rule confirmation failed")
+            committed = False
+        if not committed:
+            self.repo.get_profile(route.user_id, consistent_read=True)
+            self.telegram_api.send_message(
+                route.chat_id,
+                "That profile confirmation is stale. Please open /profile "
+                "again.",
+            )
+            return
+        message = "Profile change saved."
+        if removed_sources:
+            message += (
+                " Removed conflicting preferences: "
+                + ", ".join(removed_sources)
+                + "."
+            )
+        self.telegram_api.send_message(route.chat_id, message)
+        self.telegram_api.send_profile_root(route.chat_id)
+
+    def _handle_profile_callback(
+        self, route: RouteResult, callback: ProfileCallback
+    ) -> None:
+        """Navigate the profile editor without changing the profile."""
+        if (
+            route.chat_id is None
+            or not route.user_id
+            or not route.callback_query_id
+        ):
+            return
+
+        try:
+            self.telegram_api.answer_callback_query(
+                route.callback_query_id, "Processing profile action"
+            )
+        except TelegramAPIError:
+            logger.error("Failed to acknowledge profile callback")
+
+        try:
+            state = self._get_conversation_state(route.user_id)
+            if (
+                state is None
+                or state.workflow_kind
+                is not ConversationWorkflowKind.PROFILE_EDIT
+            ):
+                self.telegram_api.send_message(
+                    route.chat_id,
+                    "That profile menu is no longer active. Use /profile "
+                    "to open it again.",
+                )
+                return
+
+            if callback.action in {
+                ProfileCallbackAction.CONFIRM,
+                ProfileCallbackAction.CANCEL,
+            }:
+                self._handle_profile_rule_callback(route, callback, state)
+                return
+
+            if callback.action is ProfileCallbackAction.ROOT:
+                if state.step is not ConversationWorkflowStep.PROFILE_MENU:
+                    self.telegram_api.send_message(
+                        route.chat_id,
+                        "Finish or go back from the current profile edit "
+                        "first.",
+                    )
+                    return
+                self.telegram_api.send_profile_root(route.chat_id)
+                return
+
+            if callback.action is ProfileCallbackAction.CATEGORY:
+                assert callback.category is not None
+                if state.step is not ConversationWorkflowStep.PROFILE_MENU:
+                    self.telegram_api.send_message(
+                        route.chat_id,
+                        "Finish or go back from the current profile edit "
+                        "first.",
+                    )
+                    return
+                self.telegram_api.send_profile_category(
+                    route.chat_id, callback.category
+                )
+                return
+
+            if callback.action is ProfileCallbackAction.OPERATION:
+                assert callback.category is not None
+                assert callback.operation is not None
+                if state.step is not ConversationWorkflowStep.PROFILE_MENU:
+                    self.telegram_api.send_message(
+                        route.chat_id,
+                        "Finish or go back from the current profile edit "
+                        "first.",
+                    )
+                    return
+                now = datetime.now(timezone.utc)
+                candidate = state.model_copy(
+                    update={
+                        "step": ConversationWorkflowStep.AWAITING_PROFILE_INPUT,
+                        "profile_category": callback.category,
+                        "profile_operation": callback.operation,
+                        "revision": state.revision + 1,
+                        "updated_at": now,
+                    }
+                )
+                if not self.repo.transition_conversation_state(
+                    route.user_id,
+                    candidate,
+                    expected_revision=state.revision,
+                ):
+                    self.telegram_api.send_message(
+                        route.chat_id,
+                        "That profile menu changed. Please use /profile again.",
+                    )
+                    return
+                self.telegram_api.send_profile_operation(
+                    route.chat_id, callback.category, callback.operation
+                )
+                return
+
+            if callback.action is ProfileCallbackAction.BACK:
+                if (
+                    state.step
+                    is ConversationWorkflowStep.AWAITING_PROFILE_INPUT
+                ):
+                    now = datetime.now(timezone.utc)
+                    candidate = state.model_copy(
+                        update={
+                            "step": ConversationWorkflowStep.PROFILE_MENU,
+                            "profile_category": None,
+                            "profile_operation": None,
+                            "revision": state.revision + 1,
+                            "updated_at": now,
+                        }
+                    )
+                    if not self.repo.transition_conversation_state(
+                        route.user_id,
+                        candidate,
+                        expected_revision=state.revision,
+                    ):
+                        self.telegram_api.send_message(
+                            route.chat_id,
+                            "That profile menu changed. Please try again.",
+                        )
+                        return
+                self.telegram_api.send_profile_root(route.chat_id)
+                return
+
+            if callback.action in {
+                ProfileCallbackAction.DONE,
+                ProfileCallbackAction.CLOSE,
+            }:
+                if not self.repo.delete_conversation_state(
+                    route.user_id, expected_revision=state.revision
+                ):
+                    self.telegram_api.send_message(
+                        route.chat_id,
+                        "That profile menu changed. Please use /profile again.",
+                    )
+                    return
+                message = (
+                    "Profile amendments saved."
+                    if callback.action is ProfileCallbackAction.DONE
+                    else "Closed profile amendments."
+                )
+                self.telegram_api.send_message(route.chat_id, message)
+        except Exception:
+            logger.exception("Profile callback handling failed")
+            if route.chat_id is not None:
+                try:
+                    self.telegram_api.send_message(
+                        route.chat_id,
+                        "Sorry, I couldn't open that profile menu. Please try "
+                        "again.",
+                    )
+                except TelegramAPIError:
+                    logger.error(
+                        "Failed to deliver profile callback error message"
+                    )
+
+    def _handle_meal_callback(
+        self, route: RouteResult, callback: MealCallback
+    ) -> str:
+        """Apply one revision- and submission-checked meal action."""
+        if route.chat_id is None or route.user_id is None:
+            return "Invalid meal action"
+
+        try:
+            state = self._get_conversation_state(route.user_id)
+            if not self._meal_callback_matches(state, callback.submission_id):
+                self._send_stale_meal_action(route.chat_id)
+                return "Stale meal action"
+            assert state is not None
+
+            if callback.action.value == "confirm":
+                return self._confirm_meal_callback(
+                    route.chat_id, route.user_id, state, callback.submission_id
+                )
+            if callback.action.value == "cancel":
+                return self._cancel_meal_callback(
+                    route.chat_id,
+                    route.user_id,
+                    state,
+                    callback.submission_id,
+                )
+            if callback.action.value == "add":
+                return self._add_meal_callback(
+                    route.chat_id,
+                    route.user_id,
+                    state,
+                    callback.submission_id,
+                )
+            if callback.action.value == "done":
+                return self._done_meal_callback(
+                    route.chat_id,
+                    route.user_id,
+                    state,
+                    callback.submission_id,
+                )
+        except Exception:
+            logger.exception("Error handling meal callback")
+            self._send_meal_message(
+                route.chat_id,
+                "Sorry, I couldn't update that meal. Please try again.",
+            )
+            return "Unable to update meal"
+        return "Invalid meal action"
+
+    @staticmethod
+    def _meal_callback_matches(
+        state: ConversationState | None, submission_id: str
+    ) -> bool:
+        return (
+            state is not None
+            and state.workflow_kind is ConversationWorkflowKind.MEAL_LOG
+            and state.request_id == submission_id
+        )
+
+    def _confirm_meal_callback(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        state: ConversationState,
+        submission_id: str,
+    ) -> str:
+        """Atomically save a reviewed meal and show continuation actions."""
+        if (
+            state.step
+            is not ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION
+        ):
+            if (
+                state.step
+                is ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+            ):
+                self._send_saved_meal_continuation(
+                    chat_id, state, submission_id
+                )
+                return "Already saved"
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        draft = state.meal_draft
+        if draft is None or not draft.date or not draft.meal_type:
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        if not draft.description:
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+
+        now = datetime.now(timezone.utc)
+        entry = MealLogEntry(
+            date=draft.date,
+            meal_type=draft.meal_type,
+            description=draft.description,
+            created_at=now,
+        )
+        continuation = state.model_copy(
+            update={
+                "step": ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+                "revision": state.revision + 1,
+                "updated_at": now,
+            }
+        )
+        try:
+            confirmed = self.repo.confirm_meal_and_transition(
+                user_id,
+                entry,
+                continuation,
+                expected_revision=state.revision,
+                submission_id=submission_id,
+            )
+        except Exception:
+            logger.exception("Meal confirmation persistence failed")
+            self._send_meal_message(
+                chat_id,
+                "I couldn't save that meal. Your review is still available; "
+                "please try again.",
+            )
+            return "Unable to save meal"
+
+        if confirmed:
+            try:
+                self.telegram_api.send_meal_saved(
+                    chat_id, entry.description, submission_id
+                )
+            except TelegramAPIError:
+                logger.error("Meal saved delivery failed")
+            return "Meal saved"
+
+        current = self._get_conversation_state(user_id)
+        if (
+            current is not None
+            and current.workflow_kind is ConversationWorkflowKind.MEAL_LOG
+            and current.step
+            is ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+            and current.request_id == submission_id
+        ):
+            self._send_saved_meal_continuation(chat_id, current, submission_id)
+            return "Already saved"
+        self._send_stale_meal_action(chat_id)
+        return "Stale meal action"
+
+    def _send_saved_meal_continuation(
+        self,
+        chat_id: int | str,
+        state: ConversationState,
+        submission_id: str,
+    ) -> None:
+        """Retry saved-meal delivery with its continuation controls."""
+        if state.meal_draft is None or state.meal_draft.description is None:
+            self._send_stale_meal_action(chat_id)
+            return
+        try:
+            self.telegram_api.send_meal_saved(
+                chat_id, state.meal_draft.description, submission_id
+            )
+        except TelegramAPIError:
+            logger.error("Already-saved meal delivery failed")
+
+    def _cancel_meal_callback(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        state: ConversationState,
+        submission_id: str,
+    ) -> str:
+        """Discard an unconfirmed meal only at its observed revision."""
+        if (
+            state.step
+            is not ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION
+        ):
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        try:
+            deleted = self.repo.delete_conversation_state(
+                user_id,
+                expected_revision=state.revision,
+                expected_request_id=submission_id,
+                expected_step=(
+                    ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION
+                ),
+            )
+        except Exception:
+            logger.exception("Meal cancellation persistence failed")
+            self._send_meal_message(
+                chat_id,
+                "I couldn't cancel that meal. Please try again.",
+            )
+            return "Unable to cancel meal"
+        if not deleted:
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        self._send_meal_message(chat_id, "Cancelled. This meal was not saved.")
+        return "Meal cancelled"
+
+    def _add_meal_callback(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        state: ConversationState,
+        submission_id: str,
+    ) -> str:
+        """Start another empty submission after a confirmed meal."""
+        if (
+            state.step
+            is not ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+        ):
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        next_state = self._new_submission_state().model_copy(
+            update={
+                "revision": state.revision + 1,
+            }
+        )
+        try:
+            transitioned = self.repo.transition_conversation_state(
+                user_id,
+                next_state,
+                expected_revision=state.revision,
+                expected_request_id=submission_id,
+                expected_step=(
+                    ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+                ),
+            )
+        except Exception:
+            logger.exception("Starting another meal persistence failed")
+            self._send_meal_message(
+                chat_id,
+                "I couldn't start another meal. Please try again.",
+            )
+            return "Unable to add meal"
+        if not transitioned:
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        self._send_meal_message(chat_id, MEAL_INPUT_PROMPT)
+        return "Add more"
+
+    def _done_meal_callback(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        state: ConversationState,
+        submission_id: str,
+    ) -> str:
+        """Finish meal logging after the current meal has been saved."""
+        if (
+            state.step
+            is not ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+        ):
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        try:
+            deleted = self.repo.delete_conversation_state(
+                user_id,
+                expected_revision=state.revision,
+                expected_request_id=submission_id,
+                expected_step=(
+                    ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+                ),
+            )
+        except Exception:
+            logger.exception("Completing meal workflow persistence failed")
+            self._send_meal_message(
+                chat_id,
+                "I couldn't finish meal logging. Please try again.",
+            )
+            return "Unable to finish meal logging"
+        if not deleted:
+            self._send_stale_meal_action(chat_id)
+            return "Stale meal action"
+        self._send_meal_message(chat_id, "Done. Meal logging is complete.")
+        return "Meal logging complete"
+
+    def _send_stale_meal_action(self, chat_id: int | str) -> None:
+        """Tell the user that a meal button no longer applies."""
+        self._send_meal_message(
+            chat_id,
+            "That meal action is stale or outdated. Nothing was changed.",
+        )
+
+    def _send_meal_message(self, chat_id: int | str, text: str) -> None:
+        """Deliver a response without losing its callback acknowledgement."""
+        try:
+            self.telegram_api.send_message(chat_id, text)
+        except TelegramAPIError:
+            logger.error("Meal callback delivery failed")
+
     def handle_conversational(self, route: RouteResult) -> None:
         if route.chat_id is None or not route.user_id or not route.text:
             return
         try:
             source_update_id = self._get_source_update_id(route)
             state = self._get_conversation_state(route.user_id)
+            if (
+                state
+                and state.workflow_kind is ConversationWorkflowKind.MEAL_LOG
+            ):
+                if state.step is ConversationWorkflowStep.AWAITING_MEAL_INPUT:
+                    self._handle_structured_meal_input(
+                        route.chat_id,
+                        route.user_id,
+                        route.text,
+                        route,
+                        state,
+                    )
+                elif state.step in {
+                    ConversationWorkflowStep.AWAITING_DATE,
+                    ConversationWorkflowStep.AWAITING_MEAL_TYPE,
+                    ConversationWorkflowStep.AWAITING_DESCRIPTION,
+                    ConversationWorkflowStep.AWAITING_ANOTHER_MEAL,
+                }:
+                    self._restart_legacy_meal_workflow(
+                        route.chat_id, route.user_id, state
+                    )
+                return
             if (
                 state
                 and state.workflow_kind is ConversationWorkflowKind.PLAN_REQUEST
@@ -468,6 +1316,16 @@ class BotHandler:
                     route.text,
                     state,
                 )
+                return
+            if (
+                state
+                and state.workflow_kind is ConversationWorkflowKind.PROFILE_EDIT
+            ):
+                message = self._handle_profile_edit_input(
+                    route.user_id, route.chat_id, route.text, state
+                )
+                if message is not None:
+                    self.telegram_api.send_message(route.chat_id, message)
                 return
             profile = self.repo.get_profile(route.user_id)
             profile_draft = self.repo.get_profile_draft(route.user_id)
@@ -523,6 +1381,630 @@ class BotHandler:
                 route.chat_id,
                 "Sorry, I couldn't process that request. Please try again.",
             )
+
+    @staticmethod
+    def _parse_profile_name_calories(
+        text: str,
+    ) -> tuple[str, int, int | None, int | None] | None:
+        """Parse a member name followed by two or four target fields."""
+        if "\n" in text or "\r" in text:
+            return None
+        parts = text.strip().split()
+        if len(parts) < 2:
+            return None
+        if len(parts) >= 4 and all(part.isdecimal() for part in parts[-3:]):
+            name_parts = parts[:-3]
+            calorie_text, protein_text, fibre_text = parts[-3:]
+            if not name_parts or any(part.isdecimal() for part in name_parts):
+                return None
+            name = " ".join(name_parts)
+            calories = int(calorie_text)
+            protein = int(protein_text)
+            fibre = int(fibre_text)
+            if (
+                not 1 <= calories <= 10_000
+                or not 1 <= protein <= 1_000
+                or not 1 <= fibre <= 1_000
+            ):
+                return None
+            return name, calories, protein, fibre
+        if not parts[-1].isdecimal():
+            return None
+        name_parts = parts[:-1]
+        if not name_parts or any(part.isdecimal() for part in name_parts):
+            return None
+        name = " ".join(name_parts)
+        calories = int(parts[-1])
+        if not 1 <= calories <= 10_000:
+            return None
+        return name, calories, None, None
+
+    @staticmethod
+    def _parse_profile_target_change(
+        text: str,
+    ) -> tuple[str, int | None] | None:
+        """Parse a member name followed by one nutrient target or ``none``."""
+        if "\n" in text or "\r" in text:
+            return None
+        match = re.fullmatch(r"(.+?)\s+(none|[0-9]+)", text.strip(), re.I)
+        if match is None:
+            return None
+        name = match.group(1).strip()
+        target_text = match.group(2)
+        if not name or any(part.isdecimal() for part in name.split()):
+            return None
+        if target_text.casefold() == "none":
+            return name, None
+        target = int(target_text)
+        if not 1 <= target <= 1_000:
+            return None
+        return name, target
+
+    @staticmethod
+    def _parse_profile_member_suffix(
+        text: str,
+        members: list[FamilyMember],
+        *,
+        allow_none: bool,
+        maximum: int,
+    ) -> tuple[str, int | None] | None:
+        """Parse a final target suffix for an existing member edit.
+
+        Unlike the add-member parser, this parser permits numeric name tokens.
+        A stored identity prefix is used to reject extra suffix fields before
+        the caller resolves the complete parsed name.
+        """
+        if "\n" in text or "\r" in text:
+            return None
+        stripped = text.strip()
+        try:
+            name, target_text = stripped.rsplit(maxsplit=1)
+        except ValueError:
+            return None
+        target: int | None
+        if target_text.casefold() == "none":
+            if not allow_none:
+                return None
+            target = None
+        elif target_text.isdecimal():
+            target = int(target_text)
+            if not 1 <= target <= maximum:
+                return None
+        else:
+            return None
+
+        name_identity = BotHandler._member_identity(name)
+        if not name_identity:
+            return None
+        if any(
+            name_identity == BotHandler._member_identity(member.name)
+            for member in members
+        ):
+            return name, target
+        for member in members:
+            stored_name = member.name.strip()
+            if name.casefold().startswith(stored_name.casefold() + " "):
+                return None
+        return name, target
+
+    @staticmethod
+    def _parse_profile_member_name(text: str) -> str | None:
+        """Parse one exact, non-empty family member name."""
+        if "\n" in text or "\r" in text:
+            return None
+        name = text.strip()
+        return name or None
+
+    @staticmethod
+    def _member_identity(name: str) -> str:
+        """Return the stable identity key for a family member name."""
+        return name.strip().casefold()
+
+    @staticmethod
+    def _has_duplicate_member_identities(
+        members: list[FamilyMember],
+    ) -> bool:
+        """Return whether members contain a stripped, case-folded duplicate."""
+        identities: set[str] = set()
+        for member in members:
+            identity = BotHandler._member_identity(member.name)
+            if identity in identities:
+                return True
+            identities.add(identity)
+        return False
+
+    @staticmethod
+    def _parse_profile_item(text: str) -> str | None:
+        """Parse one non-empty profile list item."""
+        if "\n" in text or "\r" in text:
+            return None
+        item = text.strip()
+        if not item or item.casefold() in {
+            "none",
+            "no",
+            "nothing",
+            "n/a",
+            "not applicable",
+        }:
+            return None
+        return item
+
+    @staticmethod
+    def _profile_with_updates(
+        profile: UserProfile, updates: dict[str, Any]
+    ) -> UserProfile:
+        """Create a validated profile copy without mutating the original."""
+        data = profile.model_dump(mode="json")
+        data.update(updates)
+        return UserProfile.model_validate(data)
+
+    @staticmethod
+    def _profile_items(
+        profile: UserProfile, category: ProfileEditCategory
+    ) -> list[Any]:
+        """Return a copied list for a non-family profile category."""
+        if category is ProfileEditCategory.DIETARY_CONSTRAINTS:
+            return list(profile.dietary_constraints)
+        if category is ProfileEditCategory.DIETARY_PREFERENCES:
+            return list(profile.dietary_preferences)
+        raise ValueError("family is not an item category")
+
+    def _handle_profile_edit_input(
+        self,
+        user_id: str,
+        chat_id: int | str,
+        text: str,
+        state: ConversationState,
+    ) -> str | None:
+        """Apply one deterministic profile amendment and return its result."""
+        if state.step is not ConversationWorkflowStep.AWAITING_PROFILE_INPUT:
+            return "Please choose a profile amendment from the buttons."
+        category = state.profile_category
+        operation = state.profile_operation
+        if category is None or operation is None:
+            return "That profile edit is invalid. Please use /profile again."
+
+        if self._decode_pending_profile_rules(state.last_update_id) is not None:
+            return "Please confirm or cancel the pending profile change first."
+
+        if operation is ProfileEditOperation.ADD and category in {
+            ProfileEditCategory.DIETARY_CONSTRAINTS,
+            ProfileEditCategory.DIETARY_PREFERENCES,
+        }:
+            if self._parse_profile_item(text) is None:
+                return "Send one non-empty item."
+            mode: Literal["constraint", "stored_preference"] = (
+                "constraint"
+                if category is ProfileEditCategory.DIETARY_CONSTRAINTS
+                else "stored_preference"
+            )
+            try:
+                client = self.llm_client or LLMClient()
+                interpretation = parse_preference_interpretation(
+                    client.chat_sync(
+                        build_preference_interpretation_prompt(text, mode=mode),
+                        text,
+                    ),
+                    mode=mode,
+                )
+            except Exception:
+                logger.error("Profile rule interpretation failed")
+                interpretation = (
+                    [],
+                    "I couldn't safely interpret that profile change. "
+                    "Please rephrase it with specific foods.",
+                )
+            rules, clarification = interpretation
+            if clarification:
+                return clarification
+            if not rules:
+                return "Please provide a specific dietary rule."
+            typed_rules = [
+                rule
+                for rule in rules
+                if isinstance(rule, (ConstraintEntry, DietaryRule))
+            ]
+            if len(typed_rules) != len(rules):
+                return "I couldn't safely interpret that profile change."
+            pending_rules: list[ConstraintEntry | DietaryRule] = typed_rules
+            if mode == "constraint":
+                canonical_constraints: list[ConstraintEntry] = []
+                for rule in typed_rules:
+                    if not isinstance(rule, ConstraintEntry):
+                        return (
+                            "I couldn't safely interpret that profile change."
+                        )
+                    expansion = expand_constraint_entry(rule)
+                    if not expansion.is_safe:
+                        return (
+                            "I couldn't safely interpret that constraint. "
+                            "Please rephrase it with specific foods."
+                        )
+                    canonical_constraints.append(
+                        canonicalize_constraint_entry(
+                            rule.model_copy(
+                                update={
+                                    "forbidden_terms": list(expansion.terms),
+                                    "uninterpretable": False,
+                                }
+                            ),
+                            namespace="profile-constraint",
+                        )
+                    )
+                pending_rules = list(canonical_constraints)
+            else:
+                pending_rules = [
+                    canonicalize_dietary_rule(
+                        rule, namespace="profile-preference"
+                    )
+                    for rule in typed_rules
+                    if isinstance(rule, DietaryRule)
+                ]
+            try:
+                pending_value, token = self._encode_pending_profile_rules(
+                    mode, text.strip(), pending_rules
+                )
+            except ValueError:
+                return "That profile change is too large. Please shorten it."
+            candidate = state.model_copy(
+                update={
+                    "revision": state.revision + 1,
+                    "updated_at": datetime.now(timezone.utc),
+                    "last_update_id": pending_value,
+                }
+            )
+            if not self.repo.transition_conversation_state(
+                user_id, candidate, expected_revision=state.revision
+            ):
+                return "That profile edit is stale. Please open /profile again."
+            self.telegram_api.send_profile_rule_review(
+                chat_id, category, text.strip(), pending_rules, token
+            )
+            return None
+
+        profile = self.repo.get_profile(user_id, consistent_read=True)
+        if profile is None:
+            return "No complete profile found. Use /start to begin."
+
+        try:
+            updated, message = self._apply_profile_amendment(
+                profile, category, operation, text
+            )
+        except ValidationError:
+            return "That profile change is invalid. Please use a shorter value."
+        except ValueError as exc:
+            return str(exc)
+        if updated is None:
+            return message
+
+        now = datetime.now(timezone.utc)
+        menu_state = state.model_copy(
+            update={
+                "step": ConversationWorkflowStep.PROFILE_MENU,
+                "profile_category": None,
+                "profile_operation": None,
+                "revision": state.revision + 1,
+                "updated_at": now,
+            }
+        )
+        try:
+            committed = self.repo.save_profile_and_transition_state(
+                user_id, updated, menu_state, state
+            )
+        except Exception:
+            logger.exception("Profile amendment transaction failed")
+            return "I couldn't save that profile change. Please try again."
+        if not committed:
+            self.repo.get_profile(user_id, consistent_read=True)
+            return "That profile edit is stale. Please open /profile again."
+        self.telegram_api.send_message(chat_id, message)
+        self.telegram_api.send_profile_category(chat_id, category)
+        return None
+
+    def _apply_profile_amendment(
+        self,
+        profile: UserProfile,
+        category: ProfileEditCategory,
+        operation: ProfileEditOperation,
+        text: str,
+    ) -> tuple[UserProfile | None, str]:
+        """Validate and apply one immutable profile amendment."""
+        if not operation.is_valid_for(category):
+            return None, "That profile operation is not available here."
+        if category is ProfileEditCategory.FAMILY:
+            return self._apply_family_amendment(profile, operation, text)
+        return self._apply_item_amendment(profile, category, operation, text)
+
+    @staticmethod
+    def _apply_family_amendment(
+        profile: UserProfile,
+        operation: ProfileEditOperation,
+        text: str,
+    ) -> tuple[UserProfile | None, str]:
+        """Apply one deterministic family-member amendment."""
+        members = list(profile.family_members)
+        if operation is ProfileEditOperation.REMOVE:
+            name = BotHandler._parse_profile_member_name(text)
+            if name is None:
+                return None, "Send one exact member name to remove."
+            if len(members) == 1:
+                return None, "You must keep at least one family member."
+            matching_indices = [
+                index
+                for index, member in enumerate(members)
+                if BotHandler._member_identity(member.name)
+                == BotHandler._member_identity(name)
+            ]
+            if len(matching_indices) > 1:
+                return (
+                    None,
+                    "That family member name is ambiguous in this legacy "
+                    "profile. Please update the names before trying again.",
+                )
+            if not matching_indices:
+                return None, "I couldn't find that family member."
+            index = matching_indices[0]
+            removed = members.pop(index)
+            return (
+                BotHandler._profile_with_updates(
+                    profile,
+                    {
+                        "family_members": [
+                            member.model_dump(mode="json") for member in members
+                        ],
+                        "people_count": len(members),
+                    },
+                ),
+                f"Removed {removed.name}.",
+            )
+
+        if operation in {
+            ProfileEditOperation.CHANGE_PROTEIN,
+            ProfileEditOperation.CHANGE_FIBRE,
+        }:
+            parsed_target = BotHandler._parse_profile_member_suffix(
+                text, members, allow_none=True, maximum=1_000
+            )
+            if parsed_target is None:
+                return None, "Use the format: name grams, or name none."
+            name, target = parsed_target
+            matching_indices = [
+                index
+                for index, member in enumerate(members)
+                if BotHandler._member_identity(member.name)
+                == BotHandler._member_identity(name)
+            ]
+            if len(matching_indices) > 1:
+                return (
+                    None,
+                    "That family member name is ambiguous in this legacy "
+                    "profile. Please update the names before trying again.",
+                )
+            if not matching_indices:
+                return None, "I couldn't find that family member."
+            index = matching_indices[0]
+            field_name = (
+                "protein_target"
+                if operation is ProfileEditOperation.CHANGE_PROTEIN
+                else "fibre_target"
+            )
+            members[index] = members[index].model_copy(
+                update={field_name: target}
+            )
+            label = "protein" if field_name == "protein_target" else "fibre"
+            action = "cleared" if target is None else "updated"
+            return (
+                BotHandler._profile_with_updates(
+                    profile,
+                    {
+                        "family_members": [
+                            member.model_dump(mode="json") for member in members
+                        ],
+                        "people_count": len(members),
+                    },
+                ),
+                f"{action.capitalize()} {members[index].name}'s {label} "
+                "target.",
+            )
+
+        if operation is ProfileEditOperation.CHANGE_CALORIES:
+            parsed_target = BotHandler._parse_profile_member_suffix(
+                text, members, allow_none=False, maximum=10_000
+            )
+            if parsed_target is None or parsed_target[1] is None:
+                return (
+                    None,
+                    "Use the format: name calories, or name calories "
+                    "protein fibre.",
+                )
+            name = parsed_target[0]
+            calories = parsed_target[1]
+            assert calories is not None
+            protein = None
+            fibre = None
+        else:
+            parsed = BotHandler._parse_profile_name_calories(text)
+            if parsed is None:
+                return (
+                    None,
+                    "Use the format: name calories, or name calories "
+                    "protein fibre.",
+                )
+            name, calories, protein, fibre = parsed
+        if operation is ProfileEditOperation.CHANGE_CALORIES and (
+            protein is not None or fibre is not None
+        ):
+            return None, "Use the format: name calories."
+        matching_indices = [
+            index
+            for index, member in enumerate(members)
+            if BotHandler._member_identity(member.name)
+            == BotHandler._member_identity(name)
+        ]
+        if operation is ProfileEditOperation.ADD:
+            if len(matching_indices) > 1:
+                return (
+                    None,
+                    "That family member name is ambiguous in this legacy "
+                    "profile. Please update the names before trying again.",
+                )
+            if matching_indices:
+                return None, "That family member already exists."
+            if len(members) >= 20:
+                return None, "A profile can have at most 20 family members."
+            member = FamilyMember(
+                name=name,
+                calorie_target=calories,
+                protein_target=protein,
+                fibre_target=fibre,
+            )
+            members.append(member)
+            return (
+                BotHandler._profile_with_updates(
+                    profile,
+                    {
+                        "family_members": [
+                            item.model_dump(mode="json") for item in members
+                        ],
+                        "people_count": len(members),
+                    },
+                ),
+                f"Added {name}.",
+            )
+        if len(matching_indices) > 1:
+            return (
+                None,
+                "That family member name is ambiguous in this legacy profile. "
+                "Please update the names before trying again.",
+            )
+        if not matching_indices:
+            return None, "I couldn't find that family member."
+        index = matching_indices[0]
+        members[index] = members[index].model_copy(
+            update={"calorie_target": calories}
+        )
+        return (
+            BotHandler._profile_with_updates(
+                profile,
+                {
+                    "family_members": [
+                        item.model_dump(mode="json") for item in members
+                    ],
+                    "people_count": len(members),
+                },
+            ),
+            f"Updated {members[index].name}'s calorie target.",
+        )
+
+    @staticmethod
+    def _apply_item_amendment(
+        profile: UserProfile,
+        category: ProfileEditCategory,
+        operation: ProfileEditOperation,
+        text: str,
+    ) -> tuple[UserProfile | None, str]:
+        """Apply one item-list addition or removal."""
+        item = BotHandler._parse_profile_item(text)
+        if item is None:
+            return None, "Send one non-empty item."
+        items = BotHandler._profile_items(profile, category)
+        matching_index = next(
+            (
+                index
+                for index, existing in enumerate(items)
+                if (
+                    existing.casefold()
+                    if isinstance(existing, str)
+                    else existing.source_text.casefold()
+                )
+                == item.casefold()
+            ),
+            None,
+        )
+        label = category.value.replace("_", " ")
+        if operation is ProfileEditOperation.ADD:
+            if matching_index is not None:
+                return None, f"That {label[:-1]} already exists."
+            items.append(item)
+            return (
+                BotHandler._profile_with_updates(
+                    profile, {category.value: items}
+                ),
+                f"Added {item}.",
+            )
+        if matching_index is None:
+            return None, f"I couldn't find that {label[:-1]}."
+        removed = items.pop(matching_index)
+        removed_text = (
+            removed if isinstance(removed, str) else removed.source_text
+        )
+        return (
+            BotHandler._profile_with_updates(profile, {category.value: items}),
+            f"Removed {removed_text}.",
+        )
+
+    def _handle_structured_meal_input(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        text: str,
+        route: RouteResult,
+        state: ConversationState,
+    ) -> None:
+        """Validate one meal locally and stage it for explicit review."""
+        result = parse_meal_input(text, self._reference_date_from_route(route))
+        if not result.is_valid:
+            explanation = "\n".join(result.errors)
+            self.telegram_api.send_message(
+                chat_id, f"{explanation}\n\n{MEAL_INPUT_PROMPT}"
+            )
+            return
+
+        assert result.draft is not None
+        now = datetime.now(timezone.utc)
+        review_state = state.model_copy(
+            update={
+                "step": ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
+                "meal_draft": result.draft,
+                "revision": state.revision + 1,
+                "updated_at": now,
+            }
+        )
+        if not self.repo.transition_conversation_state(
+            user_id, review_state, expected_revision=state.revision
+        ):
+            self.telegram_api.send_message(
+                chat_id,
+                "That meal workflow changed. Please use /submit_meals.",
+            )
+            return
+        if review_state.request_id is None:
+            raise ValueError("meal review state requires a request ID")
+        self.telegram_api.send_meal_review(
+            chat_id, text, review_state.request_id
+        )
+
+    def _restart_legacy_meal_workflow(
+        self,
+        chat_id: int | str,
+        user_id: str,
+        state: ConversationState,
+    ) -> None:
+        """Remove an old field-by-field meal workflow before restarting."""
+        if not self.repo.delete_conversation_state(
+            user_id, expected_revision=state.revision
+        ):
+            self.telegram_api.send_message(
+                chat_id,
+                "That meal workflow changed. Please use /submit_meals "
+                "to restart.",
+            )
+            return
+        self.telegram_api.send_message(
+            chat_id,
+            "Your older meal logging workflow was cleared. Please use "
+            "/submit_meals to restart.",
+        )
 
     def _handle_meal_workflow(
         self,
@@ -681,6 +2163,18 @@ class BotHandler:
         *,
         source_update_id: str | None,
     ) -> None:
+        if source_update_id and state.last_update_id == source_update_id:
+            if state.step is ConversationWorkflowStep.AWAITING_PREFERENCE:
+                self.telegram_api.send_message(
+                    chat_id,
+                    "Please continue with your preference or try again.",
+                )
+                return
+            elif state.step is ConversationWorkflowStep.GENERATING:
+                self.telegram_api.send_message(
+                    chat_id, self._plan_progress_message(state.plan_days)
+                )
+                return
         if state.step is not ConversationWorkflowStep.AWAITING_PREFERENCE:
             self.telegram_api.send_message(
                 chat_id,
@@ -688,12 +2182,30 @@ class BotHandler:
                 "if it fails.",
             )
             return
-        if source_update_id and state.last_update_id == source_update_id:
+
+        profile = self.repo.get_profile(user_id)
+        if profile is None:
             self.telegram_api.send_message(
-                chat_id, "Working on your weekly meal plan."
+                chat_id, "Complete your profile before generating a plan."
             )
             return
-        normalized = text.strip().casefold().rstrip(".!?,;:")
+
+        if state.duration_collected:
+            plan_days = state.plan_days
+            preference_text = text.strip()
+        else:
+            parsed = self._parse_initial_plan_response(text)
+            if parsed is None:
+                self.telegram_api.send_message(
+                    chat_id,
+                    "Please reply in the form '3, fish for dinner'. "
+                    "Choose 1 to 7 days and include a preference, or say "
+                    "'no preference'.",
+                )
+                return
+            plan_days, preference_text = parsed
+
+        normalized = preference_text.casefold().rstrip(".!?,;:")
         preference = (
             None
             if normalized
@@ -704,14 +2216,148 @@ class BotHandler:
                 "none",
                 "whatever",
             }
-            else text.strip()
+            else preference_text
+        )
+
+        if preference is None:
+            interpretation: tuple[
+                list[DietaryRule | ConstraintEntry], str | None
+            ] = (
+                [],
+                None,
+            )
+        else:
+            combined_preference = (
+                f"{state.preference}; {preference}"
+                if state.preference
+                else preference
+            )
+            if state.preference and len(combined_preference) > 500:
+                self.telegram_api.send_message(
+                    chat_id,
+                    "Your answer was not appended because the combined "
+                    "preference exceeds 500 characters. Use /plan to reset, "
+                    "then provide one complete preference of 500 characters "
+                    "or fewer.",
+                )
+                return
+            preference = combined_preference
+            if len(preference) > 500:
+                self.telegram_api.send_message(
+                    chat_id,
+                    "That preference is too long. Please keep it to 500 "
+                    "characters or fewer.",
+                )
+                return
+            try:
+                client = self.llm_client or LLMClient()
+                interpretation = parse_preference_interpretation(
+                    client.chat_sync(
+                        build_preference_interpretation_prompt(preference),
+                        preference,
+                    )
+                )
+            except Exception:
+                logger.error("Plan preference interpretation failed")
+                interpretation = (
+                    [],
+                    "I couldn't interpret that preference yet. Please try "
+                    "again or rephrase it.",
+                )
+
+        requirements, clarification = interpretation
+        current_rules = [
+            canonicalize_dietary_rule(rule, namespace="current")
+            for rule in requirements
+            if isinstance(rule, DietaryRule)
+        ]
+        stored_rules: list[DietaryRule] = []
+        stored_clarification: str | None = None
+        if not clarification:
+            stored_rules, stored_clarification = (
+                self._prepare_stored_preference_rules(profile)
+            )
+            if stored_clarification:
+                clarification = stored_clarification
+        constraint_rules = [
+            canonicalize_constraint_entry(constraint, namespace="constraint")
+            for constraint in profile.dietary_constraints
+        ]
+        resolution_message: str | None = None
+        if not clarification:
+            horizon_start = date.today()
+            safety = validate_constraints(constraint_rules)
+            if not safety.is_safe:
+                resolution_message = (
+                    "A saved dietary constraint cannot be safely matched. "
+                    "Please edit that constraint before generating a plan."
+                )
+            elif any(
+                has_constraint_conflict(rule, constraint_rules)
+                for rule in (*stored_rules, *current_rules)
+            ):
+                resolution_message = (
+                    "That preference conflicts with a dietary constraint and "
+                    "was not sent to the planner."
+                )
+            else:
+                resolution = resolve_priority_rules(
+                    stored_rules,
+                    current_rules,
+                    constraints=constraint_rules,
+                )
+                if resolution.clarification is not None:
+                    resolution_message = resolution.clarification.message
+                else:
+                    effective_rules = self._snapshot_effective_rules(
+                        list(resolution.effective_rules),
+                        stored_rules,
+                        current_rules,
+                    )
+                    effective_ids = [rule.id for rule in effective_rules]
+                    if len(effective_ids) != len(set(effective_ids)):
+                        resolution_message = (
+                            "I couldn't safely combine your dietary rules. "
+                            "Please clarify or remove the conflicting rule."
+                        )
+                    else:
+                        horizon_result = validate_horizon_feasibility(
+                            effective_rules,
+                            start_date=horizon_start,
+                            end_date=horizon_start
+                            + timedelta(days=int(plan_days) - 1),
+                        )
+                        if not horizon_result.is_feasible:
+                            resolution_message = (
+                                horizon_result.clarification
+                                or "Some preference rules cannot fit the "
+                                "requested plan horizon. Please clarify."
+                            )
+        if clarification or resolution_message:
+            effective_rules = []
+        # Structured interpretations belong exclusively in effective_rules.
+        # The requirements field is reserved for genuinely legacy events.
+        planner_requirements: list[PreferenceRequirement] = []
+        next_step = (
+            ConversationWorkflowStep.AWAITING_PREFERENCE
+            if clarification or resolution_message
+            else ConversationWorkflowStep.GENERATING
         )
         try:
             candidate = ConversationState.model_validate(
                 {
                     **state.model_dump(),
-                    "step": ConversationWorkflowStep.GENERATING,
+                    "step": next_step,
                     "preference": preference,
+                    "plan_days": plan_days,
+                    "duration_collected": True,
+                    "requirements": planner_requirements,
+                    "stored_rules": stored_rules,
+                    "current_rules": current_rules
+                    if not resolution_message
+                    else [],
+                    "effective_rules": effective_rules,
+                    "constraint_rules": constraint_rules,
                     "revision": state.revision + 1,
                     "updated_at": datetime.now(timezone.utc),
                     "last_update_id": source_update_id,
@@ -731,12 +2377,23 @@ class BotHandler:
                 chat_id, "That plan request changed. Please use /plan again."
             )
             return
+        if clarification or resolution_message:
+            message = clarification or resolution_message
+            assert message is not None
+            self.telegram_api.send_message(chat_id, message)
+            return
         invoked = self._invoke_planner(
             user_id,
             chat_id,
             GENERATE_PLAN,
-            week_start=date.today().isoformat(),
+            week_start=horizon_start.isoformat(),
+            plan_days=plan_days,
             preference=preference,
+            requirements=planner_requirements,
+            stored_rules=stored_rules,
+            current_rules=current_rules,
+            effective_rules=effective_rules,
+            constraint_rules=constraint_rules,
             request_id=candidate.request_id,
             state_revision=candidate.revision,
         )
@@ -758,12 +2415,170 @@ class BotHandler:
             )
             return
         self.telegram_api.send_message(
-            chat_id, "Working on your weekly meal plan."
+            chat_id, self._plan_progress_message(plan_days)
         )
+
+    @staticmethod
+    def _parse_initial_plan_response(
+        text: str,
+    ) -> tuple[PlanDays, str] | None:
+        """Parse the one-time ``N, preference`` plan response."""
+        duration_text, separator, preference_text = text.partition(",")
+        if not separator:
+            return None
+        if not duration_text.strip().isdecimal():
+            return None
+        plan_days = int(duration_text.strip())
+        preference = preference_text.strip()
+        if not 1 <= plan_days <= 7 or not preference:
+            return None
+        return plan_days, preference
+
+    @staticmethod
+    def _plan_progress_message(plan_days: PlanDays | None) -> str:
+        """Describe plan generation without assuming a seven-day horizon."""
+        if plan_days is None:
+            return "Working on your meal plan."
+        return f"Working on your {plan_days}-day meal plan."
+
+    def _prepare_stored_preference_rules(
+        self, profile: UserProfile
+    ) -> tuple[list[DietaryRule], str | None]:
+        """Interpret legacy stored wording before resolving plan rules."""
+        stored_rules: list[DietaryRule] = []
+        client = self.llm_client or LLMClient()
+        for entry in profile.dietary_preferences:
+            if entry.rule is not None:
+                stored_rules.append(
+                    canonicalize_dietary_rule(entry.rule, namespace="stored")
+                )
+                continue
+            try:
+                interpretation = parse_preference_interpretation(
+                    client.chat_sync(
+                        build_preference_interpretation_prompt(
+                            entry.source_text, mode="stored_preference"
+                        ),
+                        entry.source_text,
+                    ),
+                    mode="stored_preference",
+                )
+            except Exception:
+                logger.error("Stored preference interpretation failed")
+                return [], (
+                    "I couldn't safely interpret a saved dietary preference. "
+                    "Please rephrase or remove it before generating a plan."
+                )
+            rules, clarification = interpretation
+            if clarification:
+                return [], (
+                    "I couldn't safely interpret a saved dietary preference. "
+                    f"{clarification}"
+                )
+            if not rules or not all(
+                isinstance(rule, DietaryRule) for rule in rules
+            ):
+                return [], (
+                    "I couldn't safely interpret a saved dietary preference. "
+                    "Please rephrase or remove it before generating a plan."
+                )
+            stored_rules.extend(
+                canonicalize_dietary_rule(rule, namespace="stored")
+                for rule in rules
+                if isinstance(rule, DietaryRule)
+            )
+            if len(stored_rules) > MAX_PLAN_REQUIREMENTS:
+                return [], (
+                    "Your saved dietary preferences contain too many rules. "
+                    "Please remove one before generating a plan."
+                )
+        rule_ids = [rule.id for rule in stored_rules]
+        if len(rule_ids) != len(set(rule_ids)):
+            return [], (
+                "I couldn't safely combine your saved dietary preferences. "
+                "Please remove the duplicate preference and try again."
+            )
+        return sorted(stored_rules, key=lambda rule: rule.id), None
+
+    @staticmethod
+    def _snapshot_effective_rules(
+        resolved: list[DietaryRule],
+        stored_rules: list[DietaryRule],
+        current_rules: list[DietaryRule],
+    ) -> list[DietaryRule]:
+        """Give capped current maxima stable ownership in the snapshot.
+
+        The resolver retains a capped lower-priority obligation when a broad
+        maximum is absorbed.  The dispatch snapshot should still identify
+        that obligation as originating from the current request while
+        retaining the resolver's preferred scope and exact count.
+        """
+        snapshot = list(resolved)
+        snapshot_ids = {rule.id for rule in snapshot}
+        for current in current_rules:
+            if current.operator is not RuleOperator.AT_MOST:
+                continue
+            if current.id in snapshot_ids:
+                continue
+            overlapping_stored = [
+                rule
+                for rule in stored_rules
+                if rule.id in snapshot_ids
+                and rule.foods_any_of == current.foods_any_of
+            ]
+            if len(overlapping_stored) != 1:
+                continue
+            stored = overlapping_stored[0]
+            capped = next(
+                (item for item in snapshot if item.id == stored.id), None
+            )
+            if capped is None:
+                continue
+            snapshot[snapshot.index(capped)] = current.model_copy(
+                update={
+                    "operator": RuleOperator.EXACTLY,
+                    "count": capped.count,
+                    "weekdays": capped.weekdays,
+                    "meal_type": capped.meal_type,
+                }
+            )
+        return sorted(snapshot, key=lambda rule: rule.id)
 
     def _retry_plan_request(
         self, user_id: str, chat_id: int | str, state: ConversationState
     ) -> None:
+        retry_start = (
+            _COMMAND_REFERENCE_DATE.get() or datetime.now(timezone.utc).date()
+        )
+        horizon_result = validate_horizon_feasibility(
+            state.effective_rules,
+            start_date=retry_start,
+            end_date=retry_start + timedelta(days=int(state.plan_days) - 1),
+        )
+        if not horizon_result.is_feasible:
+            candidate = state.model_copy(
+                update={
+                    "step": ConversationWorkflowStep.AWAITING_PREFERENCE,
+                    "revision": state.revision + 1,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
+            if not self.repo.transition_conversation_state(
+                user_id, candidate, expected_revision=state.revision
+            ):
+                self.telegram_api.send_message(
+                    chat_id,
+                    "That plan request changed. Please try /plan again.",
+                )
+                return
+            self.telegram_api.send_message(
+                chat_id,
+                horizon_result.clarification
+                or "Some preference rules cannot fit the requested plan "
+                "horizon. Please clarify.",
+            )
+            return
+
         candidate = state.model_copy(
             update={
                 "step": ConversationWorkflowStep.GENERATING,
@@ -782,8 +2597,14 @@ class BotHandler:
             user_id,
             chat_id,
             GENERATE_PLAN,
-            week_start=date.today().isoformat(),
+            week_start=retry_start.isoformat(),
+            plan_days=candidate.plan_days,
             preference=candidate.preference,
+            requirements=candidate.requirements,
+            stored_rules=candidate.stored_rules,
+            current_rules=candidate.current_rules,
+            effective_rules=candidate.effective_rules,
+            constraint_rules=candidate.constraint_rules,
             request_id=candidate.request_id,
             state_revision=candidate.revision,
         ):
@@ -803,7 +2624,7 @@ class BotHandler:
             )
             return
         self.telegram_api.send_message(
-            chat_id, "Working on your weekly meal plan."
+            chat_id, self._plan_progress_message(candidate.plan_days)
         )
 
     @staticmethod
@@ -859,6 +2680,64 @@ class BotHandler:
                 False, "I couldn't save that change. Please try again."
             )
 
+    def _merge_omitted_member_targets(
+        self,
+        incoming_members: list[FamilyMember],
+        draft_members: list[FamilyMember] | None,
+        saved_members: list[FamilyMember] | None,
+    ) -> list[FamilyMember] | None:
+        """Inherit only omitted targets from an unambiguous member source."""
+        if all(
+            {
+                "protein_target",
+                "fibre_target",
+            }.issubset(member.model_fields_set)
+            for member in incoming_members
+        ):
+            return list(incoming_members)
+
+        draft_by_identity: dict[str, list[FamilyMember]] = {}
+        for member in draft_members or []:
+            identity = self._member_identity(member.name)
+            draft_by_identity.setdefault(identity, []).append(member)
+
+        saved_by_identity: dict[str, list[FamilyMember]] = {}
+        for member in saved_members or []:
+            identity = self._member_identity(member.name)
+            saved_by_identity.setdefault(identity, []).append(member)
+
+        merged_members: list[FamilyMember] = []
+        for incoming in incoming_members:
+            if {
+                "protein_target",
+                "fibre_target",
+            }.issubset(incoming.model_fields_set):
+                merged_members.append(incoming)
+                continue
+            identity = self._member_identity(incoming.name)
+            draft_matches = draft_by_identity.get(identity, [])
+            source: FamilyMember | None
+            if len(draft_matches) > 1:
+                return None
+            if len(draft_matches) == 1:
+                source = draft_matches[0]
+            else:
+                saved_matches = saved_by_identity.get(identity, [])
+                if len(saved_matches) > 1:
+                    return None
+                source = saved_matches[0] if saved_matches else None
+
+            updates: dict[str, int | None] = {}
+            if source is not None:
+                if "protein_target" not in incoming.model_fields_set:
+                    updates["protein_target"] = source.protein_target
+                if "fibre_target" not in incoming.model_fields_set:
+                    updates["fibre_target"] = source.fibre_target
+            merged_members.append(
+                incoming.model_copy(update=updates) if updates else incoming
+            )
+        return merged_members
+
     def _update_profile(
         self,
         user_id: str,
@@ -866,7 +2745,15 @@ class BotHandler:
         existing: UserProfile | None,
     ) -> MutationResult:
         update = ProfileUpdateEntities.model_validate(entities)
+        expected_revision = (
+            existing.profile_revision if existing is not None else None
+        )
         persisted_draft = self.repo.get_profile_draft(user_id)
+        draft_members = (
+            persisted_draft.family_members
+            if isinstance(persisted_draft, ProfileUpdateEntities)
+            else None
+        )
         if isinstance(persisted_draft, ProfileUpdateEntities):
             data = persisted_draft.model_dump(mode="json")
         elif existing:
@@ -880,16 +2767,37 @@ class BotHandler:
         ):
             data["family_members"] = None
         for field in update.model_fields_set:
-            data[field] = getattr(update, field)
+            value = getattr(update, field)
+            if field == "family_members" and value is not None:
+                value = self._merge_omitted_member_targets(
+                    value,
+                    draft_members,
+                    existing.family_members if existing else None,
+                )
+                if value is None:
+                    return MutationResult(
+                        False,
+                        "Family member names must be unique, ignoring "
+                        "capitalization and surrounding spaces.",
+                    )
+            data[field] = value
         draft = ProfileUpdateEntities.model_validate(data)
+        if (
+            "family_members" in update.model_fields_set
+            and draft.family_members is not None
+            and self._has_duplicate_member_identities(draft.family_members)
+        ):
+            return MutationResult(
+                False,
+                "Family member names must be unique, ignoring capitalization "
+                "and surrounding spaces.",
+            )
         required = (
             "name",
             "people_count",
             "family_members",
-            "allergies",
+            "dietary_constraints",
             "dietary_preferences",
-            "restrictions",
-            "goals",
         )
         missing = [field for field in required if getattr(draft, field) is None]
         if missing:
@@ -899,10 +2807,8 @@ class BotHandler:
                 "family_members": (
                     "each household member's name and calorie target"
                 ),
-                "allergies": "allergies",
+                "dietary_constraints": "dietary constraints",
                 "dietary_preferences": "dietary preferences",
-                "restrictions": "restrictions",
-                "goals": "goals",
             }
             self.repo.save_profile_draft(user_id, draft)
             return MutationResult(
@@ -921,8 +2827,32 @@ class BotHandler:
                 "Please provide one household member name and calorie "
                 "target for each person.",
             )
-        profile = UserProfile.model_validate(draft.model_dump())
-        self.repo.save_profile(user_id, profile)
+        profile = UserProfile.model_validate(draft.model_dump()).model_copy(
+            update={
+                "profile_revision": (
+                    expected_revision if expected_revision is not None else 0
+                )
+            }
+        )
+        if any(
+            constraint.uninterpretable
+            for constraint in profile.dietary_constraints
+        ):
+            return MutationResult(
+                False,
+                "I couldn't safely interpret that constraint. Please "
+                "rephrase it with specific foods.",
+            )
+        saved = self.repo.save_profile(
+            user_id, profile, expected_revision=expected_revision
+        )
+        if not saved:
+            self.repo.save_profile_draft(user_id, draft)
+            return MutationResult(
+                False,
+                "That profile is stale. Your latest profile was kept; "
+                "please try again.",
+            )
         self.repo.delete_profile_draft(user_id)
         return MutationResult(True, "Your profile has been saved.")
 
@@ -1266,7 +3196,15 @@ class BotHandler:
         action: str,
         *,
         week_start: str,
+        plan_days: PlanDays = 7,
         preference: str | None = None,
+        requirements: list[PreferenceRequirement] | None = None,
+        stored_rules: list[DietaryRule] | None = None,
+        current_rules: list[DietaryRule] | None = None,
+        effective_rules: list[DietaryRule] | None = None,
+        constraint_rules: list[ConstraintEntry] | None = None,
+        attempt: int = 1,
+        repair_feedback: str | None = None,
         amendment: str | None = None,
         request_id: str | None = None,
         state_revision: int | None = None,
@@ -1284,7 +3222,30 @@ class BotHandler:
             if action == GENERATE_PLAN:
                 payload.update(
                     {
+                        "plan_days": plan_days,
                         "preference": preference,
+                        "requirements": [
+                            requirement.model_dump(mode="json")
+                            for requirement in (requirements or [])
+                        ],
+                        "stored_rules": [
+                            rule.model_dump(mode="json")
+                            for rule in (stored_rules or [])
+                        ],
+                        "current_rules": [
+                            rule.model_dump(mode="json")
+                            for rule in (current_rules or [])
+                        ],
+                        "effective_rules": [
+                            rule.model_dump(mode="json")
+                            for rule in (effective_rules or [])
+                        ],
+                        "constraint_rules": [
+                            rule.model_dump(mode="json")
+                            for rule in (constraint_rules or [])
+                        ],
+                        "attempt": attempt,
+                        "repair_feedback": repair_feedback,
                         "request_id": request_id,
                         "state_revision": state_revision,
                     }

@@ -3,18 +3,28 @@
 import json
 from io import BytesIO
 from urllib.error import HTTPError, URLError
+from uuid import UUID
 
 import pytest
 from pytest_mock import MockerFixture
 
-from meal_planner.models.schemas import MealOutcome, MealType
+from meal_planner.models.schemas import (
+    FamilyMember,
+    MealOutcome,
+    MealType,
+    ProfileEditCategory,
+    ProfileEditOperation,
+    UserProfile,
+)
 from meal_planner.telegram.api import (
     TelegramAPI,
     TelegramAPIError,
+    meal_continuation_keyboard,
+    meal_review_keyboard,
     split_text,
 )
 from meal_planner.telegram.commands import TelegramCommand
-from tests.factories import make_plan
+from tests.factories import make_plan, make_profile
 
 
 def _response() -> BytesIO:
@@ -175,6 +185,24 @@ def test_plan_and_checkin_use_safe_text_and_specific_week(
     assert len(callback["callback_data"].encode()) <= 64
 
 
+@pytest.mark.parametrize("plan_days", [1, 3])
+def test_short_plan_rendering_stops_at_persisted_last_day(
+    mocker: MockerFixture, plan_days: int
+) -> None:
+    """Plan rendering includes exactly the days stored in the plan."""
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+
+    TelegramAPI("token").send_plan(1, make_plan(plan_days=plan_days))
+
+    payload = json.loads(urlopen.call_args.args[0].data.decode())
+    assert "Meal Plan" in payload["text"]
+    assert f"Day {plan_days}" in payload["text"]
+    assert f"Day {plan_days + 1}" not in payload["text"]
+
+
 def test_maximum_valid_plan_fits_one_notification(
     mocker: MockerFixture,
 ) -> None:
@@ -207,3 +235,316 @@ def test_answer_callback_query(mocker: MockerFixture) -> None:
     TelegramAPI("token").answer_callback_query("query-id", "done")
     payload = json.loads(urlopen.call_args.args[0].data.decode())
     assert payload == {"callback_query_id": "query-id", "text": "done"}
+
+
+def _last_payload(urlopen: object) -> dict[str, object]:
+    """Decode the most recently posted Telegram payload."""
+    request = urlopen.call_args.args[0]  # type: ignore[attr-defined]
+    return json.loads(request.data.decode())
+
+
+def test_profile_summary_renders_canonical_text_and_root_controls(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+
+    TelegramAPI("token").send_profile(1, make_profile())
+
+    payload = _last_payload(urlopen)
+    assert "Dietary constraints: None" in payload["text"]
+    assert "Allergies:" not in payload["text"]
+    assert payload["reply_markup"] == {
+        "inline_keyboard": [
+            [{"text": "Amend profile", "callback_data": "profile:root"}],
+            [{"text": "Close", "callback_data": "profile:close"}],
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    ("protein_target", "fibre_target", "expected_targets"),
+    [
+        (None, None, "protein: not set, fibre: not set"),
+        (120, None, "protein: 120 g/day, fibre: not set"),
+        (120, 30, "protein: 120 g/day, fibre: 30 g/day"),
+    ],
+)
+def test_profile_summary_renders_optional_targets_and_not_set_copy(
+    mocker: MockerFixture,
+    protein_target: int | None,
+    fibre_target: int | None,
+    expected_targets: str,
+) -> None:
+    """Show each member's supplied and absent nutrient targets."""
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+    profile = UserProfile(
+        name="Alex",
+        people_count=1,
+        family_members=[
+            FamilyMember(
+                name="Alex",
+                calorie_target=2000,
+                protein_target=protein_target,
+                fibre_target=fibre_target,
+            )
+        ],
+    )
+
+    TelegramAPI("token").send_profile(1, profile)
+
+    payload = _last_payload(urlopen)
+    assert "- Alex (2000 kcal/day, " + expected_targets + ")" in payload["text"]
+
+
+def test_profile_root_renders_all_categories_and_close(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+
+    TelegramAPI("token").send_profile_root(1)
+
+    payload = _last_payload(urlopen)
+    assert payload["reply_markup"] == {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "Family",
+                    "callback_data": "profile:category:family",
+                }
+            ],
+            [
+                {
+                    "text": "Dietary constraints",
+                    "callback_data": ("profile:category:dietary_constraints"),
+                }
+            ],
+            [
+                {
+                    "text": "Dietary preferences",
+                    "callback_data": ("profile:category:dietary_preferences"),
+                }
+            ],
+            [{"text": "Done", "callback_data": "profile:done"}],
+            [{"text": "Close", "callback_data": "profile:close"}],
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "category, expected_operations",
+    [
+        (
+            ProfileEditCategory.FAMILY,
+            [
+                (ProfileEditOperation.ADD, "Add member"),
+                (ProfileEditOperation.REMOVE, "Remove member"),
+                (ProfileEditOperation.CHANGE_CALORIES, "Change calories"),
+                (ProfileEditOperation.CHANGE_PROTEIN, "Change protein"),
+                (ProfileEditOperation.CHANGE_FIBRE, "Change fibre"),
+            ],
+        ),
+        (
+            ProfileEditCategory.DIETARY_CONSTRAINTS,
+            [
+                (ProfileEditOperation.ADD, "Add constraint"),
+                (ProfileEditOperation.REMOVE, "Remove constraint"),
+            ],
+        ),
+        (
+            ProfileEditCategory.DIETARY_PREFERENCES,
+            [
+                (ProfileEditOperation.ADD, "Add preference"),
+                (ProfileEditOperation.REMOVE, "Remove preference"),
+            ],
+        ),
+    ],
+)
+def test_profile_category_renders_valid_operations_and_navigation(
+    mocker: MockerFixture,
+    category: ProfileEditCategory,
+    expected_operations: list[tuple[ProfileEditOperation, str]],
+) -> None:
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+
+    TelegramAPI("token").send_profile_category(1, category)
+
+    payload = _last_payload(urlopen)
+    buttons = payload["reply_markup"]["inline_keyboard"]
+    assert [
+        (button["text"], button["callback_data"])
+        for row in buttons[:-2]
+        for button in row
+    ] == [
+        (
+            label,
+            f"profile:operation:{category.value}:{operation.value}",
+        )
+        for operation, label in expected_operations
+    ]
+    assert buttons[-2:] == [
+        [{"text": "Back", "callback_data": "profile:back"}],
+        [{"text": "Done", "callback_data": "profile:done"}],
+    ]
+
+
+def test_profile_operation_renders_guidance_and_compact_navigation(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+
+    TelegramAPI("token").send_profile_operation(
+        1,
+        ProfileEditCategory.FAMILY,
+        ProfileEditOperation.CHANGE_CALORIES,
+    )
+
+    payload = _last_payload(urlopen)
+    assert "name and new calorie target" in payload["text"]
+    assert payload["reply_markup"] == {
+        "inline_keyboard": [
+            [{"text": "Back", "callback_data": "profile:back"}],
+            [{"text": "Done", "callback_data": "profile:done"}],
+            [{"text": "Close", "callback_data": "profile:close"}],
+        ]
+    }
+    for row in payload["reply_markup"]["inline_keyboard"]:
+        for button in row:
+            assert len(button["callback_data"].encode()) <= 64
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_fragments"),
+    [
+        (
+            ProfileEditOperation.ADD,
+            ["John 1500", "John 2000 120 30"],
+        ),
+        (
+            ProfileEditOperation.CHANGE_PROTEIN,
+            ["John 120", "John none"],
+        ),
+        (
+            ProfileEditOperation.CHANGE_FIBRE,
+            ["John 30", "John none"],
+        ),
+    ],
+)
+def test_profile_operations_render_target_guidance(
+    mocker: MockerFixture,
+    operation: ProfileEditOperation,
+    expected_fragments: list[str],
+) -> None:
+    """Document nutrient updates, clearing, and both member-add forms."""
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+
+    TelegramAPI("token").send_profile_operation(
+        1, ProfileEditCategory.FAMILY, operation
+    )
+
+    payload = _last_payload(urlopen)
+    for fragment in expected_fragments:
+        assert fragment in payload["text"]
+
+
+def test_send_meal_review_renders_exact_text_and_review_buttons(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch("urllib.request.urlopen", return_value=_response())
+    submission_id = UUID("12345678-1234-5678-1234-567812345678")
+
+    TelegramAPI("token").send_meal_review(
+        1,
+        "today, lunch, rice, beans, and salsa",
+        submission_id,
+    )
+
+    payload = json.loads(urlopen.call_args.args[0].data.decode())
+    assert payload["text"] == (
+        "Review this meal submission:\n"
+        "today, lunch, rice, beans, and salsa\n\n"
+        "Confirm to save it or cancel."
+    )
+    assert payload["reply_markup"] == {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "✅ Confirm",
+                    "callback_data": (
+                        "meal:confirm:12345678-1234-5678-1234-567812345678"
+                    ),
+                    "style": "success",
+                },
+                {
+                    "text": "❌ Cancel",
+                    "callback_data": (
+                        "meal:cancel:12345678-1234-5678-1234-567812345678"
+                    ),
+                    "style": "danger",
+                },
+            ]
+        ]
+    }
+
+
+def test_send_meal_saved_renders_continuation_buttons(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch("urllib.request.urlopen", return_value=_response())
+    submission_id = "12345678-1234-5678-1234-567812345678"
+
+    TelegramAPI("token").send_meal_saved(1, "rice and beans", submission_id)
+
+    payload = json.loads(urlopen.call_args.args[0].data.decode())
+    assert payload["text"] == "✅ Meal saved: rice and beans"
+    assert payload["reply_markup"] == {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "➕ Add more",
+                    "callback_data": (
+                        "meal:add:12345678-1234-5678-1234-567812345678"
+                    ),
+                    "style": "primary",
+                },
+                {
+                    "text": "✅ Done",
+                    "callback_data": (
+                        "meal:done:12345678-1234-5678-1234-567812345678"
+                    ),
+                    "style": "success",
+                },
+            ]
+        ]
+    }
+
+
+def test_meal_keyboard_callbacks_fit_telegram_byte_limit() -> None:
+    submission_id = UUID("12345678-1234-5678-1234-567812345678")
+
+    keyboards = (
+        meal_review_keyboard(submission_id),
+        meal_continuation_keyboard(submission_id),
+    )
+    for keyboard in keyboards:
+        for row in keyboard["inline_keyboard"]:
+            assert len(row) == 2
+            for button in row:
+                assert len(button["callback_data"].encode("utf-8")) <= 64

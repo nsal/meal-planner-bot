@@ -4,21 +4,26 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from enum import Enum
 from typing import Any, Optional
 
 from boto3.dynamodb.conditions import Key  # type: ignore[import-untyped]
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
+from meal_planner.dietary_rules import has_constraint_conflict
 from meal_planner.models.schemas import (
     ConversationState,
+    ConversationWorkflowKind,
     ConversationWorkflowStep,
     MealLogEntry,
     MealOutcome,
     PlanStatus,
+    ProfileEditCategory,
     ProfileUpdateEntities,
     UserProfile,
     WeeklyPlan,
+    canonicalize_profile_rule_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,6 +35,14 @@ class ActivePlanSnapshot:
 
     plan: WeeklyPlan
     active_epoch: int | None
+
+
+class RepairPublicationOutcome(str, Enum):
+    """Result of attempting an untracked repair publication."""
+
+    PUBLISHED = "published"
+    STALE = "stale"
+    DUPLICATE = "duplicate"
 
 
 class DynamoRepository:
@@ -44,21 +57,226 @@ class DynamoRepository:
             key: value for key, value in item.items() if key not in {"PK", "SK"}
         }
 
-    def get_profile(self, user_id: str) -> Optional[UserProfile]:
-        response = self.table.get_item(
-            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}
-        )
+    def get_profile(
+        self, user_id: str, *, consistent_read: bool = False
+    ) -> Optional[UserProfile]:
+        """Return the user's canonical profile, if it exists."""
+        get_kwargs: dict[str, Any] = {
+            "Key": {"PK": f"USER#{user_id}", "SK": "PROFILE"}
+        }
+        if consistent_read:
+            get_kwargs["ConsistentRead"] = True
+        response = self.table.get_item(**get_kwargs)
         item = response.get("Item")
-        return UserProfile.model_validate(self._data(item)) if item else None
+        return (
+            canonicalize_profile_rule_ids(
+                UserProfile.model_validate(self._data(item))
+            )
+            if item
+            else None
+        )
 
-    def save_profile(self, user_id: str, profile: UserProfile) -> None:
-        self.table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": "PROFILE",
-                **profile.model_dump(mode="json"),
+    @staticmethod
+    def _canonical_profile(profile: UserProfile) -> UserProfile:
+        """Validate and deterministically normalize a profile before saving."""
+        canonical = canonicalize_profile_rule_ids(profile)
+        data = canonical.model_dump(mode="json", warnings=False)
+        preferences = data.get("dietary_preferences", [])
+        seen_sources: set[str] = set()
+        unique_preferences: list[dict[str, Any]] = []
+        for preference in preferences:
+            source_text = str(preference["source_text"])
+            source_key = source_text.casefold()
+            if source_key in seen_sources:
+                continue
+            seen_sources.add(source_key)
+            unique_preferences.append(preference)
+        data["dietary_preferences"] = unique_preferences
+        return UserProfile.model_validate(data)
+
+    @classmethod
+    def _prepare_guarded_profile(
+        cls,
+        profile: UserProfile,
+        category: ProfileEditCategory,
+    ) -> UserProfile | None:
+        """Apply profile-rule guards before a state-guarded transaction."""
+        canonical = cls._canonical_profile(profile)
+        if category is ProfileEditCategory.DIETARY_PREFERENCES:
+            if any(
+                preference.rule is not None
+                and has_constraint_conflict(
+                    preference.rule, canonical.dietary_constraints
+                )
+                for preference in canonical.dietary_preferences
+            ):
+                return None
+            return canonical
+
+        if category is ProfileEditCategory.DIETARY_CONSTRAINTS:
+            retained = [
+                preference
+                for preference in canonical.dietary_preferences
+                if preference.rule is None
+                or not has_constraint_conflict(
+                    preference.rule, canonical.dietary_constraints
+                )
+            ]
+            if len(retained) != len(canonical.dietary_preferences):
+                return canonical.model_copy(
+                    update={"dietary_preferences": retained}
+                )
+        return canonical
+
+    def save_profile(
+        self,
+        user_id: str,
+        profile: UserProfile,
+        *,
+        expected_revision: int | None,
+    ) -> bool:
+        """Save a profile only when its caller-observed state is current."""
+        profile = self._canonical_profile(profile)
+        profile = profile.model_copy(
+            update={
+                "profile_revision": (
+                    0 if expected_revision is None else expected_revision + 1
+                )
             }
         )
+        item = {
+            "PK": f"USER#{user_id}",
+            "SK": "PROFILE",
+            **profile.model_dump(mode="json"),
+        }
+        kwargs: dict[str, Any] = {"Item": item}
+        if expected_revision is None:
+            kwargs["ConditionExpression"] = "attribute_not_exists(#pk)"
+            kwargs["ExpressionAttributeNames"] = {"#pk": "PK"}
+        else:
+            revision_condition = (
+                "(attribute_not_exists(#profile_revision) OR "
+                "#profile_revision = :expected_revision)"
+                if expected_revision == 0
+                else "attribute_exists(#profile_revision) AND "
+                "#profile_revision = :expected_revision"
+            )
+            kwargs["ConditionExpression"] = (
+                "attribute_exists(#pk) AND " + revision_condition
+            )
+            kwargs["ExpressionAttributeNames"] = {
+                "#pk": "PK",
+                "#profile_revision": "profile_revision",
+            }
+            kwargs["ExpressionAttributeValues"] = {
+                ":expected_revision": expected_revision,
+            }
+        try:
+            self.table.put_item(**kwargs)
+        except ClientError as exc:
+            if self._is_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def save_profile_and_transition_state(
+        self,
+        user_id: str,
+        profile: UserProfile,
+        next_state: ConversationState,
+        observed_state: ConversationState,
+    ) -> bool:
+        """Atomically save a profile and consume its observed edit state."""
+        if (
+            observed_state.workflow_kind
+            is not ConversationWorkflowKind.PROFILE_EDIT
+            or observed_state.step
+            is not ConversationWorkflowStep.AWAITING_PROFILE_INPUT
+            or observed_state.profile_category is None
+            or observed_state.profile_operation is None
+        ):
+            return False
+        prepared_profile = self._prepare_guarded_profile(
+            profile, observed_state.profile_category
+        )
+        if prepared_profile is None:
+            return False
+        committed_profile = prepared_profile.model_copy(
+            update={
+                "profile_revision": prepared_profile.profile_revision + 1,
+            }
+        )
+        profile_item = {
+            "PK": f"USER#{user_id}",
+            "SK": "PROFILE",
+            **committed_profile.model_dump(mode="json"),
+        }
+        state_item = {
+            **self._conversation_key(user_id),
+            **next_state.model_dump(mode="json"),
+        }
+        profile_condition = (
+            "attribute_exists(PK) AND "
+            "(attribute_not_exists(#profile_revision) OR "
+            "#profile_revision = :observed_profile_revision)"
+        )
+        state_condition = (
+            "#revision = :observed_revision AND "
+            "#created_at = :observed_created_at AND "
+            "#workflow_kind = :observed_workflow_kind AND "
+            "#step = :observed_step AND "
+            "#profile_category = :observed_profile_category AND "
+            "#profile_operation = :observed_profile_operation"
+        )
+        profile_names = {"#profile_revision": "profile_revision"}
+        state_names = {
+            "#revision": "revision",
+            "#created_at": "created_at",
+            "#workflow_kind": "workflow_kind",
+            "#step": "step",
+            "#profile_category": "profile_category",
+            "#profile_operation": "profile_operation",
+        }
+        observed_data = observed_state.model_dump(mode="json")
+        profile_values = {
+            ":observed_profile_revision": profile.profile_revision,
+        }
+        state_values = {
+            ":observed_revision": observed_data["revision"],
+            ":observed_created_at": observed_data["created_at"],
+            ":observed_workflow_kind": observed_data["workflow_kind"],
+            ":observed_step": observed_data["step"],
+            ":observed_profile_category": observed_data["profile_category"],
+            ":observed_profile_operation": observed_data["profile_operation"],
+        }
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": profile_item,
+                            "ConditionExpression": profile_condition,
+                            "ExpressionAttributeNames": profile_names,
+                            "ExpressionAttributeValues": profile_values,
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": state_item,
+                            "ConditionExpression": state_condition,
+                            "ExpressionAttributeNames": state_names,
+                            "ExpressionAttributeValues": state_values,
+                        }
+                    },
+                ]
+            )
+        except ClientError as exc:
+            if self._is_transaction_conditional_failure(exc):
+                return False
+            raise
+        return True
 
     def get_profile_draft(
         self, user_id: str
@@ -129,20 +347,22 @@ class DynamoRepository:
         state: ConversationState,
         *,
         expected_revision: int | None = None,
+        expected_request_id: str | None = None,
+        expected_step: ConversationWorkflowStep | None = None,
     ) -> bool:
         """Create or replace state only when its revision is current."""
         item = {
             **self._conversation_key(user_id),
             **state.model_dump(mode="json"),
         }
-        if expected_revision is None:
-            condition = "attribute_not_exists(#pk)"
-            names = {"#pk": "PK"}
-            values: dict[str, Any] = {}
-        else:
-            condition = "#revision = :expected_revision"
-            names = {"#revision": "revision"}
-            values = {":expected_revision": expected_revision}
+        condition, names, values = self._conversation_state_condition(
+            expected_revision=expected_revision,
+            expected_request_id=expected_request_id,
+            expected_step=expected_step,
+            require_absent=expected_revision is None
+            and expected_request_id is None
+            and expected_step is None,
+        )
         kwargs: dict[str, Any] = {
             "Item": item,
             "ConditionExpression": condition,
@@ -164,25 +384,44 @@ class DynamoRepository:
         state: ConversationState,
         *,
         expected_revision: int,
+        expected_request_id: str | None = None,
+        expected_step: ConversationWorkflowStep | None = None,
     ) -> bool:
         """Atomically persist a state transition from one revision."""
         return self.save_conversation_state(
-            user_id, state, expected_revision=expected_revision
+            user_id,
+            state,
+            expected_revision=expected_revision,
+            expected_request_id=expected_request_id,
+            expected_step=expected_step,
         )
 
     def delete_conversation_state(
-        self, user_id: str, *, expected_revision: int | None = None
+        self,
+        user_id: str,
+        *,
+        expected_revision: int | None = None,
+        expected_request_id: str | None = None,
+        expected_step: ConversationWorkflowStep | None = None,
     ) -> bool:
         """Delete state conditionally, preventing stale workflow cleanup."""
         kwargs: dict[str, Any] = {"Key": self._conversation_key(user_id)}
-        if expected_revision is not None:
+        if (
+            expected_revision is not None
+            or expected_request_id is not None
+            or expected_step is not None
+        ):
+            condition, names, values = self._conversation_state_condition(
+                expected_revision=expected_revision,
+                expected_request_id=expected_request_id,
+                expected_step=expected_step,
+                require_absent=False,
+            )
             kwargs.update(
                 {
-                    "ConditionExpression": "#revision = :revision",
-                    "ExpressionAttributeNames": {"#revision": "revision"},
-                    "ExpressionAttributeValues": {
-                        ":revision": expected_revision
-                    },
+                    "ConditionExpression": condition,
+                    "ExpressionAttributeNames": names,
+                    "ExpressionAttributeValues": values,
                 }
             )
         try:
@@ -192,6 +431,35 @@ class DynamoRepository:
                 return False
             raise
         return True
+
+    @staticmethod
+    def _conversation_state_condition(
+        *,
+        expected_revision: int | None,
+        expected_request_id: str | None,
+        expected_step: ConversationWorkflowStep | None,
+        require_absent: bool,
+    ) -> tuple[str, dict[str, str], dict[str, Any]]:
+        """Build one condition for the conversation-state mutation."""
+        if require_absent:
+            return "attribute_not_exists(#pk)", {"#pk": "PK"}, {}
+
+        conditions: list[str] = []
+        names: dict[str, str] = {}
+        values: dict[str, Any] = {}
+        if expected_revision is not None:
+            conditions.append("#revision = :expected_revision")
+            names["#revision"] = "revision"
+            values[":expected_revision"] = expected_revision
+        if expected_request_id is not None:
+            conditions.append("#request_id = :expected_request_id")
+            names["#request_id"] = "request_id"
+            values[":expected_request_id"] = expected_request_id
+        if expected_step is not None:
+            conditions.append("#step = :expected_step")
+            names["#step"] = "step"
+            values[":expected_step"] = expected_step.value
+        return " AND ".join(conditions), names, values
 
     def clear_conversation_state_if_matches(
         self,
@@ -431,6 +699,92 @@ class DynamoRepository:
             raise
         return True
 
+    def confirm_meal_and_transition(
+        self,
+        user_id: str,
+        entry: MealLogEntry,
+        state: ConversationState,
+        *,
+        expected_revision: int,
+        submission_id: str,
+    ) -> bool:
+        """Save one reviewed meal and advance its workflow atomically.
+
+        ``state`` is the state that should exist after confirmation.  The
+        transaction conditions its replacement on the prior state still
+        being the matching review step, revision, and submission.  The meal
+        key is derived from the submission ID so a retry cannot overwrite a
+        different meal or create a second item.
+        """
+        draft = state.meal_draft
+        if (
+            state.workflow_kind is not ConversationWorkflowKind.MEAL_LOG
+            or state.step
+            is not ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION
+            or draft is None
+            or state.request_id != submission_id
+            or state.revision != expected_revision + 1
+            or draft.date != entry.date
+            or draft.meal_type != entry.meal_type
+            or draft.description != entry.description
+        ):
+            return False
+
+        meal_item = {
+            "PK": f"USER#{user_id}",
+            "SK": (f"MEAL#{entry.date_key}#SUBMISSION#{submission_id}"),
+            **entry.model_dump(mode="json"),
+        }
+        state_item = {
+            **self._conversation_key(user_id),
+            **state.model_dump(mode="json"),
+        }
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": meal_item,
+                            "ConditionExpression": "attribute_not_exists(PK)",
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": state_item,
+                            "ConditionExpression": (
+                                "#workflow_kind = :meal_log "
+                                "AND #step = :awaiting_confirmation "
+                                "AND #revision = :expected_revision "
+                                "AND #request_id = :request_id"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#workflow_kind": "workflow_kind",
+                                "#step": "step",
+                                "#revision": "revision",
+                                "#request_id": "request_id",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":meal_log": (
+                                    ConversationWorkflowKind.MEAL_LOG.value
+                                ),
+                                ":awaiting_confirmation": (
+                                    ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION.value
+                                ),
+                                ":expected_revision": expected_revision,
+                                ":request_id": submission_id,
+                            },
+                        }
+                    },
+                ]
+            )
+        except ClientError as exc:
+            if self._is_transaction_conditional_failure(exc):
+                return False
+            raise
+        return True
+
     def get_meal_history(
         self,
         user_id: str,
@@ -518,6 +872,14 @@ class DynamoRepository:
             and second.get("Code") == "ConditionalCheckFailed"
         )
 
+    @staticmethod
+    def _repair_marker_key(user_id: str, repair_id: str) -> dict[str, str]:
+        """Return the durable marker key for one untracked repair."""
+        return {
+            "PK": f"USER#{user_id}",
+            "SK": f"PLAN_REPAIR#{repair_id}",
+        }
+
     def save_generated_draft(
         self,
         user_id: str,
@@ -562,6 +924,155 @@ class DynamoRepository:
                 return False
             raise
         return True
+
+    def save_generated_draft_and_clear_conversation_state(
+        self,
+        user_id: str,
+        plan: WeeklyPlan,
+        *,
+        expected_revision: int | None,
+        request_id: str,
+        expected_state_revision: int,
+    ) -> bool:
+        """Publish a tracked draft and release its request atomically."""
+        plan_item = {
+            "PK": f"USER#{user_id}",
+            "SK": f"PLAN#{plan.week_start_date}",
+            **plan.model_dump(by_alias=True, mode="json"),
+        }
+        if expected_revision is None:
+            plan_condition = "attribute_not_exists(#pk)"
+            plan_names = {"#pk": "PK"}
+            plan_values: dict[str, Any] = {}
+        else:
+            plan_condition = (
+                "#status = :draft AND #revision = :expected_revision"
+            )
+            plan_names = {
+                "#status": "status",
+                "#revision": "revision",
+            }
+            plan_values = {
+                ":draft": PlanStatus.DRAFT.value,
+                ":expected_revision": expected_revision,
+            }
+        plan_put: dict[str, Any] = {
+            "TableName": self.table.name,
+            "Item": plan_item,
+            "ConditionExpression": plan_condition,
+            "ExpressionAttributeNames": plan_names,
+        }
+        if plan_values:
+            plan_put["ExpressionAttributeValues"] = plan_values
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {"Put": plan_put},
+                    {
+                        "Delete": {
+                            "TableName": self.table.name,
+                            "Key": self._conversation_key(user_id),
+                            "ConditionExpression": (
+                                "#request_id = :request_id AND "
+                                "#revision = :expected_state_revision"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#request_id": "request_id",
+                                "#revision": "revision",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":request_id": request_id,
+                                ":expected_state_revision": (
+                                    expected_state_revision
+                                ),
+                            },
+                        }
+                    },
+                ]
+            )
+        except ClientError as exc:
+            if self._is_transaction_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def save_repaired_draft_once(
+        self,
+        user_id: str,
+        plan: WeeklyPlan,
+        *,
+        expected_revision: int | None,
+        repair_id: str,
+    ) -> RepairPublicationOutcome:
+        """Atomically publish one untracked repair and its replay marker."""
+        if expected_revision is None:
+            plan_condition = "attribute_not_exists(#pk)"
+            plan_names = {"#pk": "PK"}
+            plan_values: dict[str, Any] = {}
+        else:
+            plan_condition = (
+                "#status = :draft AND #revision = :expected_revision"
+            )
+            plan_names = {
+                "#status": "status",
+                "#revision": "revision",
+            }
+            plan_values = {
+                ":draft": PlanStatus.DRAFT.value,
+                ":expected_revision": expected_revision,
+            }
+        plan_put: dict[str, Any] = {
+            "TableName": self.table.name,
+            "Item": {
+                "PK": f"USER#{user_id}",
+                "SK": f"PLAN#{plan.week_start_date}",
+                **plan.model_dump(by_alias=True, mode="json"),
+            },
+            "ConditionExpression": plan_condition,
+            "ExpressionAttributeNames": plan_names,
+        }
+        if plan_values:
+            plan_put["ExpressionAttributeValues"] = plan_values
+        marker_put = {
+            "TableName": self.table.name,
+            "Item": self._repair_marker_key(user_id, repair_id),
+            "ConditionExpression": "attribute_not_exists(PK)",
+        }
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[{"Put": plan_put}, {"Put": marker_put}]
+            )
+        except ClientError as exc:
+            outcome = self._repair_publication_outcome(exc)
+            if outcome is None:
+                raise
+            return outcome
+        return RepairPublicationOutcome.PUBLISHED
+
+    @staticmethod
+    def _repair_publication_outcome(
+        exc: ClientError,
+    ) -> RepairPublicationOutcome | None:
+        """Classify only exact plan/marker conditional cancellations."""
+        error = exc.response.get("Error", {})
+        code = error.get("Code") if isinstance(error, dict) else None
+        if code != "TransactionCanceledException":
+            return None
+        reasons = exc.response.get("CancellationReasons")
+        if not isinstance(reasons, list) or len(reasons) != 2:
+            return None
+        first = reasons[0] if isinstance(reasons[0], dict) else {}
+        second = reasons[1] if isinstance(reasons[1], dict) else {}
+        first_code = first.get("Code")
+        second_code = second.get("Code")
+        if second_code == "ConditionalCheckFailed" and first_code in {
+            "None",
+            "ConditionalCheckFailed",
+        }:
+            return RepairPublicationOutcome.DUPLICATE
+        if first_code == "ConditionalCheckFailed" and second_code == "None":
+            return RepairPublicationOutcome.STALE
+        return None
 
     def replace_draft_and_clear_revision_state(
         self,

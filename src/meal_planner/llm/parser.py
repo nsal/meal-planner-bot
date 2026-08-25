@@ -3,18 +3,140 @@
 import json
 import logging
 import re
-from typing import Any, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Literal, Optional, Union, cast
 
 from pydantic import ValidationError
 
 from meal_planner.models.schemas import (
+    MAX_PLAN_REQUIREMENTS,
+    ConstraintEntry,
     ConversationIntent,
+    DietaryRule,
     GrocerySection,
     LLMResponseMetadata,
+    MealType,
+    RuleOperator,
+    RuleStrength,
+    Weekday,
     WeeklyPlan,
 )
+from meal_planner.normalization import normalize_food
 
 logger = logging.getLogger(__name__)
+
+InterpretationMode = Literal[
+    "constraint", "stored_preference", "current_plan_preference"
+]
+InterpretationRule = DietaryRule | ConstraintEntry
+PreferenceInterpretation = tuple[list[InterpretationRule], str | None]
+PreferenceSignature = tuple[
+    MealType | None, frozenset[tuple[str, ...]], frozenset[Weekday]
+]
+
+MAX_CLARIFICATION_LENGTH = 500
+MAX_PROVIDER_CLARIFICATION_LENGTH = 500
+MAX_UNPARSED_CLAUSES = 8
+MAX_UNPARSED_CLAUSE_LENGTH = 160
+
+_REPHRASE_CLARIFICATION = (
+    "I couldn't safely interpret that preference. Please rephrase it with "
+    "specific foods and counts."
+)
+_TOO_MANY_REQUIREMENTS_CLARIFICATION = (
+    "That preference contains too many separate rules. Please combine or "
+    "prioritize the most important rules, then try again."
+)
+_SAFE_LOCATION_PART = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+@dataclass(frozen=True, slots=True)
+class SafeValidationIssue:
+    """Bounded validation metadata safe for repair transport and logs."""
+
+    code: str
+    location: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlanResponseFeedback:
+    """A classified plan-response failure without provider content."""
+
+    category: str
+    issues: tuple[SafeValidationIssue, ...]
+
+    def render(self) -> str:
+        """Render bounded machine-readable repair feedback."""
+        rendered = "; ".join(
+            f"code={issue.code} location={issue.location}"
+            for issue in self.issues
+        )
+        return rendered[:800]
+
+
+def _safe_schema_location(location: object) -> str:
+    """Convert a Pydantic location into a bounded schema-only path."""
+    if not isinstance(location, tuple):
+        return "$"
+    result = ""
+    for part in location[:8]:
+        if isinstance(part, int) and 0 <= part <= 28:
+            result += f"[{part}]"
+        elif isinstance(part, str) and _SAFE_LOCATION_PART.fullmatch(part):
+            result += part if not result else f".{part}"
+    return result[:120] or "$"
+
+
+def _safe_validation_code(error_type: object) -> str:
+    """Map provider-independent Pydantic types to bounded codes."""
+    if not isinstance(error_type, str):
+        return "schema_validation"
+    if error_type.startswith("missing"):
+        return "missing"
+    if "type" in error_type:
+        return "type"
+    if error_type in {"literal_error", "enum", "value_error"}:
+        return "value"
+    return "schema_validation"
+
+
+def _schema_feedback(error: ValidationError) -> PlanResponseFeedback:
+    """Build safe structural metadata from a Pydantic validation error."""
+    issues = tuple(
+        SafeValidationIssue(
+            code=_safe_validation_code(item.get("type")),
+            location=_safe_schema_location(item.get("loc")),
+        )
+        for item in error.errors(include_url=False)[:6]
+    )
+    return PlanResponseFeedback(
+        category="structural",
+        issues=issues or (SafeValidationIssue("schema_validation", "$"),),
+    )
+
+
+def _preference_signature(
+    requirement: DietaryRule,
+) -> PreferenceSignature:
+    """Return the shared normalized signature for one requirement."""
+    return (
+        requirement.meal_type,
+        frozenset(normalize_food(food) for food in requirement.foods_any_of),
+        frozenset(requirement.weekdays),
+    )
+
+
+def _render_bounded_clarification(text: str) -> str:
+    """Render one safe clarification without truncating its meaning."""
+    rendered = text.strip()
+    if not rendered or len(rendered) > MAX_CLARIFICATION_LENGTH:
+        return _REPHRASE_CLARIFICATION
+    return rendered
+
+
+def _clarification_response(text: str) -> PreferenceInterpretation:
+    """Return a parser clarification through the final bounded renderer."""
+    return [], _render_bounded_clarification(text)
 
 
 def _extract_json_block(text: str) -> tuple[str, Optional[dict[str, Any]]]:
@@ -28,8 +150,8 @@ def _extract_json_block(text: str) -> tuple[str, Optional[dict[str, Any]]]:
             parsed = json.loads(json_str)
             if isinstance(parsed, dict):
                 return reply_text, parsed
-        except json.JSONDecodeError as exc:
-            logger.warning("Failed to decode JSON block in response: %s", exc)
+        except json.JSONDecodeError:
+            logger.warning("LLM response contained malformed JSON")
             return text.strip(), None
 
     text_stripped = text.strip()
@@ -65,8 +187,8 @@ def parse_conversational_response(
     try:
         metadata = LLMResponseMetadata.model_validate(json_dict)
         return reply_text, metadata
-    except ValidationError as exc:
-        logger.warning("Invalid LLM response metadata schema: %s", exc)
+    except ValidationError:
+        logger.warning("LLM response metadata failed schema validation")
         return (
             reply_text or raw_text.strip(),
             LLMResponseMetadata(
@@ -83,7 +205,8 @@ def parse_plan_response(
         try:
             return WeeklyPlan.model_validate(raw_text_or_dict)
         except ValidationError as exc:
-            logger.warning("Failed to validate plan dict: %s", exc)
+            del exc
+            logger.warning("Plan response failed schema validation")
             return None
 
     if not raw_text_or_dict or not raw_text_or_dict.strip():
@@ -100,18 +223,368 @@ def parse_plan_response(
     try:
         return WeeklyPlan.model_validate(json_dict)
     except ValidationError as exc:
-        logger.warning("Failed to validate WeeklyPlan schema: %s", exc)
+        del exc
+        logger.warning("Plan response failed schema validation")
         return None
+
+
+def _normalise_weekdays(value: object) -> object:
+    """Normalize provider weekday names to the shared ISO enum."""
+    if not isinstance(value, list):
+        return value
+    names = {
+        "monday": Weekday.MONDAY,
+        "tuesday": Weekday.TUESDAY,
+        "wednesday": Weekday.WEDNESDAY,
+        "thursday": Weekday.THURSDAY,
+        "friday": Weekday.FRIDAY,
+        "saturday": Weekday.SATURDAY,
+        "sunday": Weekday.SUNDAY,
+    }
+    return [
+        names[item.casefold()]
+        if isinstance(item, str) and item.casefold() in names
+        else item
+        for item in value
+    ]
+
+
+def _is_best_effort_wording(source_text: str) -> bool:
+    """Return whether wording explicitly permits omitting a rule."""
+    return bool(
+        re.search(
+            r"\b(if convenient|if possible|when practical|optionally|"
+            r"when convenient)\b",
+            source_text.casefold(),
+        )
+    )
+
+
+def _is_positive_request(source_text: str) -> bool:
+    """Return whether wording asks for at least one item."""
+    return bool(
+        re.search(
+            r"\b(i['’]d like|i would like|would like|please include)\b",
+            source_text.casefold(),
+        )
+    )
+
+
+def _has_strict_wording(source_text: str) -> bool:
+    """Return whether wording explicitly requires a preference."""
+    return bool(
+        re.search(
+            r"\b(strict(?:ly)?|must|required|non[- ]negotiable)\b",
+            source_text.casefold(),
+        )
+    )
+
+
+def _has_ambiguous_operator_wording(source_text: str) -> bool:
+    """Return whether wording names more than one count operator."""
+    operators = re.findall(
+        r"\b(exactly|at\s+least|at\s+most)\b", source_text.casefold()
+    )
+    return len(operators) > 1
+
+
+def _prepare_rule_payload(raw_rule: dict[str, Any]) -> dict[str, Any]:
+    """Adapt legacy and wording-derived fields to :class:`DietaryRule`."""
+    payload = dict(raw_rule)
+    payload["weekdays"] = _normalise_weekdays(payload.get("weekdays", []))
+    source_text = payload.get("source_text")
+    if not isinstance(source_text, str):
+        return payload
+    explicit_count = "count" in payload or "exact_count" in payload
+    explicit_operator = "operator" in payload or "exact_count" in payload
+    if "count" not in payload and "exact_count" in payload:
+        payload["count"] = payload.pop("exact_count")
+        payload.setdefault("operator", RuleOperator.EXACTLY.value)
+    if (
+        not explicit_count
+        and not explicit_operator
+        and _is_positive_request(source_text)
+    ):
+        payload["count"] = 1
+        payload["operator"] = RuleOperator.AT_LEAST.value
+    if "count" not in payload:
+        return payload
+    if _is_best_effort_wording(source_text):
+        payload["strength"] = RuleStrength.BEST_EFFORT.value
+    else:
+        payload["strength"] = RuleStrength.STRICT.value
+    return payload
+
+
+def _scope_overlaps(left: DietaryRule, right: DietaryRule) -> bool:
+    """Return whether two rules can constrain the same meals."""
+    if (
+        left.meal_type is not None
+        and right.meal_type is not None
+        and left.meal_type is not right.meal_type
+    ):
+        return False
+    left_days = set(left.weekdays) or set(Weekday)
+    right_days = set(right.weekdays) or set(Weekday)
+    return bool(left_days & right_days)
+
+
+def _rules_conflict(left: DietaryRule, right: DietaryRule) -> bool:
+    """Detect contradictory same-tier rules without selecting a winner."""
+    left_foods = {normalize_food(food) for food in left.foods_any_of}
+    right_foods = {normalize_food(food) for food in right.foods_any_of}
+    if not left_foods & right_foods or not _scope_overlaps(left, right):
+        return False
+
+    def bounds(rule: DietaryRule) -> tuple[int, int | None]:
+        if rule.operator is RuleOperator.EXACTLY:
+            return rule.count, rule.count
+        if rule.operator is RuleOperator.AT_LEAST:
+            return rule.count, None
+        return 0, rule.count
+
+    left_min, left_max = bounds(left)
+    right_min, right_max = bounds(right)
+    lower = max(left_min, right_min)
+    upper_values = [
+        value for value in (left_max, right_max) if value is not None
+    ]
+    return bool(upper_values and lower > min(upper_values))
+
+
+def _parse_interpretation_data(
+    raw_text_or_dict: Union[str, dict[str, Any]],
+) -> Any:
+    """Decode provider JSON and return ``None`` for malformed input."""
+    if isinstance(raw_text_or_dict, dict):
+        return raw_text_or_dict
+    if not raw_text_or_dict.strip():
+        return None
+    _, json_dict = _extract_json_block(raw_text_or_dict)
+    if json_dict is not None:
+        return json_dict
+    try:
+        return json.loads(raw_text_or_dict.strip())
+    except json.JSONDecodeError:
+        return None
+
+
+def parse_preference_interpretation(
+    raw_text_or_dict: Union[str, dict[str, Any]],
+    *,
+    mode: InterpretationMode | None = None,
+) -> PreferenceInterpretation:
+    """Parse one interpretation mode into shared rules or clarification."""
+    data = _parse_interpretation_data(raw_text_or_dict)
+    if data is None:
+        return _clarification_response(
+            "I could not parse the preference interpretation."
+        )
+
+    if not isinstance(data, dict):
+        return _clarification_response(
+            "The preference interpretation must be a JSON object."
+        )
+
+    declared_mode = data.get("mode")
+    valid_modes = {
+        "constraint",
+        "stored_preference",
+        "current_plan_preference",
+    }
+    if declared_mode is not None and declared_mode not in valid_modes:
+        return _clarification_response(
+            "The interpretation mode is unsupported; please retry clearly."
+        )
+    selected_mode: InterpretationMode = (
+        mode
+        if mode is not None
+        else (
+            declared_mode
+            if declared_mode
+            in {"constraint", "stored_preference", "current_plan_preference"}
+            else "current_plan_preference"
+        )
+    )
+    if mode is not None and declared_mode is not None and declared_mode != mode:
+        return _clarification_response(
+            "The interpretation mode does not match the requested operation."
+        )
+    required_keys = {"requirements", "clarification", "unparsed_text"}
+    missing_keys = required_keys.difference(data)
+    if selected_mode == "constraint" and "exclusions" not in data:
+        missing_keys.add("exclusions")
+    if missing_keys:
+        missing = ", ".join(sorted(missing_keys))
+        return _clarification_response(
+            f"The interpretation omitted required fields: {missing}."
+        )
+
+    raw_requirements = data["requirements"]
+    raw_exclusions = data.get("exclusions", [])
+    if not isinstance(raw_requirements, list):
+        return _clarification_response(
+            "The interpretation requirements must be a list."
+        )
+    if not isinstance(raw_exclusions, list):
+        return _clarification_response(
+            "The interpretation exclusions must be a list."
+        )
+    if len(raw_requirements) + len(raw_exclusions) > MAX_PLAN_REQUIREMENTS:
+        return _clarification_response(_TOO_MANY_REQUIREMENTS_CLARIFICATION)
+    if selected_mode == "constraint" and raw_requirements:
+        return _clarification_response(
+            "Constraint mode must return exclusions, not preference rules."
+        )
+    if selected_mode != "constraint" and raw_exclusions:
+        return _clarification_response(
+            "Preference modes must return rules, not exclusions."
+        )
+
+    raw_clarification = data["clarification"]
+    if raw_clarification is not None and not isinstance(raw_clarification, str):
+        return _clarification_response(
+            "The interpretation clarification must be text or null."
+        )
+    if (
+        isinstance(raw_clarification, str)
+        and len(raw_clarification) > MAX_PROVIDER_CLARIFICATION_LENGTH
+    ):
+        return _clarification_response(_REPHRASE_CLARIFICATION)
+    clarification = raw_clarification.strip() if raw_clarification else None
+    if raw_clarification is not None and not clarification:
+        return _clarification_response(
+            "The interpretation clarification must not be blank."
+        )
+
+    raw_unparsed = data["unparsed_text"]
+    if isinstance(raw_unparsed, str):
+        unparsed_text = [raw_unparsed.strip()] if raw_unparsed.strip() else []
+    elif isinstance(raw_unparsed, list) and all(
+        isinstance(item, str) and item.strip() for item in raw_unparsed
+    ):
+        unparsed_text = [item.strip() for item in raw_unparsed]
+    else:
+        return _clarification_response(
+            "The interpretation unparsed_text must contain text."
+        )
+
+    if len(unparsed_text) > MAX_UNPARSED_CLAUSES or any(
+        len(clause) > MAX_UNPARSED_CLAUSE_LENGTH for clause in unparsed_text
+    ):
+        return _clarification_response(_REPHRASE_CLARIFICATION)
+
+    if clarification or unparsed_text:
+        if clarification:
+            return _clarification_response(clarification)
+        clauses = "; ".join(unparsed_text)
+        return _clarification_response(
+            f"Please clarify these preference clauses: {clauses}"
+        )
+
+    if selected_mode == "constraint":
+        exclusions: list[InterpretationRule] = []
+        seen_exclusion_ids: set[str] = set()
+        for raw_exclusion in raw_exclusions:
+            if not isinstance(raw_exclusion, dict):
+                return _clarification_response(
+                    "Each exclusion must be an object."
+                )
+            try:
+                exclusion = ConstraintEntry.model_validate(raw_exclusion)
+            except ValidationError:
+                logger.warning("Constraint exclusion failed schema validation")
+                return _clarification_response(
+                    "One or more constraint exclusions are malformed."
+                )
+            if exclusion.id in seen_exclusion_ids:
+                return _clarification_response(
+                    f"The interpretation contains duplicate exclusion id: "
+                    f"{exclusion.id}."
+                )
+            seen_exclusion_ids.add(exclusion.id)
+            exclusions.append(exclusion)
+        if not exclusions:
+            return _clarification_response(
+                "Please provide a specific food to exclude."
+            )
+        return exclusions, None
+
+    if not raw_requirements:
+        return _clarification_response(
+            "Please provide a measurable meal preference."
+        )
+
+    requirements: list[DietaryRule] = []
+    seen_ids: set[str] = set()
+    for raw_requirement in raw_requirements:
+        if not isinstance(raw_requirement, dict):
+            return _clarification_response(
+                "Each preference requirement must be an object."
+            )
+        source_text = raw_requirement.get("source_text")
+        if isinstance(source_text, str):
+            if _is_best_effort_wording(source_text) and _has_strict_wording(
+                source_text
+            ):
+                return _clarification_response(
+                    "The preference mixes strict and flexible wording. "
+                    "Please choose one."
+                )
+            if _has_ambiguous_operator_wording(source_text):
+                return _clarification_response(
+                    "The preference names multiple count operators. Please "
+                    "clarify the desired operator."
+                )
+        try:
+            requirement = DietaryRule.model_validate(
+                _prepare_rule_payload(raw_requirement)
+            )
+        except TypeError, ValueError, ValidationError:
+            logger.warning("Preference requirement failed schema validation")
+            return _clarification_response(
+                "One or more preference requirements are malformed."
+            )
+        if requirement.id in seen_ids:
+            return _clarification_response(
+                f"The interpretation contains duplicate requirement id: "
+                f"{requirement.id}.",
+            )
+        seen_ids.add(requirement.id)
+        requirements.append(requirement)
+
+    for index, requirement in enumerate(requirements):
+        if any(
+            _rules_conflict(requirement, other)
+            for other in requirements[index + 1 :]
+        ):
+            return _clarification_response(
+                "Some preference requirements conflict. Please clarify the "
+                "desired counts for the same foods and scope."
+            )
+
+    return cast(list[InterpretationRule], requirements), None
 
 
 def parse_plan_response_with_feedback(
     raw_text_or_dict: Union[str, dict[str, Any]],
 ) -> tuple[Optional[WeeklyPlan], str | None]:
-    """Parse a plan and return bounded Pydantic feedback for one repair."""
+    """Parse a plan and return bounded feedback for one repair."""
+    plan, feedback = parse_plan_response_with_metadata(raw_text_or_dict)
+    return plan, feedback.render() if feedback is not None else None
+
+
+def parse_plan_response_with_metadata(
+    raw_text_or_dict: Union[str, dict[str, Any]],
+) -> tuple[Optional[WeeklyPlan], PlanResponseFeedback | None]:
+    """Parse a plan while retaining safe failure codes and locations."""
     data: Any = raw_text_or_dict
     if isinstance(raw_text_or_dict, str):
         if not raw_text_or_dict.strip():
-            return None, "response was empty"
+            return None, PlanResponseFeedback(
+                category="structural",
+                issues=(SafeValidationIssue("empty_response", "$"),),
+            )
         _, json_dict = _extract_json_block(raw_text_or_dict)
         if json_dict is not None:
             data = json_dict
@@ -119,19 +592,19 @@ def parse_plan_response_with_feedback(
             try:
                 data = json.loads(raw_text_or_dict.strip())
             except json.JSONDecodeError:
-                return None, "response was not valid JSON"
+                return None, PlanResponseFeedback(
+                    category="structural",
+                    issues=(SafeValidationIssue("invalid_json", "$"),),
+                )
     if not isinstance(data, dict):
-        return None, "response must be a JSON object"
+        return None, PlanResponseFeedback(
+            category="structural",
+            issues=(SafeValidationIssue("not_object", "$"),),
+        )
     try:
         return WeeklyPlan.model_validate(data), None
     except ValidationError as exc:
-        errors = exc.errors(include_url=False)
-        details = [
-            f"{error.get('loc', ())}: {error.get('msg', 'invalid value')}"
-            for error in errors[:6]
-        ]
-        feedback = "; ".join(details)
-        return None, feedback[:800]
+        return None, _schema_feedback(exc)
 
 
 def parse_grocery_response(
@@ -149,7 +622,7 @@ def parse_grocery_response(
             try:
                 data = json.loads(raw_text_or_dict.strip())
             except json.JSONDecodeError:
-                logger.warning("Could not parse grocery JSON response")
+                logger.warning("Grocery response contained malformed JSON")
                 return []
 
     if isinstance(data, dict):
@@ -164,6 +637,7 @@ def parse_grocery_response(
         try:
             sections.append(GrocerySection.model_validate(item))
         except ValidationError as exc:
-            logger.warning("Skipping invalid grocery section: %s", exc)
+            del exc
+            logger.warning("Skipping grocery section with invalid schema")
 
     return sections

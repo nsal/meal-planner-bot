@@ -250,20 +250,28 @@ def _assert_built_template_is_current() -> None:
     built_globals = built_template["Globals"]["Function"]
 
     built_global_variables = built_globals["Environment"]["Variables"]
-    for variable_name, parameter_name in (
-        ("TELEGRAM_BOT_TOKEN", "TelegramBotTokenSecretName"),
-        ("LLM_API_KEY", "LlmApiKeySecretName"),
+    for variable_name in (
+        "TELEGRAM_BOT_TOKEN",
+        "LLM_API_KEY",
     ):
         dynamic_reference = built_global_variables[variable_name]
         assert _contains_text(dynamic_reference, "secretsmanager")
-        assert _contains_text(dynamic_reference, parameter_name)
+        assert _contains_text(dynamic_reference, "AppSecretsSecretName")
 
     built_bot_variables = built_template["Resources"]["BotFunction"][
         "Properties"
     ]["Environment"]["Variables"]
     webhook_reference = built_bot_variables["TELEGRAM_WEBHOOK_SECRET"]
     assert _contains_text(webhook_reference, "secretsmanager")
-    assert _contains_text(webhook_reference, "TelegramWebhookSecretName")
+    assert _contains_text(webhook_reference, "AppSecretsSecretName")
+
+    for logical_id in ("BotFunction", "PlannerFunction"):
+        variables = built_template["Resources"][logical_id]["Properties"][
+            "Environment"
+        ]["Variables"]
+        assert variables["SECRET_REFRESH_TOKEN"] == {
+            "Ref": "SecretRefreshToken"
+        }
 
 
 def _assert_source_files_match_artifact(artifact: Path) -> None:
@@ -383,6 +391,42 @@ def test_lambda_build_configuration() -> None:
         }
 
 
+def test_planner_can_invoke_only_its_own_function_for_repair() -> None:
+    """Repair permission is narrow and does not reference the resource ARN."""
+    template = _load_template()
+    planner = template["Resources"]["PlannerFunction"]
+    policies = planner["Properties"]["Policies"]
+    statements = [
+        statement
+        for policy in policies
+        if isinstance(policy, dict) and "Statement" in policy
+        for statement in policy["Statement"]
+    ]
+
+    repair_statements = [
+        statement
+        for statement in statements
+        if statement.get("Action") == "lambda:InvokeFunction"
+    ]
+    assert repair_statements == [
+        {
+            "Effect": "Allow",
+            "Action": "lambda:InvokeFunction",
+            "Resource": {
+                "Fn::Sub": (
+                    "arn:${AWS::Partition}:lambda:${AWS::Region}:"
+                    "${AWS::AccountId}:function:${AWS::StackName}-planner"
+                )
+            },
+        }
+    ]
+    assert "GetAtt" not in str(repair_statements[0]["Resource"])
+    assert planner["Properties"]["Timeout"] == 310
+    assert planner["Properties"]["MemorySize"] == 512
+    variables = planner["Properties"]["Environment"]["Variables"]
+    assert variables["PLANNER_LLM_MAX_RETRIES"] == "1"
+
+
 def test_readme_documents_single_attempt_planner_diagnostics() -> None:
     """Operational documentation matches the deployed Planner policy."""
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
@@ -392,6 +436,13 @@ def test_readme_documents_single_attempt_planner_diagnostics() -> None:
     assert "`PLANNER_GROCERY_LLM_REQUEST_TIMEOUT_SECONDS` | `120`" in readme
     assert "`PLANNER_GROCERY_LLM_MAX_RETRIES` | `2`" in readme
     assert "one 240-second whole-plan provider attempt" in readme
+    normalized_readme = " ".join(readme.split())
+    assert "one automatic repair in a fresh asynchronous" in normalized_readme
+    assert "Preference interpretation is LLM-assisted" in normalized_readme
+    assert (
+        "Application code is authoritative for the measurable parts"
+        in normalized_readme
+    )
     assert "Grocery generation retains two" in readme
     assert "`attempt`, `elapsed_ms`, `model`, and a" in readme
     assert "These diagnostics do not include prompts" in readme
@@ -400,41 +451,30 @@ def test_readme_documents_single_attempt_planner_diagnostics() -> None:
     assert "second request" not in readme
 
 
-def test_bot_transaction_permission_is_explicit_and_table_scoped() -> None:
-    """Only BotFunction can transact against the application table."""
+def test_transaction_permission_is_explicit_and_table_scoped() -> None:
+    """Both functions can transact only against the application table."""
     template = _load_template()
     resources = template["Resources"]
 
-    bot_policies = resources["BotFunction"]["Properties"]["Policies"]
-    transaction_statements = [
-        statement
-        for policy in bot_policies
-        if isinstance(policy, dict)
-        for statement in policy.get("Statement", [])
-        if isinstance(statement, dict)
-        and statement.get("Action") == "dynamodb:TransactWriteItems"
-    ]
-    assert transaction_statements == [
-        {
-            "Effect": "Allow",
-            "Action": "dynamodb:TransactWriteItems",
-            "Resource": {"Fn::GetAtt": "MealPlannerTable.Arn"},
-        }
-    ]
-    assert all(
-        statement["Resource"] != "*" for statement in transaction_statements
-    )
-
-    planner_policies = resources["PlannerFunction"]["Properties"]["Policies"]
-    assert not any(
-        isinstance(policy, dict)
-        and any(
-            isinstance(statement, dict)
-            and statement.get("Action") == "dynamodb:TransactWriteItems"
+    expected_statement = {
+        "Effect": "Allow",
+        "Action": "dynamodb:TransactWriteItems",
+        "Resource": {"Fn::GetAtt": "MealPlannerTable.Arn"},
+    }
+    for function_name in ("BotFunction", "PlannerFunction"):
+        policies = resources[function_name]["Properties"]["Policies"]
+        transaction_statements = [
+            statement
+            for policy in policies
+            if isinstance(policy, dict)
             for statement in policy.get("Statement", [])
+            if isinstance(statement, dict)
+            and statement.get("Action") == "dynamodb:TransactWriteItems"
+        ]
+        assert transaction_statements == [expected_statement]
+        assert all(
+            statement["Resource"] != "*" for statement in transaction_statements
         )
-        for policy in planner_policies
-    )
 
 
 @pytest.mark.parametrize(
@@ -493,15 +533,22 @@ def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
     """Secrets enter Lambda through Secrets Manager references."""
     template = _load_template()
     parameters = template["Parameters"]
-    secret_parameters = {
-        "TelegramBotTokenSecretName",
-        "TelegramWebhookSecretName",
-        "LlmApiKeySecretName",
-    }
     assert parameters["SecretRefreshToken"]["Type"] == "String"
     assert "Default" not in parameters["SecretRefreshToken"]
 
-    assert secret_parameters <= parameters.keys()
+    assert "AppSecretsSecretName" in parameters
+    secret_name_parameters = {
+        name for name in parameters if name.endswith("SecretName")
+    }
+    assert secret_name_parameters == {"AppSecretsSecretName"}
+    assert (
+        not {
+            "TelegramBotTokenSecretName",
+            "TelegramWebhookSecretName",
+            "LlmApiKeySecretName",
+        }
+        & parameters.keys()
+    )
     assert (
         not {
             "TelegramBotTokenParameter",
@@ -510,25 +557,30 @@ def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
         }
         & parameters.keys()
     )
-    for parameter_name in secret_parameters:
-        assert parameters[parameter_name]["Type"] == "String"
-        assert "NoEcho" not in parameters[parameter_name]
-        assert "Default" not in parameters[parameter_name]
+    assert parameters["AppSecretsSecretName"]["Type"] == "String"
+    assert "NoEcho" not in parameters["AppSecretsSecretName"]
+    assert "Default" not in parameters["AppSecretsSecretName"]
 
     variables = template["Globals"]["Function"]["Environment"]["Variables"]
     assert variables["SECRET_REFRESH_TOKEN"] == {"Ref": "SecretRefreshToken"}
-    for variable_name in (
-        "TELEGRAM_BOT_TOKEN",
-        "LLM_API_KEY",
-    ):
+    expected_references = {
+        "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
+        "LLM_API_KEY": "llm_api_key",
+    }
+    for variable_name, json_key in expected_references.items():
         dynamic_reference = variables[variable_name]
         assert isinstance(dynamic_reference, dict)
         dynamic_reference = dynamic_reference["Fn::Sub"]
         assert isinstance(dynamic_reference, list)
         assert (
             dynamic_reference[0]
-            == "{{resolve:secretsmanager:${SecretName}:SecretString}}"
+            == "{{resolve:secretsmanager:${SecretName}:SecretString:"
+            + json_key
+            + "}}"
         )
+        assert dynamic_reference[1] == {
+            "SecretName": {"Ref": "AppSecretsSecretName"}
+        }
 
     assert "TELEGRAM_WEBHOOK_SECRET" not in variables
     bot_variables = template["Resources"]["BotFunction"]["Properties"]
@@ -539,8 +591,53 @@ def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
     assert isinstance(webhook_reference, list)
     assert (
         webhook_reference[0]
-        == "{{resolve:secretsmanager:${SecretName}:SecretString}}"
+        == "{{resolve:secretsmanager:${SecretName}:SecretString:"
+        "telegram_webhook_secret}}"
     )
+    assert webhook_reference[1] == {
+        "SecretName": {"Ref": "AppSecretsSecretName"}
+    }
+
+
+def test_secret_refresh_updates_both_lambda_configurations() -> None:
+    """Both functions use the deployment refresh marker."""
+    template = _load_template()
+    for logical_id in ("BotFunction", "PlannerFunction"):
+        variables = template["Resources"][logical_id]["Properties"][
+            "Environment"
+        ]["Variables"]
+        assert variables["SECRET_REFRESH_TOKEN"] == {
+            "Ref": "SecretRefreshToken"
+        }
+
+
+def test_secret_values_are_not_runtime_retrieved_or_whole_secret_injected() -> (
+    None
+):
+    """The template resolves fields during deployment without runtime access."""
+    template = _load_template()
+    serialized_template = repr(template)
+    assert "GetSecretValue" not in serialized_template
+    assert "secretsmanager:GetSecretValue" not in serialized_template
+
+    global_variables = template["Globals"]["Function"]["Environment"][
+        "Variables"
+    ]
+    bot_variables = template["Resources"]["BotFunction"]["Properties"][
+        "Environment"
+    ]["Variables"]
+    all_variables = {**global_variables, **bot_variables}
+    for variable_name, json_key in (
+        ("TELEGRAM_BOT_TOKEN", "telegram_bot_token"),
+        ("TELEGRAM_WEBHOOK_SECRET", "telegram_webhook_secret"),
+        ("LLM_API_KEY", "llm_api_key"),
+    ):
+        reference = all_variables[variable_name]
+        assert isinstance(reference, dict)
+        substitution = reference["Fn::Sub"]
+        assert isinstance(substitution, list)
+        assert substitution[0].endswith(f":{json_key}}}}}")
+        assert ":SecretString}}" not in substitution[0]
 
 
 def test_telegram_allowlist_is_required_and_bot_scoped() -> None:

@@ -1,4 +1,4 @@
-"""Verify deployed Bot Lambda permission for DynamoDB transactions."""
+"""Verify deployed Lambda permissions for DynamoDB transactions."""
 
 import argparse
 import re
@@ -31,8 +31,10 @@ class VerificationError(Exception):
 class DeploymentResources:
     """Resolved resources used by the authorization simulation."""
 
-    function_name: str
-    role_arn: str
+    bot_function_name: str
+    bot_role_arn: str
+    planner_function_name: str
+    planner_role_arn: str
     table_name: str
     table_arn: str
 
@@ -108,20 +110,34 @@ def resolve_resources(
     dynamodb: Any,
     stack_name: str,
 ) -> DeploymentResources:
-    """Resolve the deployed Bot role and table ARN from stack resources."""
+    """Resolve both deployed roles and the table ARN from stack resources."""
     stack_response = cloudformation.describe_stacks(StackName=stack_name)
-    function_name = _stack_output(stack_response, "BotFunctionName", stack_name)
+    bot_function_name = _stack_output(
+        stack_response, "BotFunctionName", stack_name
+    )
+    planner_function_name = _stack_output(
+        stack_response, "PlannerFunctionName", stack_name
+    )
     table_name = _stack_output(
         stack_response, "MealPlannerTableName", stack_name
     )
 
-    function_response = lambda_client.get_function_configuration(
-        FunctionName=function_name
+    bot_function_response = lambda_client.get_function_configuration(
+        FunctionName=bot_function_name
     )
-    if not isinstance(function_response, dict):
+    if not isinstance(bot_function_response, dict):
         raise VerificationError("malformed AWS response from Lambda")
-    role_arn = _required_string(
-        function_response.get("Role"), "Lambda role ARN"
+    bot_role_arn = _required_string(
+        bot_function_response.get("Role"), "Bot Lambda role ARN"
+    )
+
+    planner_function_response = lambda_client.get_function_configuration(
+        FunctionName=planner_function_name
+    )
+    if not isinstance(planner_function_response, dict):
+        raise VerificationError("malformed AWS response from Lambda")
+    planner_role_arn = _required_string(
+        planner_function_response.get("Role"), "Planner Lambda role ARN"
     )
 
     table_response = dynamodb.describe_table(TableName=table_name)
@@ -135,43 +151,80 @@ def resolve_resources(
     table_arn = _required_string(table.get("TableArn"), "DynamoDB table ARN")
 
     return DeploymentResources(
-        function_name=function_name,
-        role_arn=role_arn,
+        bot_function_name=bot_function_name,
+        bot_role_arn=bot_role_arn,
+        planner_function_name=planner_function_name,
+        planner_role_arn=planner_role_arn,
         table_name=table_name,
         table_arn=table_arn,
     )
 
 
-def verify_permission(iam: Any, resources: DeploymentResources) -> None:
-    """Require an explicit allow for the exact deployed table ARN."""
+def _verify_role_permission(
+    iam: Any,
+    role_label: str,
+    role_arn: str,
+    table_arn: str,
+) -> None:
+    """Require one role's exact transaction permission."""
     response = iam.simulate_principal_policy(
-        PolicySourceArn=resources.role_arn,
+        PolicySourceArn=role_arn,
         ActionNames=[TRANSACTION_ACTION],
-        ResourceArns=[resources.table_arn],
+        ResourceArns=[table_arn],
     )
     if not isinstance(response, dict):
-        raise VerificationError("malformed AWS response from IAM")
+        raise VerificationError(f"malformed IAM response for {role_label} role")
     results = response.get("EvaluationResults")
     if not isinstance(results, list) or len(results) != 1:
-        raise VerificationError("malformed IAM simulation response")
+        raise VerificationError(
+            f"malformed IAM simulation response for {role_label} role"
+        )
     result = results[0]
     if not isinstance(result, dict):
-        raise VerificationError("malformed IAM evaluation result")
-    if result.get("EvalActionName") != TRANSACTION_ACTION:
-        raise VerificationError("malformed IAM evaluation action")
-    if result.get("EvalResourceName") != resources.table_arn:
         raise VerificationError(
-            "IAM result does not target the exact table ARN"
+            f"malformed IAM evaluation result for {role_label} role"
+        )
+    if result.get("EvalActionName") != TRANSACTION_ACTION:
+        raise VerificationError(
+            f"malformed IAM evaluation action for {role_label} role"
+        )
+    if result.get("EvalResourceName") != table_arn:
+        raise VerificationError(
+            f"IAM result for {role_label} role does not target the exact "
+            "table ARN"
         )
     if result.get("EvalDecision") != "allowed":
         decision = result.get("EvalDecision", "missing")
-        raise VerificationError(f"IAM transaction permission is {decision}")
+        raise VerificationError(
+            f"IAM transaction permission for {role_label} role is {decision}"
+        )
+
+
+def verify_permission(iam: Any, resources: DeploymentResources) -> None:
+    """Require both deployed roles to allow the exact table transaction."""
+    first_error: VerificationError | None = None
+    for role_label, role_arn in (
+        ("BotFunction", resources.bot_role_arn),
+        ("PlannerFunction", resources.planner_role_arn),
+    ):
+        try:
+            _verify_role_permission(
+                iam, role_label, role_arn, resources.table_arn
+            )
+        except VerificationError as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
 
 
 def _parser() -> argparse.ArgumentParser:
     """Build the command-line parser."""
     parser = argparse.ArgumentParser(
-        description="Verify the deployed Bot role can transact on its table."
+        description=(
+            "Verify the deployed Bot and Planner roles can transact on "
+            "their table."
+        )
     )
     parser.add_argument("--stack-name", required=True)
     parser.add_argument("--region", required=True)
@@ -219,7 +272,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"verification failed: {exc}", file=sys.stderr)
         return 1
 
-    print(f"explicitly allows {TRANSACTION_ACTION} on {resources.table_arn}")
+    print(
+        f"BotFunction and PlannerFunction roles explicitly allow "
+        f"{TRANSACTION_ACTION} on {resources.table_arn}"
+    )
     return 0
 
 

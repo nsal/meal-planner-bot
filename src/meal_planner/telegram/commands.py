@@ -42,8 +42,8 @@ class TelegramCommand:
 BOT_COMMANDS: Final[tuple[TelegramCommand, ...]] = (
     TelegramCommand("start", "Start onboarding or view what to do next"),
     TelegramCommand("help", "Show the available commands"),
-    TelegramCommand("profile", "View the household profile"),
-    TelegramCommand("plan", "Create or retry a weekly meal plan"),
+    TelegramCommand("profile", "View and amend the household profile"),
+    TelegramCommand("plan", "Create or retry a meal plan"),
     TelegramCommand("grocery", "View the active grocery list"),
     TelegramCommand("today", "View today's planned meals"),
     TelegramCommand("submit_meals", "Log meals eaten in the past week"),
