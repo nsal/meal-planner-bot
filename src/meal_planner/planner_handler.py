@@ -54,6 +54,7 @@ from meal_planner.models.schemas import (
     DietaryRule,
     GroceryStatus,
     MealOutcome,
+    PlanDays,
     PlanGenerationContext,
     PlanRevisionContext,
     PlanStatus,
@@ -149,6 +150,7 @@ class PlannerHandler:
         chat_id: int | str,
         *,
         week_start: date | None = None,
+        plan_days: PlanDays = 7,
         preference: str | None = None,
         requirements: list[PreferenceRequirement] | None = None,
         stored_rules: list[DietaryRule] | None = None,
@@ -167,6 +169,7 @@ class PlannerHandler:
         try:
             generation_context = PlanGenerationContext(
                 preference=preference,
+                plan_days=plan_days,
                 requirements=requirements or [],
                 stored_rules=stored_rules or [],
                 current_rules=current_rules or [],
@@ -226,6 +229,7 @@ class PlannerHandler:
                 meal_history=self.repo.get_meal_history(user_id, days=14),
                 previous_plan=self.repo.get_latest_plan(user_id),
                 week_start=target_week.isoformat(),
+                plan_days=int(generation_context.plan_days),
                 preference=generation_context.preference,
                 requirements=generation_context.requirements,
                 stored_rules=generation_context.stored_rules,
@@ -238,6 +242,7 @@ class PlannerHandler:
                 client,
                 prompt,
                 target_week,
+                plan_days=int(generation_context.plan_days),
                 attempt=generation_context.attempt,
             )
             if generation.plan is None:
@@ -416,6 +421,7 @@ class PlannerHandler:
         prompt: str,
         target_week: date,
         *,
+        plan_days: int = 7,
         attempt: int = 1,
     ) -> _GenerationAttempt:
         """Make exactly one provider call for this Planner invocation."""
@@ -448,8 +454,13 @@ class PlannerHandler:
 
         plan, feedback = parse_plan_response_with_metadata(raw)
         if plan and plan.week_start == target_week:
-            return _GenerationAttempt(plan=plan)
-        if plan is not None:
+            if len(plan.days) == plan_days:
+                return _GenerationAttempt(plan=plan)
+            feedback = PlanResponseFeedback(
+                category="structural",
+                issues=(SafeValidationIssue("wrong_day_count", "days"),),
+            )
+        elif plan is not None:
             feedback = PlanResponseFeedback(
                 category="structural",
                 issues=(SafeValidationIssue("wrong_week", "week_start_date"),),
@@ -474,10 +485,13 @@ class PlannerHandler:
         prompt: str,
         target_week: date,
         chat_id: int | str,
+        plan_days: int,
         failure_mode: str = "initial",
     ) -> WeeklyPlan | None:
         """Keep revisions to one provider call per Planner invocation."""
-        generation = self._generate_once(client, prompt, target_week)
+        generation = self._generate_once(
+            client, prompt, target_week, plan_days=plan_days
+        )
         if generation.plan is not None:
             return generation.plan
         reason = generation.failure_reason or self._invalid_plan_message()
@@ -645,6 +659,7 @@ class PlannerHandler:
             "user_id": user_id,
             "chat_id": chat_id,
             "week_start": target_week.isoformat(),
+            "plan_days": context.plan_days,
             "preference": context.preference,
             "requirements": [
                 requirement.model_dump(mode="json")
@@ -1084,6 +1099,7 @@ class PlannerHandler:
                     "to create a new draft.",
                 )
                 return
+            expected_plan_days = len(plan.days)
             client = self.llm_client or LLMClient()
             revised = self._generate_with_bounded_repair(
                 client,
@@ -1091,10 +1107,12 @@ class PlannerHandler:
                     profile,
                     plan,
                     context.amendment,
+                    expected_plan_days=expected_plan_days,
                     week_start=context.week_start.isoformat(),
                 ),
                 context.week_start,
                 chat_id,
+                plan_days=expected_plan_days,
                 failure_mode="revision",
             )
             if revised is None:
@@ -1272,6 +1290,7 @@ class PlannerHandler:
                         "current_rules": event.get("current_rules", []),
                         "effective_rules": event.get("effective_rules", []),
                         "constraint_rules": event.get("constraint_rules", []),
+                        "plan_days": event.get("plan_days", 7),
                         "attempt": event.get("attempt", 1),
                         "repair_feedback": event.get("repair_feedback"),
                         "request_id": event.get("request_id"),
@@ -1285,6 +1304,7 @@ class PlannerHandler:
                 user_id,
                 chat_id,
                 week_start=week,
+                plan_days=context.plan_days,
                 preference=context.preference,
                 requirements=context.requirements,
                 stored_rules=context.stored_rules,

@@ -128,11 +128,13 @@ def test_parse_plan_response_invalid() -> None:
     assert parse_plan_response({"invalid": "schema"}) is None
 
 
-def test_parse_plan_response_rejects_incomplete_and_duplicate_days() -> None:
-    """Plan parser enforces the complete-week domain invariant."""
+def test_parse_plan_response_accepts_short_and_rejects_duplicate_days() -> None:
+    """Parser accepts contiguous short plans and rejects duplicates."""
     partial = make_plan_data()
     partial["days"] = partial["days"][:-1]
-    assert parse_plan_response(partial) is None
+    parsed = parse_plan_response(partial)
+    assert parsed is not None
+    assert [plan_day.day for plan_day in parsed.days] == [1, 2, 3, 4, 5, 6]
 
     duplicate = make_plan_data()
     duplicate["days"] = [{"day": 1, "meals": []} for _ in range(7)]

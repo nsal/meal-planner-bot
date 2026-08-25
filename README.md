@@ -1,7 +1,7 @@
 # Meal Planner Bot
 
 A Telegram assistant that collects a household nutrition profile, generates a
-seven-day meal plan through LiteLLM, confirms edits, builds groceries
+variable-length meal plan through LiteLLM, confirms edits, builds groceries
 asynchronously, records actual meals, and records cooked, skipped, or swapped
 meal outcomes.
 
@@ -47,10 +47,15 @@ the locked `uv` environment.
   dietary constraints > current plan preferences > stored dietary
   preferences. Constraints cannot be overridden, and a preference that
   conflicts with one is rejected.
-- `/plan` asks for a request-specific preference before starting asynchronous
-  generation. `no preference` and `anything` remove the extra constraint; the
-  saved family profile is never changed. A failed request retains the
-  preference so `/plan` can retry it.
+- `/plan` asks for a duration and request-specific preference before starting
+  asynchronous generation. Reply in the form `N, preference`, such as
+  `1, no preference` or `3, fish for dinner`; only the first comma separates
+  the duration, so later commas remain part of the preference. `no
+  preference` and `anything` remove the extra constraint; the saved family
+  profile is never changed. After the initial reply, clarification messages
+  are treated as preference text and retain the selected duration. Historical
+  in-progress seven-day requests continue to accept preference-only replies.
+  A failed request retains the preference so `/plan` can retry it.
 - Request-specific preferences support structured natural-language rules.
   `I'd like eggs for breakfast` becomes a strict minimum of one, while
   `beans for breakfast if convenient` is best effort and may be omitted.
@@ -60,7 +65,10 @@ the locked `uv` environment.
   LLM asks a focused clarification question when a clause is ambiguous,
   unsupported, conflicting, or incomplete. The original wording stays
   attached to the same `/plan` workflow, and your next reply is combined with
-  it.
+  it. Positive exact-count or minimum obligations are also clarified when the
+  selected date horizon cannot provide enough eligible weekday or meal slots;
+  maximum rules and an exact count of zero remain feasible when no matching
+  slots exist.
 - The application validates constraints first, then strict rules and plan
   completeness. It matches whole words or phrases in declared meal names and
   ingredient items, ignoring case, punctuation, whitespace, and conservative
@@ -72,7 +80,7 @@ the locked `uv` environment.
   asynchronous invocation. A second invalid result is terminal, leaves the
   previous draft unchanged, retains the preference, and can be retried
   manually with `/plan`.
-- Profile changes apply only to newly generated plans. Existing weekly plans
+- Profile changes apply only to newly generated plans. Existing meal plans
   are not revalidated or altered after a constraint changes, and users are
   responsible for regenerating them. Declared-ingredient validation does not
   detect undeclared product cross-contamination and is not medical
@@ -172,7 +180,7 @@ use the function-specific settings above.
 
 Never commit `.env` or secret values.
 
-Planner generation makes one whole-week provider request per invocation. An
+Planner generation makes one whole-plan provider request per invocation. An
 invalid first result can trigger one bounded repair in a fresh asynchronous
 Planner invocation; each invocation still makes only one provider request. A
 timeout failure is reported separately from invalid structured output, and
@@ -409,7 +417,7 @@ The Telegram command menu and `/help` show the same command reference:
 - `/start` — Start onboarding or view what to do next.
 - `/help` — Show the available commands.
 - `/profile` — View and amend the household profile.
-- `/plan` — Create or retry a weekly meal plan.
+- `/plan` — Create or retry a meal plan.
 - `/grocery` — View the active grocery list.
 - `/today` — View today's planned meals.
 - `/submit_meals` — Submit one meal eaten in the past seven UTC calendar days.
@@ -428,12 +436,15 @@ The Telegram command menu and `/help` show the same command reference:
 - Natural-language no-value answers such as `none`, `nothing`, `no allergies`,
   and `no restrictions` are stored as empty categories. They count as answers,
   while omitted fields remain missing until supplied.
-- `/plan` asks for a one-time request preference before asynchronously
-  generating a complete seven-day draft. Use exact-count natural-language
-  clauses such as `three egg breakfasts` or `one dinner with salmon or trout`.
-  If the request cannot be interpreted completely, the bot asks one focused
-  clarification and keeps the raw preference in the same workflow; your next
-  reply is combined with it. The draft is persisted before Telegram delivery
+- `/plan` asks for a duration and request-specific preference in the form
+  `N, preference`, for example `1, no preference` or `3, fish for dinner`.
+  Split only at the first comma when the preference contains more commas.
+  After the initial response, clarification replies are preference-only and
+  retain the selected duration. If the request cannot be interpreted
+  completely, the bot asks one focused clarification and keeps the raw
+  preference in the same workflow; your next reply is combined with it.
+  Historical in-progress seven-day requests continue to accept
+  preference-only replies. The draft is persisted before Telegram delivery
   only after application validation. An invalid first result receives one
   automatic repair in a separate Planner invocation. If that repair also
   fails, no draft is saved, the preference is retained, and `/plan` is the

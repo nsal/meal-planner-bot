@@ -42,6 +42,7 @@ from meal_planner.models.schemas import (
     Weekday,
     canonicalize_profile_rule_ids,
 )
+from meal_planner.preferences import validate_horizon_feasibility
 from meal_planner.router import RouteResult, RouteType
 from meal_planner.telegram.access import TelegramAccessPolicy
 from meal_planner.telegram.api import TelegramAPIError, split_text
@@ -51,7 +52,7 @@ from tests.factories import make_plan, make_profile
 
 @pytest.fixture
 def handler(mocker: Any) -> BotHandler:
-    return BotHandler(
+    bot_handler = BotHandler(
         mocker.MagicMock(),
         mocker.MagicMock(),
         lambda_client=mocker.MagicMock(),
@@ -59,6 +60,15 @@ def handler(mocker: Any) -> BotHandler:
         llm_client=mocker.MagicMock(),
         access_policy=TelegramAccessPolicy(frozenset({"1"})),
     )
+
+    def collected_plan_state() -> ConversationState:
+        """Build a collected state for legacy preference-flow tests."""
+        return BotHandler._new_plan_state().model_copy(
+            update={"duration_collected": True}
+        )
+
+    bot_handler._new_plan_state = collected_plan_state
+    return bot_handler
 
 
 @pytest.fixture
@@ -99,6 +109,22 @@ def _command(name: str) -> RouteResult:
         chat_id=1,
         user_id="user",
         command=name,
+    )
+
+
+def _plan_command_at(day: date) -> RouteResult:
+    """Build a plan command with a controlled UTC processing date."""
+    timestamp = int(
+        datetime.combine(
+            day, datetime.min.time(), tzinfo=timezone.utc
+        ).timestamp()
+    )
+    return RouteResult(
+        route_type=RouteType.COMMAND,
+        chat_id=1,
+        user_id="user",
+        command="plan",
+        raw_update={"message": {"date": timestamp}},
     )
 
 
@@ -166,6 +192,8 @@ def test_help_renders_catalogue_without_repository_interaction(
     handler.handle_command(_command("help"))
 
     handler.telegram_api.send_message.assert_called_once_with(1, render_help())
+    assert "/plan — Create or retry a meal plan" in render_help().splitlines()
+    assert "weekly meal plan" not in render_help().lower()
     handler.repo.assert_not_called()
 
 
@@ -2735,6 +2763,267 @@ def test_plan_preference_resolves_current_rules_over_stored_rules(
     assert payload["constraint_rules"] == []
 
 
+def test_horizon_feasibility_checks_resolved_current_override(
+    handler: BotHandler, mocker: Any
+) -> None:
+    """Horizon capacity is checked after current rules cap stored rules."""
+    stored_rule = DietaryRule(
+        id="stored-eggs",
+        source_text="eggs three times for breakfast",
+        foods_any_of=["eggs"],
+        meal_type=MealType.BREAKFAST,
+        count=3,
+    )
+    profile = make_profile().model_copy(
+        update={
+            "dietary_preferences": [
+                DietaryPreferenceEntry(
+                    id=stored_rule.id,
+                    source_text=stored_rule.source_text,
+                    rule=stored_rule,
+                )
+            ]
+        }
+    )
+    handler.repo.get_profile.return_value = profile
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": "current_plan_preference",
+            "requirements": [
+                {
+                    "id": "current-eggs-max",
+                    "source_text": "eggs at most once for breakfast",
+                    "foods_any_of": ["eggs"],
+                    "meal_type": "breakfast",
+                    "operator": "at_most",
+                    "count": 1,
+                    "strength": "strict",
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+    state = handler._new_plan_state().model_copy(update={"plan_days": 1})
+    handler.repo.get_conversation_state.return_value = state
+    feasibility = mocker.patch(
+        "meal_planner.bot_handler.validate_horizon_feasibility",
+        wraps=validate_horizon_feasibility,
+    )
+
+    handler.handle_conversational(
+        _plan_route("eggs at most once for breakfast", update_id=6501)
+    )
+
+    feasibility.assert_called_once()
+    checked_rules = feasibility.call_args.args[0]
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert len(checked_rules) == 1
+    assert checked_rules[0].id == saved.effective_rules[0].id
+    assert checked_rules[0].source_text == ("eggs at most once for breakfast")
+    assert checked_rules[0].count == 1
+    assert saved.step is ConversationWorkflowStep.GENERATING
+    assert saved.plan_days == 1
+    assert saved.duration_collected
+    assert saved.current_rules[0].id.startswith("r-current-")
+    handler.lambda_client.invoke.assert_called_once()
+
+
+def test_horizon_feasibility_waits_until_after_constraint_conflict_check(
+    handler: BotHandler, mocker: Any
+) -> None:
+    """A constraint conflict blocks before horizon feasibility is needed."""
+    profile = make_profile().model_copy(
+        update={
+            "dietary_constraints": [
+                ConstraintEntry(
+                    id="constraint-peanuts",
+                    source_text="no peanuts",
+                    forbidden_terms=["peanuts"],
+                )
+            ]
+        }
+    )
+    handler.repo.get_profile.return_value = profile
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": "current_plan_preference",
+            "requirements": [
+                {
+                    "id": "current-peanuts",
+                    "source_text": "peanuts once",
+                    "foods_any_of": ["peanuts"],
+                    "operator": "exactly",
+                    "count": 1,
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+    state = handler._new_plan_state().model_copy(update={"plan_days": 1})
+    handler.repo.get_conversation_state.return_value = state
+    feasibility = mocker.patch(
+        "meal_planner.bot_handler.validate_horizon_feasibility"
+    )
+
+    handler.handle_conversational(_plan_route("peanuts once", update_id=6502))
+
+    feasibility.assert_not_called()
+    handler.lambda_client.invoke.assert_not_called()
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert saved.plan_days == 1
+    assert saved.duration_collected
+
+
+def test_infeasible_effective_rule_retains_duration_for_clarification(
+    handler: BotHandler,
+) -> None:
+    """An impossible effective rule pauses without invoking the planner."""
+    handler.repo.get_profile.return_value = make_profile()
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": "current_plan_preference",
+            "requirements": [
+                {
+                    "id": "current-eggs",
+                    "source_text": "eggs twice for breakfast",
+                    "foods_any_of": ["eggs"],
+                    "meal_type": "breakfast",
+                    "operator": "exactly",
+                    "count": 2,
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+    state = handler._new_plan_state().model_copy(update={"plan_days": 1})
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(
+        _plan_route("eggs twice for breakfast", update_id=6503)
+    )
+
+    handler.lambda_client.invoke.assert_not_called()
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert saved.plan_days == 1
+    assert saved.duration_collected
+    assert saved.preference == "eggs twice for breakfast"
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "cannot fit" in message
+    assert "eggs twice for breakfast" not in message
+
+
+@pytest.mark.parametrize("operator_text", ["exactly", "at least"])
+def test_infeasible_best_effort_rule_still_invokes_planner(
+    handler: BotHandler,
+    operator_text: str,
+) -> None:
+    """Best-effort horizon shortfalls remain prompt and summary guidance."""
+    preference_text = f"eggs {operator_text} twice for breakfast if convenient"
+    handler.repo.get_profile.return_value = make_profile()
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": "current_plan_preference",
+            "requirements": [
+                {
+                    "id": "best-effort-eggs",
+                    "source_text": preference_text,
+                    "foods_any_of": ["eggs"],
+                    "meal_type": "breakfast",
+                    "operator": operator_text.replace(" ", "_"),
+                    "count": 2,
+                    "strength": "best_effort",
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+    state = handler._new_plan_state().model_copy(update={"plan_days": 1})
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(_plan_route(preference_text, update_id=6505))
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.GENERATING
+    assert saved.plan_days == 1
+    assert saved.effective_rules[0].strength is RuleStrength.BEST_EFFORT
+    handler.lambda_client.invoke.assert_called_once()
+    assert not any(
+        "cannot fit" in call.args[1]
+        for call in handler.telegram_api.send_message.call_args_list
+    )
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["plan_days"] == 1
+    assert payload["effective_rules"][0]["strength"] == "best_effort"
+
+
+def test_absent_weekday_at_most_keeps_priority_tiers_and_generates(
+    handler: BotHandler, mocker: Any
+) -> None:
+    """An absent weekday upper bound remains feasible after resolution."""
+    absent_weekday = Weekday((date.today().isoweekday() % 7) + 1)
+    handler.repo.get_profile.return_value = make_profile()
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": "current_plan_preference",
+            "requirements": [
+                {
+                    "id": "current-eggs-max",
+                    "source_text": "eggs at most twice on another day",
+                    "foods_any_of": ["eggs"],
+                    "meal_type": "breakfast",
+                    "weekdays": [absent_weekday.value],
+                    "operator": "at_most",
+                    "count": 2,
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+    state = handler._new_plan_state().model_copy(update={"plan_days": 1})
+    handler.repo.get_conversation_state.return_value = state
+    feasibility = mocker.patch(
+        "meal_planner.bot_handler.validate_horizon_feasibility",
+        wraps=validate_horizon_feasibility,
+    )
+
+    handler.handle_conversational(
+        _plan_route("eggs at most twice on another day", update_id=6504)
+    )
+
+    feasibility.assert_called_once()
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.GENERATING
+    assert len(saved.current_rules) == 1
+    assert saved.current_rules[0].id.startswith("r-current-")
+    assert [rule.id for rule in saved.effective_rules] == [
+        saved.current_rules[0].id
+    ]
+    result = validate_horizon_feasibility(
+        saved.effective_rules,
+        start_date=date.today(),
+        end_date=date.today(),
+    )
+    assert result.is_feasible
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["effective_rules"][0]["operator"] == "at_most"
+
+
 def test_partial_scope_maximum_preserves_ids_through_retry_boundary(
     handler: BotHandler,
 ) -> None:
@@ -2830,7 +3119,7 @@ def test_partial_scope_maximum_preserves_ids_through_retry_boundary(
     )
     assert len(first_payload["effective_rules"]) == 2
     assert (
-        "Working on your weekly meal plan."
+        "Working on your 7-day meal plan."
         in (handler.telegram_api.send_message.call_args.args[1])
     )
 
@@ -3612,7 +3901,7 @@ def test_plan_preference_requirement_count_boundary(
         assert len(saved.effective_rules) == 20
         handler.lambda_client.invoke.assert_called_once()
         assert handler.telegram_api.send_message.call_args.args[1] == (
-            "Working on your weekly meal plan."
+            "Working on your 7-day meal plan."
         )
     else:
         assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
@@ -4181,7 +4470,7 @@ def test_duplicate_generating_plan_update_keeps_working_reply(
     handler.lambda_client.invoke.assert_not_called()
     assert (
         handler.telegram_api.send_message.call_args.args[1]
-        == "Working on your weekly meal plan."
+        == "Working on your 7-day meal plan."
     )
 
 
@@ -4269,6 +4558,559 @@ def test_plan_retry_preserves_preference_without_reinterpreting(
         handler.lambda_client.invoke.call_args.kwargs["Payload"]
     )
     assert payload["preference"] == "eggs three times"
+
+
+@pytest.mark.parametrize("plan_days", [3, 7])
+def test_plan_retry_dispatches_retained_duration(
+    handler: BotHandler, plan_days: int
+) -> None:
+    """Manual retry serializes the retained duration to the planner."""
+    state = handler._new_plan_state().model_copy(
+        update={
+            "step": ConversationWorkflowStep.RETRY_READY,
+            "plan_days": plan_days,
+            "duration_collected": True,
+            "revision": 4,
+        }
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.transition_conversation_state.return_value = True
+
+    handler.handle_command(_command("plan"))
+
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["plan_days"] == plan_days
+    assert payload["week_start"] == date.today().isoformat()
+
+
+def test_retry_revalidates_rules_after_utc_date_change(
+    handler: BotHandler,
+) -> None:
+    """A shifted strict weekday horizon returns to bounded clarification."""
+    accepted_date = date.today() - timedelta(days=1)
+    retry_date = date.today()
+    rule = DietaryRule(
+        id="monday-eggs",
+        source_text="eggs once for breakfast on the prior weekday",
+        foods_any_of=["eggs"],
+        meal_type=MealType.BREAKFAST,
+        weekdays=[Weekday(accepted_date.isoweekday())],
+        operator=RuleOperator.EXACTLY,
+        count=1,
+        strength=RuleStrength.STRICT,
+    )
+    state = handler._new_plan_state().model_copy(
+        update={
+            "step": ConversationWorkflowStep.RETRY_READY,
+            "plan_days": 1,
+            "duration_collected": True,
+            "preference": "eggs once for breakfast",
+            "effective_rules": [rule],
+            "revision": 4,
+        }
+    )
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.transition_conversation_state.return_value = True
+
+    handler.handle_command(_plan_command_at(retry_date))
+
+    handler.lambda_client.invoke.assert_not_called()
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert saved.plan_days == 1
+    assert saved.duration_collected
+    assert saved.request_id == state.request_id
+    assert saved.effective_rules == [rule]
+    assert saved.revision == state.revision + 1
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert "cannot fit" in message
+    assert rule.source_text not in message
+
+
+def test_retry_feasible_date_shift_uses_one_start_date(
+    handler: BotHandler,
+) -> None:
+    """A feasible retry transitions and dispatches its captured UTC date."""
+    retry_date = date.today()
+    state = handler._new_plan_state().model_copy(
+        update={
+            "step": ConversationWorkflowStep.RETRY_READY,
+            "plan_days": 3,
+            "duration_collected": True,
+            "revision": 4,
+        }
+    )
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.transition_conversation_state.return_value = True
+
+    handler.handle_command(_plan_command_at(retry_date))
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.GENERATING
+    assert saved.revision == state.revision + 1
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["week_start"] == retry_date.isoformat()
+    assert payload["plan_days"] == state.plan_days
+    assert handler.repo.transition_conversation_state.call_args.kwargs == {
+        "expected_revision": state.revision
+    }
+
+
+def test_retry_best_effort_shortfall_remains_non_blocking(
+    handler: BotHandler,
+) -> None:
+    """A best-effort retry still dispatches when capacity is insufficient."""
+    rule = DietaryRule(
+        id="best-effort-eggs",
+        source_text="eggs twice for breakfast if convenient",
+        foods_any_of=["eggs"],
+        meal_type=MealType.BREAKFAST,
+        operator=RuleOperator.EXACTLY,
+        count=2,
+        strength=RuleStrength.BEST_EFFORT,
+    )
+    state = handler._new_plan_state().model_copy(
+        update={
+            "step": ConversationWorkflowStep.RETRY_READY,
+            "plan_days": 1,
+            "duration_collected": True,
+            "effective_rules": [rule],
+            "revision": 4,
+        }
+    )
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.transition_conversation_state.return_value = True
+
+    handler.handle_command(_plan_command_at(date.today()))
+
+    handler.lambda_client.invoke.assert_called_once()
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["plan_days"] == 1
+    assert payload["effective_rules"][0]["id"] == rule.id
+
+
+def test_retry_date_revalidation_does_not_dispatch_after_state_loss(
+    handler: BotHandler,
+) -> None:
+    """A lost retry transition never creates a planner side effect."""
+    state = handler._new_plan_state().model_copy(
+        update={
+            "step": ConversationWorkflowStep.RETRY_READY,
+            "plan_days": 3,
+            "duration_collected": True,
+            "revision": 4,
+        }
+    )
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.transition_conversation_state.return_value = False
+
+    handler.handle_command(_plan_command_at(date.today()))
+
+    handler.lambda_client.invoke.assert_not_called()
+    handler.repo.transition_conversation_state.assert_called_once()
+    assert "changed" in handler.telegram_api.send_message.call_args.args[1]
+
+
+def _plan_route(text: str, update_id: int = 9000) -> RouteResult:
+    """Build a conversational route for focused plan-phase tests."""
+    return RouteResult(
+        route_type=RouteType.CONVERSATIONAL,
+        chat_id=1,
+        user_id="user",
+        text=text,
+        raw_update={"update_id": update_id},
+    )
+
+
+def test_new_plan_phase_requires_duration_and_preference_pair(
+    handler: BotHandler,
+) -> None:
+    """A new uncollected request rejects preference-only input."""
+    state = BotHandler._new_plan_state()
+    assert not state.duration_collected
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(_plan_route("fish for dinner"))
+
+    handler.llm_client.chat_sync.assert_not_called()
+    handler.lambda_client.invoke.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
+    assert (
+        "3, fish for dinner"
+        in (handler.telegram_api.send_message.call_args.args[1])
+    )
+
+
+@pytest.mark.parametrize("plan_days", [1, 3])
+def test_plan_request_dispatches_selected_duration(
+    handler: BotHandler, plan_days: int
+) -> None:
+    """Initial planner events carry the accepted duration and start date."""
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.get_conversation_state.return_value = (
+        BotHandler._new_plan_state()
+    )
+    handler.repo.transition_conversation_state.return_value = True
+
+    handler.handle_conversational(
+        _plan_route(f"{plan_days}, no preference", update_id=9020 + plan_days)
+    )
+
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["plan_days"] == plan_days
+    assert payload["week_start"] == date.today().isoformat()
+
+
+def test_legacy_plan_phase_accepts_preference_only_as_seven_days(
+    handler: BotHandler,
+) -> None:
+    """A persisted state without phase fields remains a seven-day request."""
+    legacy_payload = handler._new_plan_state().model_dump()
+    legacy_payload.pop("plan_days")
+    legacy_payload.pop("duration_collected")
+    legacy_state = ConversationState.model_validate(legacy_payload)
+    handler.repo.get_conversation_state.return_value = legacy_state
+    handler.repo.transition_conversation_state.return_value = True
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {"requirements": [], "clarification": "How many?", "unparsed_text": []}
+    )
+
+    handler.handle_conversational(_plan_route("fish", update_id=9001))
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.plan_days == 7
+    assert saved.duration_collected
+    assert saved.preference == "fish"
+
+
+def test_initial_duration_splits_only_at_first_comma(
+    handler: BotHandler,
+) -> None:
+    """The initial response retains commas in the preference wording."""
+    handler.repo.get_conversation_state.return_value = (
+        BotHandler._new_plan_state()
+    )
+    handler.repo.transition_conversation_state.return_value = True
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {"requirements": [], "clarification": "How many?", "unparsed_text": []}
+    )
+
+    handler.handle_conversational(
+        _plan_route("3, fish for dinner, twice", update_id=9002)
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.plan_days == 3
+    assert saved.duration_collected
+    assert saved.preference == "fish for dinner, twice"
+    assert handler.llm_client.chat_sync.call_args.args[1] == (
+        "fish for dinner, twice"
+    )
+
+
+@pytest.mark.parametrize(
+    "text, expected_days, expected_preference",
+    [
+        ("1, no preference", 1, None),
+        (" 7 ,  fish for dinner  ", 7, "fish for dinner"),
+        ("3, fish, pasta, and salad", 3, "fish, pasta, and salad"),
+        ("2, anything", 2, None),
+        ("4, NO PREFERENCE", 4, None),
+        ("5, no preferences!", 5, None),
+        ("6, none", 6, None),
+        ("7, whatever.", 7, None),
+    ],
+)
+def test_initial_plan_input_matrix_preserves_duration_and_preference(
+    handler: BotHandler,
+    text: str,
+    expected_days: int,
+    expected_preference: str | None,
+) -> None:
+    """Accepted initial forms retain duration and normalized preference."""
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.get_conversation_state.return_value = (
+        BotHandler._new_plan_state()
+    )
+    handler.repo.transition_conversation_state.return_value = True
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [],
+            "clarification": "Which count?",
+            "unparsed_text": [],
+        }
+    )
+
+    handler.handle_conversational(_plan_route(text, 9050 + expected_days))
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.plan_days == expected_days
+    assert saved.duration_collected
+    assert saved.preference == expected_preference
+    if expected_preference is None:
+        handler.llm_client.chat_sync.assert_not_called()
+        handler.lambda_client.invoke.assert_called_once()
+    else:
+        assert handler.llm_client.chat_sync.call_args.args[1] == (
+            expected_preference
+        )
+        handler.lambda_client.invoke.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "1",
+        ", fish",
+        "1,   ",
+        "True, fish",
+        "false, fish",
+        "three, fish",
+        "1.5, fish",
+        "0, fish",
+        "8, fish",
+    ],
+)
+def test_invalid_initial_plan_input_is_side_effect_free(
+    handler: BotHandler, text: str
+) -> None:
+    """Malformed initial input cannot transition or start plan work."""
+    handler.repo.get_profile.return_value = make_profile()
+    state = BotHandler._new_plan_state()
+    state_snapshot = state.model_dump(mode="json")
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(_plan_route(text, 9100))
+
+    assert state.model_dump(mode="json") == state_snapshot
+    handler.repo.transition_conversation_state.assert_not_called()
+    handler.repo.mark_conversation_retry_ready.assert_not_called()
+    handler.repo.save_conversation_state.assert_not_called()
+    handler.repo.log_meal_and_transition.assert_not_called()
+    handler.llm_client.chat_sync.assert_not_called()
+    handler.lambda_client.invoke.assert_not_called()
+    handler.telegram_api.send_plan.assert_not_called()
+    messages = [
+        call_args.args[1]
+        for call_args in handler.telegram_api.send_message.call_args_list
+    ]
+    assert len(messages) == 1
+    assert "Please reply in the form" in messages[0]
+
+
+def test_no_preference_initial_response_keeps_saved_rule_phase(
+    handler: BotHandler,
+) -> None:
+    """Saved-rule clarification retains duration and preference-only input."""
+    profile = make_profile().model_copy(
+        update={
+            "dietary_preferences": [
+                DietaryPreferenceEntry(
+                    id="saved-1", source_text="fish on Mondays"
+                )
+            ]
+        }
+    )
+    handler.repo.get_profile.return_value = profile
+    handler.repo.get_conversation_state.return_value = (
+        BotHandler._new_plan_state()
+    )
+    handler.repo.transition_conversation_state.return_value = True
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [],
+            "clarification": "Which count?",
+            "unparsed_text": [],
+        }
+    )
+
+    handler.handle_conversational(_plan_route("3, no preference", 9003))
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.plan_days == 3
+    assert saved.duration_collected
+    assert saved.preference is None
+    handler.lambda_client.invoke.assert_not_called()
+
+
+def test_no_preference_initial_response_keeps_constraint_phase(
+    handler: BotHandler,
+) -> None:
+    """Unsafe saved constraints clarify without losing the accepted duration."""
+    profile = make_profile().model_copy(
+        update={
+            "dietary_constraints": [
+                ConstraintEntry(
+                    id="constraint-1",
+                    source_text="an unknown restriction",
+                    uninterpretable=True,
+                )
+            ]
+        }
+    )
+    handler.repo.get_profile.return_value = profile
+    handler.repo.get_conversation_state.return_value = (
+        BotHandler._new_plan_state()
+    )
+    handler.repo.transition_conversation_state.return_value = True
+
+    handler.handle_conversational(_plan_route("3, no preference", 9005))
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.plan_days == 3
+    assert saved.duration_collected
+    assert saved.preference is None
+    handler.llm_client.chat_sync.assert_not_called()
+    handler.lambda_client.invoke.assert_not_called()
+    assert (
+        "constraint"
+        in handler.telegram_api.send_message.call_args.args[1].lower()
+    )
+
+
+def test_clarification_text_with_comma_is_not_reparsed(
+    handler: BotHandler,
+) -> None:
+    """Collected clarification preserves comma-containing text."""
+    state = handler._new_plan_state().model_copy(
+        update={
+            "plan_days": 3,
+            "duration_collected": True,
+            "preference": "fish",
+            "revision": 1,
+        }
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.transition_conversation_state.return_value = True
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [],
+            "clarification": "Please provide a count.",
+            "unparsed_text": ["fish"],
+        }
+    )
+
+    handler.handle_conversational(_plan_route("twice, on Mondays", 9004))
+
+    assert handler.llm_client.chat_sync.call_args.args[1] == (
+        "fish; twice, on Mondays"
+    )
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.plan_days == 3
+    assert saved.duration_collected
+
+
+def test_horizon_clarification_reply_remains_preference_only(
+    handler: BotHandler,
+) -> None:
+    """A horizon clarification reply cannot replace the retained duration."""
+    state = BotHandler._new_plan_state().model_copy(
+        update={
+            "plan_days": 3,
+            "duration_collected": True,
+            "effective_rules": [
+                DietaryRule(
+                    id="horizon-rule",
+                    source_text="fish twice on Mondays",
+                    foods_any_of=["fish"],
+                    weekdays=[Weekday.MONDAY],
+                    count=2,
+                )
+            ],
+        }
+    )
+    handler.repo.get_conversation_state.return_value = state
+    handler.repo.transition_conversation_state.return_value = True
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "requirements": [],
+            "clarification": "How many fish meals fit this horizon?",
+            "unparsed_text": ["fish"],
+        }
+    )
+
+    handler.handle_conversational(_plan_route("twice, on Mondays", 9007))
+
+    assert handler.llm_client.chat_sync.call_args.args[1] == (
+        "twice, on Mondays"
+    )
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.plan_days == 3
+    assert saved.duration_collected
+
+
+def test_plan_command_reset_starts_uncollected_duration_phase(
+    handler: BotHandler,
+) -> None:
+    """A fresh /plan replaces retained duration and preference state."""
+    handler.repo.get_profile.return_value = make_profile()
+    previous = handler._new_plan_state().model_copy(
+        update={
+            "plan_days": 3,
+            "duration_collected": True,
+            "preference": "fish",
+            "revision": 4,
+        }
+    )
+    handler.repo.get_conversation_state.return_value = previous
+    handler.repo.save_conversation_state.return_value = True
+    handler._new_plan_state = BotHandler._new_plan_state
+
+    handler.handle_command(_command("plan"))
+
+    saved = handler.repo.save_conversation_state.call_args.args[1]
+    assert saved.plan_days == 7
+    assert not saved.duration_collected
+    assert saved.preference is None
+
+
+def test_initial_duration_is_retained_when_planner_dispatch_fails(
+    handler: BotHandler,
+) -> None:
+    """Generation and retry-ready transitions keep the collected phase."""
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.get_conversation_state.return_value = (
+        BotHandler._new_plan_state()
+    )
+    handler.repo.transition_conversation_state.return_value = True
+    handler.lambda_client.invoke.side_effect = RuntimeError("planner down")
+
+    handler.handle_conversational(_plan_route("3, no preference", 9006))
+
+    generating = handler.repo.transition_conversation_state.call_args.args[1]
+    retry_ready = handler.repo.mark_conversation_retry_ready.call_args.args[1]
+    assert generating.plan_days == 3
+    assert generating.duration_collected
+    assert retry_ready.plan_days == 3
+    assert retry_ready.duration_collected
+    assert retry_ready.step is ConversationWorkflowStep.RETRY_READY
+
+
+@pytest.mark.parametrize("text", ["fish", "0, fish", "8, fish", "three, fish"])
+def test_invalid_initial_plan_syntax_has_no_interpreter_or_planner_side_effects(
+    handler: BotHandler, text: str
+) -> None:
+    """Invalid initial syntax leaves the uncollected state untouched."""
+    state = BotHandler._new_plan_state()
+    handler.repo.get_conversation_state.return_value = state
+
+    handler.handle_conversational(_plan_route(text, 9010))
+
+    handler.llm_client.chat_sync.assert_not_called()
+    handler.lambda_client.invoke.assert_not_called()
+    handler.repo.transition_conversation_state.assert_not_called()
 
 
 def test_profile_onboarding_accumulates_then_saves(handler: BotHandler) -> None:
@@ -5359,6 +6201,165 @@ def test_edit_accepts_current_and_future_drafts(
     handler.repo.update_meal.assert_called_once()
     handler.repo.get_active_plan.assert_not_called()
     handler.lambda_client.invoke.assert_not_called()
+
+
+@pytest.mark.parametrize("plan_days", [1, 3])
+def test_short_plan_edit_accepts_last_day_and_rejects_next_day(
+    handler: BotHandler, plan_days: int
+) -> None:
+    """Edits can address every persisted day but cannot create a new one."""
+    plan = make_plan(plan_days=plan_days)
+    handler.repo.get_latest_plan.return_value = plan
+    handler.repo.update_meal.return_value = True
+
+    accepted = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.EDIT_PLAN,
+        {"day": plan_days, "meal_type": "lunch", "name": "New lunch"},
+        None,
+    )
+    assert accepted.success
+    handler.repo.update_meal.assert_called_once()
+
+    handler.repo.update_meal.reset_mock()
+    rejected = handler._apply_intent_metadata(
+        "user",
+        1,
+        ConversationIntent.EDIT_PLAN,
+        {
+            "day": plan_days + 1,
+            "meal_type": "lunch",
+            "name": "Out of range",
+        },
+        None,
+    )
+    assert not rejected.success
+    assert rejected.message == "That day or meal does not exist."
+    handler.repo.update_meal.assert_not_called()
+    handler.lambda_client.invoke.assert_not_called()
+
+
+@pytest.mark.parametrize("plan_days", [1, 3])
+def test_short_plan_confirmation_starts_grocery_generation(
+    handler: BotHandler, plan_days: int
+) -> None:
+    """Confirmation publishes a short plan and starts its grocery worker."""
+    plan = make_plan(plan_days=plan_days)
+    handler.repo.get_latest_plan.return_value = plan
+    handler.repo.confirm_plan.return_value = True
+
+    result = handler._apply_intent_metadata(
+        "user", 1, ConversationIntent.CONFIRM_PLAN, {}, None
+    )
+
+    assert result.success
+    handler.repo.confirm_plan.assert_called_once_with(
+        "user", plan.week_start_date, plan.revision
+    )
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["action"] == "finalize_grocery"
+    assert payload["week_start"] == plan.week_start_date
+
+
+@pytest.mark.parametrize("plan_days", [1, 3])
+def test_today_displays_the_current_day_of_a_short_plan(
+    handler: BotHandler, plan_days: int
+) -> None:
+    """/today renders a current day that may be the short plan's last day."""
+    plan = make_plan(
+        week_start=date.today() - timedelta(days=plan_days - 1),
+        plan_days=plan_days,
+        status=PlanStatus.CONFIRMED,
+    )
+    handler.repo.get_active_plan.return_value = plan
+
+    handler._cmd_today(1, "user")
+
+    message = handler.telegram_api.send_message.call_args.args[1]
+    assert f"Day {plan_days}" in message
+    assert f"Lunch {plan_days}" in message
+    assert f"Day {plan_days + 1}" not in message
+
+
+@pytest.mark.parametrize("plan_days", [1, 3])
+def test_short_plan_checkin_and_outcome_use_actual_last_day(
+    handler: BotHandler, plan_days: int
+) -> None:
+    """Check-in buttons and outcomes remain bounded by persisted plan days."""
+    plan = make_plan(
+        week_start=date.today() - timedelta(days=plan_days - 1),
+        plan_days=plan_days,
+        status=PlanStatus.CONFIRMED,
+    )
+    handler.repo.get_active_plan.return_value = plan
+    handler._cmd_checkin(1, "user")
+    handler.telegram_api.send_meal_checkin.assert_called_once_with(
+        1,
+        plan.days[-1].meals,
+        week_start=plan.week_start_date,
+        day=plan_days,
+    )
+
+    handler.repo.get_active_plan_snapshot.return_value = ActivePlanSnapshot(
+        plan=plan, active_epoch=2
+    )
+    handler.repo.update_meal_outcome.return_value = True
+    route = RouteResult(
+        route_type=RouteType.CALLBACK,
+        chat_id=1,
+        user_id="user",
+        callback_query_id="query",
+        callback_data=(
+            f"checkin:{plan.week_start_date}:{plan_days}:lunch:cooked"
+        ),
+    )
+    handler.handle_callback(route)
+
+    handler.repo.update_meal_outcome.assert_called_once_with(
+        "user",
+        plan.week_start_date,
+        plan_days,
+        "lunch",
+        MealOutcome.COOKED,
+        expected_epoch=2,
+    )
+
+
+@pytest.mark.parametrize("plan_days", [1, 3])
+def test_short_plan_callback_rejects_day_after_persisted_end(
+    handler: BotHandler, plan_days: int
+) -> None:
+    """Forged callbacks cannot target a day absent from the active plan."""
+    plan = make_plan(
+        week_start=date.today() - timedelta(days=plan_days - 1),
+        plan_days=plan_days,
+        status=PlanStatus.CONFIRMED,
+    )
+    handler.repo.get_active_plan_snapshot.return_value = ActivePlanSnapshot(
+        plan=plan, active_epoch=2
+    )
+    route = RouteResult(
+        route_type=RouteType.CALLBACK,
+        chat_id=1,
+        user_id="user",
+        callback_query_id="query",
+        callback_data=(
+            f"checkin:{plan.week_start_date}:{plan_days + 1}:lunch:cooked"
+        ),
+    )
+
+    handler.handle_callback(route)
+
+    handler.repo.update_meal_outcome.assert_not_called()
+    assert handler.telegram_api.send_message.call_args_list == [
+        call(1, "That check-in button is invalid or outdated.")
+    ]
+    handler.telegram_api.answer_callback_query.assert_called_once_with(
+        "query", "Invalid check-in"
+    )
 
 
 @pytest.mark.parametrize("status", [GroceryStatus.PENDING, GroceryStatus.READY])

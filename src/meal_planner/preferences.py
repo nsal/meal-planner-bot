@@ -1,6 +1,7 @@
 """Evidence matching and generated-plan validation for preferences."""
 
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import Sequence
 
 from meal_planner.dietary_rules import expand_constraint_entry
@@ -32,6 +33,78 @@ _MEAL_TYPE_ORDER = {
     MealType.DINNER: 2,
     MealType.SNACK: 3,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class RuleHorizonFeasibility:
+    """Capacity outcome for one rule over a concrete date horizon."""
+
+    rule_id: str
+    operator: RuleOperator
+    requested_count: int
+    eligible_slot_capacity: int
+    weekday_capacities: tuple[tuple[Weekday, int], ...] = ()
+    infeasible_weekdays: tuple[Weekday, ...] = ()
+    strength: RuleStrength = RuleStrength.STRICT
+
+    @property
+    def is_feasible(self) -> bool:
+        """Return whether the rule can fit within its available slots."""
+        if self.weekday_capacities:
+            return not self.infeasible_weekdays
+        return not (
+            self.operator in {RuleOperator.EXACTLY, RuleOperator.AT_LEAST}
+            and self.requested_count > 0
+            and self.requested_count > self.eligible_slot_capacity
+        )
+
+    @property
+    def feasible(self) -> bool:
+        """Return whether the rule can fit within its available slots."""
+        return self.is_feasible
+
+    @property
+    def possible_count(self) -> int:
+        """Return the total number of eligible slots in the horizon."""
+        return self.eligible_slot_capacity
+
+    @property
+    def is_blocking(self) -> bool:
+        """Return whether this shortfall must block plan generation."""
+        return self.strength is RuleStrength.STRICT and not self.is_feasible
+
+
+@dataclass(frozen=True, slots=True)
+class HorizonFeasibilityResult:
+    """Typed capacity outcome for resolved rules over a date horizon."""
+
+    rules: tuple[RuleHorizonFeasibility, ...]
+    clarification: str | None = None
+
+    @property
+    def is_feasible(self) -> bool:
+        """Return whether every strict rule fits within the date horizon."""
+        return not self.infeasible_rules
+
+    @property
+    def feasible(self) -> bool:
+        """Return whether every rule fits within the date horizon."""
+        return self.is_feasible
+
+    @property
+    def infeasible_rules(self) -> tuple[RuleHorizonFeasibility, ...]:
+        """Return strict rules whose positive obligation exceeds capacity."""
+        return tuple(rule for rule in self.rules if rule.is_blocking)
+
+    @property
+    def advisory_shortfalls(self) -> tuple[RuleHorizonFeasibility, ...]:
+        """Return best-effort rules whose capacity is below their target."""
+        return tuple(
+            rule
+            for rule in self.rules
+            if not rule.is_feasible
+            and rule.strength is RuleStrength.BEST_EFFORT
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +240,149 @@ class PlanValidationResult:
                 "impossible_rule_count",
             }
         )
+
+
+def _horizon_dates(start_date: date, end_date: date) -> tuple[date, ...]:
+    """Return every inclusive date in a valid, bounded horizon."""
+    if end_date < start_date:
+        raise ValueError("end_date must not precede start_date")
+    horizon_days = (end_date - start_date).days + 1
+    return tuple(
+        start_date + timedelta(days=offset) for offset in range(horizon_days)
+    )
+
+
+def _rule_capacity_for_dates(
+    rule: DietaryRule, dates: Sequence[date]
+) -> tuple[int, tuple[tuple[Weekday, int], ...]]:
+    """Return total and per-weekday eligible slot capacity for a rule."""
+    daily_capacity = daily_meal_capacity(rule.meal_type)
+    if not rule.weekdays:
+        return len(dates) * daily_capacity, ()
+
+    weekday_capacities = tuple(
+        (
+            weekday,
+            sum(
+                daily_capacity
+                for target_date in dates
+                if target_date.isoweekday() == int(weekday)
+            ),
+        )
+        for weekday in rule.weekdays
+    )
+    return sum(capacity for _, capacity in weekday_capacities), (
+        weekday_capacities
+    )
+
+
+def _capacity_is_insufficient(rule: DietaryRule, capacity: int) -> bool:
+    """Return whether a positive obligation exceeds its slot capacity."""
+    return (
+        rule.operator in {RuleOperator.EXACTLY, RuleOperator.AT_LEAST}
+        and rule.count > 0
+        and rule.count > capacity
+    )
+
+
+def validate_horizon_feasibility(
+    rules: Sequence[DietaryRule],
+    *,
+    start_date: date,
+    end_date: date,
+) -> HorizonFeasibilityResult:
+    """Check rule obligations against eligible slots in an inclusive horizon.
+
+    This is a capacity check, not a claim that a food will match a slot.  An
+    ``AT_MOST`` rule is always capacity-feasible because zero matches can
+    satisfy it.  Named weekdays are checked independently, so a missing day
+    can make a positive exact or lower-bound obligation impossible without
+    making an upper bound impossible.
+    """
+    dates = _horizon_dates(start_date, end_date)
+    results: list[RuleHorizonFeasibility] = []
+    for rule in rules:
+        capacity, weekday_capacities = _rule_capacity_for_dates(rule, dates)
+        infeasible_weekdays = tuple(
+            weekday
+            for weekday, weekday_capacity in weekday_capacities
+            if _capacity_is_insufficient(rule, weekday_capacity)
+        )
+        results.append(
+            RuleHorizonFeasibility(
+                rule_id=rule.id,
+                operator=rule.operator,
+                requested_count=rule.count,
+                eligible_slot_capacity=capacity,
+                weekday_capacities=weekday_capacities,
+                infeasible_weekdays=infeasible_weekdays,
+                strength=rule.strength,
+            )
+        )
+
+    normalized_results = tuple(results)
+    preliminary = HorizonFeasibilityResult(rules=normalized_results)
+    return HorizonFeasibilityResult(
+        rules=normalized_results,
+        clarification=(
+            format_horizon_clarification(preliminary)
+            if not preliminary.is_feasible
+            else None
+        ),
+    )
+
+
+def _horizon_rule_line(
+    result: RuleHorizonFeasibility,
+) -> str:
+    """Return one bounded application-owned horizon explanation."""
+    operator = {
+        RuleOperator.EXACTLY: "exactly",
+        RuleOperator.AT_LEAST: "at least",
+        RuleOperator.AT_MOST: "at most",
+    }[result.operator]
+    if result.weekday_capacities:
+        details = ", ".join(
+            f"{weekday.name.title()} ({capacity})"
+            for weekday, capacity in result.weekday_capacities
+            if weekday in result.infeasible_weekdays
+        )
+        return (
+            f"• Rule '{result.rule_id}' needs {operator} "
+            f"{result.requested_count} eligible meals on {details}."
+        )
+    return (
+        f"• Rule '{result.rule_id}' needs {operator} "
+        f"{result.requested_count} eligible meals, but the horizon "
+        f"provides {result.eligible_slot_capacity}."
+    )
+
+
+def format_horizon_clarification(result: HorizonFeasibilityResult) -> str:
+    """Format bounded horizon feedback without exposing rule source text."""
+    if result.is_feasible:
+        return ""
+
+    prefix = (
+        "Some preference rules cannot fit the requested plan horizon. "
+        "Please clarify:\n"
+    )
+    suffix = "\nThe plan duration is retained for your clarification."
+    lines: list[str] = []
+    infeasible_rules = result.infeasible_rules
+    for index, rule_result in enumerate(infeasible_rules):
+        line = _horizon_rule_line(rule_result)
+        remaining = len(infeasible_rules) - index - 1
+        omission = f"• ... and {remaining} rules omitted."
+        candidate = prefix + "\n".join([*lines, line]) + suffix
+        reserved = len(omission) + 1 if remaining else 0
+        if len(candidate) + reserved > MAX_REQUIREMENT_MESSAGE_LENGTH:
+            lines.append(
+                f"• ... and {len(infeasible_rules) - index} rules omitted."
+            )
+            break
+        lines.append(line)
+    return prefix + "\n".join(lines) + suffix
 
 
 def matches_food(text: str, food: str) -> bool:

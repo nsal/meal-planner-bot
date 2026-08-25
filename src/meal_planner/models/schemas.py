@@ -31,6 +31,7 @@ PlanPreference = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
 ]
+PlanDays = Annotated[int, Field(ge=1, le=7)]
 PlanInstruction = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
@@ -550,6 +551,8 @@ class ConversationState(BaseModel):
     step: ConversationWorkflowStep
     meal_draft: MealLogDraft | None = None
     preference: PlanPreference | None = None
+    plan_days: PlanDays = 7
+    duration_collected: bool = Field(default=True, strict=True)
     requirements: list[PreferenceRequirement] = Field(
         default_factory=list, max_length=20
     )
@@ -613,6 +616,14 @@ class ConversationState(BaseModel):
             raise ValueError("conversation timestamps must be timezone-aware")
         return value.astimezone(timezone.utc)
 
+    @field_validator("plan_days", mode="before")
+    @classmethod
+    def reject_boolean_plan_days(cls, value: Any) -> Any:
+        """Reject booleans while accepting DynamoDB integer wire values."""
+        if isinstance(value, bool):
+            raise ValueError("plan_days must be an integer, not a boolean")
+        return value
+
     @field_validator("expires_at", mode="before")
     @classmethod
     def normalize_expiry(cls, value: Any) -> Any:
@@ -626,6 +637,14 @@ class ConversationState(BaseModel):
     @model_validator(mode="after")
     def validate_workflow_shape(self) -> "ConversationState":
         """Reject steps and fields that belong to another workflow."""
+        if (
+            self.workflow_kind is not ConversationWorkflowKind.PLAN_REQUEST
+            and not self.duration_collected
+        ):
+            raise ValueError(
+                "duration_collected can only be uncollected for plan "
+                "request workflows"
+            )
         tier_ids = [
             rule.id
             for rules in (
@@ -701,6 +720,17 @@ class ConversationState(BaseModel):
         elif self.workflow_kind is ConversationWorkflowKind.PLAN_REQUEST:
             if self.step not in plan_steps or self.request_id is None:
                 raise ValueError("plan workflows require a request ID step")
+            if (
+                self.step
+                in {
+                    ConversationWorkflowStep.GENERATING,
+                    ConversationWorkflowStep.RETRY_READY,
+                }
+                and not self.duration_collected
+            ):
+                raise ValueError(
+                    "plan generation steps require a collected duration"
+                )
             if self.meal_draft is not None:
                 raise ValueError("plan workflows cannot contain meal fields")
             if (
@@ -831,6 +861,7 @@ class PlanGenerationContext(BaseModel):
     """Validated request-specific context carried to the planner Lambda."""
 
     preference: PlanPreference | None = None
+    plan_days: PlanDays = 7
     requirements: list[PreferenceRequirement] = Field(
         default_factory=list, max_length=MAX_PLAN_REQUIREMENTS
     )
@@ -861,6 +892,14 @@ class PlanGenerationContext(BaseModel):
     request_id: RequestId | None = None
     state_revision: int | None = Field(default=None, ge=0)
     repair_id: RequestId | None = None
+
+    @field_validator("plan_days", mode="before")
+    @classmethod
+    def reject_non_integer_plan_days(cls, value: Any) -> Any:
+        """Reject planner durations before Pydantic can coerce them."""
+        if type(value) is not int:
+            raise ValueError("plan_days must be an integer")
+        return value
 
     @model_validator(mode="after")
     def validate_request_pair(self) -> "PlanGenerationContext":
@@ -1238,10 +1277,12 @@ class WeeklyPlan(BaseModel):
 
     @model_validator(mode="after")
     def validate_complete_week(self) -> "WeeklyPlan":
-        """Require exactly one plan day for every day from one to seven."""
+        """Require a contiguous plan starting at day one."""
         day_numbers = [plan_day.day for plan_day in self.days]
-        if len(day_numbers) != 7 or set(day_numbers) != set(range(1, 8)):
-            raise ValueError("days must contain each day from 1 through 7")
+        if not day_numbers or day_numbers != list(
+            range(1, len(day_numbers) + 1)
+        ):
+            raise ValueError("days must contain contiguous entries from day 1")
         if self.grocery_status is GroceryStatus.READY and not self.grocery_list:
             raise ValueError("ready grocery lists must contain a section")
         return self
@@ -1253,8 +1294,10 @@ class WeeklyPlan(BaseModel):
 
     @property
     def week_end(self) -> date:
-        """Return the final date covered by this seven-day plan."""
-        return self.week_start.fromordinal(self.week_start.toordinal() + 6)
+        """Return the final date covered by this plan."""
+        return self.week_start.fromordinal(
+            self.week_start.toordinal() + len(self.days) - 1
+        )
 
 
 class MealLogEntry(BaseModel):

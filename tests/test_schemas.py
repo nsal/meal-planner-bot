@@ -6,6 +6,9 @@ import pytest
 from pydantic import ValidationError
 
 from meal_planner.models import (
+    PlanDays as ExportedPlanDays,
+)
+from meal_planner.models import (
     PreferenceRequirement as ExportedPreferenceRequirement,
 )
 from meal_planner.models.schemas import (
@@ -25,6 +28,7 @@ from meal_planner.models.schemas import (
     MealOutcome,
     MealType,
     PlanDay,
+    PlanDays,
     PlanGenerationContext,
     PlannedMeal,
     PlanRevisionContext,
@@ -39,7 +43,7 @@ from meal_planner.models.schemas import (
     Weekday,
     WeeklyPlan,
 )
-from tests.factories import make_profile
+from tests.factories import make_plan, make_profile
 
 
 def test_preference_requirement_valid_exact_count_and_optional_scope() -> None:
@@ -371,6 +375,45 @@ def test_plan_generation_context_carries_bounded_preference_metadata() -> None:
     assert context.repair_id == "repair-123"
 
 
+@pytest.mark.parametrize(
+    "plan_days",
+    [True, False, "1", "7", 1.0, 3.5, None, [], {}],
+)
+def test_plan_generation_context_rejects_non_integer_plan_days(
+    plan_days: object,
+) -> None:
+    """Planner events reject non-integer durations before coercion."""
+    with pytest.raises(ValidationError):
+        PlanGenerationContext(plan_days=plan_days)
+
+
+@pytest.mark.parametrize("plan_days", [1, 7])
+def test_plan_generation_context_retains_valid_integer_plan_days(
+    plan_days: int,
+) -> None:
+    """Planner events retain each valid integer duration exactly."""
+    context = PlanGenerationContext(plan_days=plan_days)
+
+    assert context.plan_days == plan_days
+    assert type(context.plan_days) is int
+
+
+def test_plan_generation_context_defaults_omitted_plan_days_to_seven() -> None:
+    """Historical planner events retain the seven-day default."""
+    context = PlanGenerationContext()
+
+    assert context.plan_days == 7
+
+
+@pytest.mark.parametrize("plan_days", [0, 8, -1, 10])
+def test_plan_generation_context_rejects_out_of_range_integer_plan_days(
+    plan_days: int,
+) -> None:
+    """Planner events retain the one-through-seven duration bounds."""
+    with pytest.raises(ValidationError):
+        PlanGenerationContext(plan_days=plan_days)
+
+
 def test_generation_context_round_trips_prioritized_rule_snapshots() -> None:
     """Retries retain each rule tier and constraint without reinterpretation."""
     stored = DietaryRule(
@@ -568,6 +611,135 @@ def test_preference_requirement_keeps_legacy_plan_and_conversation_models() -> (
     assert restored_state.request_id == "request-1"
     assert restored_plan.week_start_date == "2026-08-10"
     assert len(restored_plan.days) == 7
+
+
+def test_plan_request_duration_phase_round_trips_explicit_values() -> None:
+    """Collected and uncollected plan phases survive serialization."""
+    common = _conversation_state_values()
+    uncollected = ConversationState(
+        **common,
+        workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+        step=ConversationWorkflowStep.AWAITING_PREFERENCE,
+        request_id="plan-uncollected",
+        plan_days=3,
+        duration_collected=False,
+    )
+    collected = uncollected.model_copy(
+        update={
+            "request_id": "plan-collected",
+            "step": ConversationWorkflowStep.GENERATING,
+            "duration_collected": True,
+        }
+    )
+
+    restored_uncollected = ConversationState.model_validate_json(
+        uncollected.model_dump_json()
+    )
+    restored_collected = ConversationState.model_validate_json(
+        collected.model_dump_json()
+    )
+
+    assert restored_uncollected.plan_days == 3
+    assert not restored_uncollected.duration_collected
+    assert restored_collected.plan_days == 3
+    assert restored_collected.duration_collected
+
+
+def test_legacy_plan_request_defaults_to_collected_seven_day_request() -> None:
+    """Historical state payloads enter the preference-only phase safely."""
+    payload = {
+        **_conversation_state_values(),
+        "workflow_kind": ConversationWorkflowKind.PLAN_REQUEST,
+        "step": ConversationWorkflowStep.AWAITING_PREFERENCE,
+        "request_id": "legacy-plan",
+    }
+
+    state = ConversationState.model_validate(payload)
+
+    assert state.plan_days == 7
+    assert state.duration_collected
+    assert "plan_days" not in payload
+    assert "duration_collected" not in payload
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        ConversationWorkflowStep.GENERATING,
+        ConversationWorkflowStep.RETRY_READY,
+    ],
+)
+def test_plan_generation_steps_require_collected_duration(
+    step: ConversationWorkflowStep,
+) -> None:
+    """Generation cannot start while the initial duration is uncollected."""
+    with pytest.raises(ValidationError, match="collected duration"):
+        ConversationState(
+            **_conversation_state_values(),
+            workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+            step=step,
+            request_id="plan-uncollected",
+            plan_days=3,
+            duration_collected=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "workflow_kind",
+    [
+        ConversationWorkflowKind.MEAL_LOG,
+        ConversationWorkflowKind.PLAN_REVISION,
+        ConversationWorkflowKind.PROFILE_EDIT,
+    ],
+)
+def test_uncollected_duration_is_only_valid_for_plan_requests(
+    workflow_kind: ConversationWorkflowKind,
+) -> None:
+    """The phase marker cannot leak into unrelated workflows."""
+    fields: dict[str, object]
+    if workflow_kind is ConversationWorkflowKind.MEAL_LOG:
+        fields = {
+            "step": ConversationWorkflowStep.AWAITING_DATE,
+            "meal_draft": MealLogDraft(),
+        }
+    elif workflow_kind is ConversationWorkflowKind.PLAN_REVISION:
+        fields = {
+            "step": ConversationWorkflowStep.GENERATING,
+            "amendment": "Avoid cauliflower",
+            "target_week": date(2026, 8, 17),
+            "expected_plan_revision": 1,
+            "request_id": "revision-1",
+        }
+    else:
+        fields = {"step": ConversationWorkflowStep.PROFILE_MENU}
+
+    with pytest.raises(ValidationError, match="only be uncollected"):
+        ConversationState(
+            **_conversation_state_values(),
+            workflow_kind=workflow_kind,
+            duration_collected=False,
+            **fields,
+        )
+
+
+@pytest.mark.parametrize("plan_days", [0, 8, True, False])
+def test_conversation_state_rejects_invalid_plan_duration(
+    plan_days: object,
+) -> None:
+    """Plan duration is a strict bounded integer rather than a loose bool."""
+    with pytest.raises(ValidationError):
+        ConversationState(
+            **_conversation_state_values(),
+            workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+            step=ConversationWorkflowStep.AWAITING_PREFERENCE,
+            request_id="invalid-duration",
+            plan_days=plan_days,
+        )
+
+
+def test_plan_days_export_is_a_bounded_typed_contract() -> None:
+    """The public duration type can be used by planner-facing callers."""
+    assert ExportedPlanDays is PlanDays
 
 
 def test_conversation_state_validates_workflow_shape_and_expiry() -> None:
@@ -1555,16 +1727,83 @@ def test_meal_log_entry() -> None:
 @pytest.mark.parametrize(
     "days",
     [
-        [PlanDay(day=day) for day in range(1, 7)],
+        [],
+        [PlanDay(day=day) for day in [1, 2, 3, 5]],
         [PlanDay(day=1) for _ in range(7)],
+        [PlanDay(day=2)],
+        [PlanDay(day=day) for day in range(1, 8)] + [PlanDay(day=7)],
     ],
 )
-def test_weekly_plan_requires_complete_unique_week(
+def test_weekly_plan_requires_contiguous_unique_days(
     days: list[PlanDay],
 ) -> None:
-    """Plans must contain exactly one entry for every day of the week."""
+    """Plans reject empty, malformed, non-one, and overlong day sequences."""
     with pytest.raises(ValidationError):
         WeeklyPlan(week_start="2026-08-10", days=days)
+
+
+@pytest.mark.parametrize("plan_days", range(1, 8))
+def test_weekly_plan_accepts_every_contiguous_horizon(plan_days: int) -> None:
+    """Plans accept each contiguous horizon from one through seven days."""
+    plan = WeeklyPlan(
+        week_start="2026-08-10",
+        days=[PlanDay(day=day) for day in range(1, plan_days + 1)],
+    )
+
+    assert [plan_day.day for plan_day in plan.days] == list(
+        range(1, plan_days + 1)
+    )
+
+
+@pytest.mark.parametrize(
+    ("plan_days", "expected_week_end"),
+    [
+        (1, date(2026, 8, 10)),
+        (3, date(2026, 8, 12)),
+        (7, date(2026, 8, 16)),
+    ],
+)
+def test_weekly_plan_derives_dynamic_end_date(
+    plan_days: int, expected_week_end: date
+) -> None:
+    """The final covered date is derived from the actual plan length."""
+    plan = WeeklyPlan(
+        week_start="2026-08-10",
+        days=[PlanDay(day=day) for day in range(1, plan_days + 1)],
+    )
+
+    assert plan.week_end == expected_week_end
+
+
+@pytest.mark.parametrize("plan_days", range(1, 8))
+def test_make_plan_constructs_exact_contiguous_horizon(plan_days: int) -> None:
+    """The shared factory creates exactly the requested day sequence."""
+    plan = make_plan(plan_days=plan_days)
+
+    assert [plan_day.day for plan_day in plan.days] == list(
+        range(1, plan_days + 1)
+    )
+
+
+def test_make_plan_defaults_remain_legacy_compatible() -> None:
+    """Default factory values preserve the historical complete plan shape."""
+    plan = make_plan()
+
+    assert len(plan.days) == 7
+    assert plan.status is PlanStatus.DRAFT
+    assert plan.revision == 0
+    assert plan.grocery_status is GroceryStatus.NOT_REQUESTED
+    assert plan.grocery_list == []
+    assert plan.planning_instructions == []
+    assert all(len(plan_day.meals) == 1 for plan_day in plan.days)
+    assert all(
+        plan_day.meals[0].meal_type is MealType.LUNCH for plan_day in plan.days
+    )
+    assert all(plan_day.meals[0].est_calories == 500 for plan_day in plan.days)
+    assert all(
+        plan_day.meals[0].outcome is MealOutcome.UNREPORTED
+        for plan_day in plan.days
+    )
 
 
 def test_weekly_plan_rejects_invalid_date_status_and_outcome() -> None:

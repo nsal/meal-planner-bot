@@ -12,6 +12,7 @@ from meal_planner.models.schemas import (
     GroceryStatus,
     MealOutcome,
     PlanDay,
+    PlanDays,
     PlannedMeal,
     PlanStatus,
     UserProfile,
@@ -109,8 +110,9 @@ def make_plan(
     grocery_status: GroceryStatus = GroceryStatus.NOT_REQUESTED,
     outcome: MealOutcome = MealOutcome.UNREPORTED,
     planning_instructions: list[str] | None = None,
+    plan_days: PlanDays = 7,
 ) -> WeeklyPlan:
-    """Return a complete seven-day plan with one lunch per day."""
+    """Return a complete plan with one lunch per requested day."""
     groceries = (
         [GrocerySection(name="Produce", items=["Apples"])]
         if grocery_status is GroceryStatus.READY
@@ -135,7 +137,7 @@ def make_plan(
                     )
                 ],
             )
-            for day in range(1, 8)
+            for day in range(1, plan_days + 1)
         ],
     )
 

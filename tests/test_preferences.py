@@ -18,15 +18,19 @@ from meal_planner.models import (
 )
 from meal_planner.models.schemas import MealType
 from meal_planner.preferences import (
+    HorizonFeasibilityResult,
     PlanValidationResult,
     RequirementValidation,
+    RuleHorizonFeasibility,
     ValidationIssue,
     format_best_effort_summary,
+    format_horizon_clarification,
     format_satisfaction_summary,
     format_unmet_preference_clauses,
     match_requirement,
     matches_food,
     validate_generated_plan,
+    validate_horizon_feasibility,
 )
 from meal_planner.telegram.api import split_text
 
@@ -1024,3 +1028,304 @@ def test_rule_summaries_are_bounded_and_do_not_include_raw_source_text() -> (
     assert len(best_effort_summary) <= MAX_REQUIREMENT_OUTPUT_LENGTH
     assert "Best-long" in best_effort_summary
     assert long_source not in best_effort_summary
+
+
+def test_absent_weekday_upper_bound_and_exact_zero_are_feasible() -> None:
+    """Zero eligible slots do not make non-positive obligations impossible."""
+    monday = date(2026, 8, 17)
+    rules = [
+        rule(
+            ["salmon"],
+            2,
+            identifier="absent-upper",
+            operator=RuleOperator.AT_MOST,
+            weekdays=[Weekday.MONDAY],
+        ),
+        rule(
+            ["trout"],
+            0,
+            identifier="absent-zero",
+            weekdays=[Weekday.WEDNESDAY],
+        ),
+    ]
+
+    result = validate_horizon_feasibility(
+        rules,
+        start_date=monday + date.resolution,
+        end_date=monday + date.resolution,
+    )
+
+    assert result.is_feasible
+    assert result.rules[0].weekday_capacities == ((Weekday.MONDAY, 0),)
+    assert result.rules[1].weekday_capacities == ((Weekday.WEDNESDAY, 0),)
+    assert result.clarification is None
+
+
+@pytest.mark.parametrize(
+    "operator", [RuleOperator.EXACTLY, RuleOperator.AT_LEAST]
+)
+def test_positive_rule_count_cannot_exceed_whole_horizon_capacity(
+    operator: RuleOperator,
+) -> None:
+    """Positive lower obligations fail when the selected horizon is full."""
+    rule_to_check = rule(
+        ["salmon"],
+        2,
+        identifier=f"whole-{operator.value}",
+        operator=operator,
+        meal_type=MealType.BREAKFAST,
+    )
+
+    result = validate_horizon_feasibility(
+        [rule_to_check],
+        start_date=date(2026, 8, 17),
+        end_date=date(2026, 8, 17),
+    )
+
+    assert not result.is_feasible
+    assert result.rules == (
+        RuleHorizonFeasibility(
+            rule_id=rule_to_check.id,
+            operator=operator,
+            requested_count=2,
+            eligible_slot_capacity=1,
+            weekday_capacities=(),
+            infeasible_weekdays=(),
+        ),
+    )
+    assert result.clarification is not None
+
+
+def test_positive_weekday_rule_is_evaluated_for_each_named_weekday() -> None:
+    """A partly covered scope reports only its absent named weekday."""
+    rule_to_check = rule(
+        ["salmon"],
+        1,
+        identifier="partial-weekday",
+        operator=RuleOperator.AT_LEAST,
+        meal_type=MealType.LUNCH,
+        weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY],
+    )
+
+    result = validate_horizon_feasibility(
+        [rule_to_check],
+        start_date=date(2026, 8, 17),
+        end_date=date(2026, 8, 18),
+    )
+
+    assert not result.is_feasible
+    assert result.rules[0].eligible_slot_capacity == 1
+    assert result.rules[0].weekday_capacities == (
+        (Weekday.MONDAY, 1),
+        (Weekday.WEDNESDAY, 0),
+    )
+    assert result.rules[0].infeasible_weekdays == (Weekday.WEDNESDAY,)
+
+
+@pytest.mark.parametrize(
+    ("horizon_days", "meal_type", "count"),
+    [
+        (1, MealType.DINNER, 1),
+        (3, MealType.DINNER, 3),
+        (7, MealType.DINNER, 7),
+        (1, None, 4),
+        (3, None, 12),
+        (7, None, 28),
+    ],
+)
+def test_capacity_matches_horizon_and_meal_scope(
+    horizon_days: int,
+    meal_type: MealType | None,
+    count: int,
+) -> None:
+    """Capacity is one scoped slot or four unscoped slots per date."""
+    result = validate_horizon_feasibility(
+        [rule(["salmon"], count, meal_type=meal_type)],
+        start_date=date(2026, 8, 17),
+        end_date=date(2026, 8, 17 + horizon_days - 1),
+    )
+
+    assert result.is_feasible
+    assert result.rules[0].eligible_slot_capacity == count
+
+
+def test_horizon_clarification_is_bounded_and_excludes_raw_rule_source() -> (
+    None
+):
+    """Horizon feedback is deterministic, bounded, and application-owned."""
+    raw_source = "private preference source " + ("x" * 450)
+    rules = [
+        DietaryRule(
+            id=f"impossible-{index}",
+            source_text=raw_source,
+            foods_any_of=["salmon"],
+            operator=RuleOperator.EXACTLY,
+            count=2,
+            meal_type=MealType.BREAKFAST,
+        )
+        for index in range(20)
+    ]
+    result = validate_horizon_feasibility(
+        rules,
+        start_date=date(2026, 8, 17),
+        end_date=date(2026, 8, 17),
+    )
+
+    message = format_horizon_clarification(result)
+
+    assert isinstance(result, HorizonFeasibilityResult)
+    assert message == format_horizon_clarification(result)
+    assert len(message) <= MAX_REQUIREMENT_OUTPUT_LENGTH
+    assert raw_source not in message
+    assert "impossible-0" in message
+    assert "rules omitted" in message
+
+
+@pytest.mark.parametrize(
+    ("operator", "rule_kwargs", "count", "start_date", "end_date"),
+    [
+        (
+            RuleOperator.EXACTLY,
+            {},
+            5,
+            date(2026, 8, 17),
+            date(2026, 8, 17),
+        ),
+        (
+            RuleOperator.AT_LEAST,
+            {},
+            5,
+            date(2026, 8, 17),
+            date(2026, 8, 17),
+        ),
+        (
+            RuleOperator.EXACTLY,
+            {"weekdays": [Weekday.WEDNESDAY]},
+            1,
+            date(2026, 8, 17),
+            date(2026, 8, 17),
+        ),
+        (
+            RuleOperator.AT_LEAST,
+            {"weekdays": [Weekday.MONDAY, Weekday.WEDNESDAY]},
+            1,
+            date(2026, 8, 17),
+            date(2026, 8, 18),
+        ),
+        (
+            RuleOperator.EXACTLY,
+            {"meal_type": MealType.BREAKFAST},
+            2,
+            date(2026, 8, 17),
+            date(2026, 8, 17),
+        ),
+        (
+            RuleOperator.AT_LEAST,
+            {"meal_type": MealType.BREAKFAST},
+            2,
+            date(2026, 8, 17),
+            date(2026, 8, 17),
+        ),
+    ],
+)
+def test_best_effort_exact_rule_does_not_block_short_horizon(
+    operator: RuleOperator,
+    rule_kwargs: dict[str, object],
+    count: int,
+    start_date: date,
+    end_date: date,
+) -> None:
+    """Best-effort capacity shortfalls do not block generation."""
+    rule_to_check = rule(
+        ["eggs"],
+        count,
+        identifier=f"best-effort-{operator.value}",
+        operator=operator,
+        strength=RuleStrength.BEST_EFFORT,
+        **rule_kwargs,
+    )
+
+    result = validate_horizon_feasibility(
+        [rule_to_check], start_date=start_date, end_date=end_date
+    )
+
+    assert result.is_feasible
+    assert result.infeasible_rules == ()
+    assert result.advisory_shortfalls == (result.rules[0],)
+    assert not result.rules[0].is_feasible
+    assert result.rules[0].strength is RuleStrength.BEST_EFFORT
+    assert result.clarification is None
+
+
+@pytest.mark.parametrize(
+    ("operator", "rule_kwargs", "count", "start_date", "end_date"),
+    [
+        (
+            RuleOperator.EXACTLY,
+            {},
+            5,
+            date(2026, 8, 17),
+            date(2026, 8, 17),
+        ),
+        (
+            RuleOperator.AT_LEAST,
+            {},
+            5,
+            date(2026, 8, 17),
+            date(2026, 8, 17),
+        ),
+        (
+            RuleOperator.EXACTLY,
+            {"weekdays": [Weekday.WEDNESDAY]},
+            1,
+            date(2026, 8, 17),
+            date(2026, 8, 17),
+        ),
+        (
+            RuleOperator.AT_LEAST,
+            {"weekdays": [Weekday.MONDAY, Weekday.WEDNESDAY]},
+            1,
+            date(2026, 8, 17),
+            date(2026, 8, 18),
+        ),
+        (
+            RuleOperator.EXACTLY,
+            {"meal_type": MealType.BREAKFAST},
+            2,
+            date(2026, 8, 17),
+            date(2026, 8, 17),
+        ),
+        (
+            RuleOperator.AT_LEAST,
+            {"meal_type": MealType.BREAKFAST},
+            2,
+            date(2026, 8, 17),
+            date(2026, 8, 17),
+        ),
+    ],
+)
+def test_strict_horizon_shortfall_remains_blocking(
+    operator: RuleOperator,
+    rule_kwargs: dict[str, object],
+    count: int,
+    start_date: date,
+    end_date: date,
+) -> None:
+    """Strict positive obligations still require bounded clarification."""
+    rule_to_check = rule(
+        ["eggs"],
+        count,
+        identifier=f"strict-{operator.value}",
+        operator=operator,
+        **rule_kwargs,
+    )
+
+    result = validate_horizon_feasibility(
+        [rule_to_check], start_date=start_date, end_date=end_date
+    )
+
+    assert not result.is_feasible
+    assert result.infeasible_rules == (result.rules[0],)
+    assert result.advisory_shortfalls == ()
+    assert result.rules[0].strength is RuleStrength.STRICT
+    assert result.clarification is not None

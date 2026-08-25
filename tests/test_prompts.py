@@ -255,6 +255,28 @@ def test_build_plan_prompt_empty() -> None:
     assert "OUTPUT JSON SCHEMA" in prompt
 
 
+@pytest.mark.parametrize(
+    ("plan_days", "end_date"),
+    [(1, "2026-08-10"), (3, "2026-08-12"), (7, "2026-08-16")],
+)
+def test_build_plan_prompt_uses_exact_requested_duration(
+    plan_days: int, end_date: str
+) -> None:
+    """Generation prompts describe the exact dates and day sequence."""
+    prompt = build_plan_prompt(
+        week_start="2026-08-10",
+        plan_days=plan_days,
+    )
+
+    assert f"Generate a {plan_days}-day meal plan" in prompt
+    assert f"Inclusive Plan Date Range: 2026-08-10 through {end_date}" in prompt
+    day_sequence = ", ".join(str(day) for day in range(1, plan_days + 1))
+    assert f"with day numbers: {day_sequence}" in prompt
+    if plan_days < 7:
+        assert "7-day meal plan" not in prompt
+        assert "of the 7 days" not in prompt
+
+
 def test_build_plan_prompt_states_complete_generated_plan_contract() -> None:
     """Initial generation prompts state all validator-aligned invariants."""
     prompt = build_plan_prompt()
@@ -654,6 +676,32 @@ def test_build_plan_revision_prompt_contains_trusted_full_context() -> None:
     assert "2026-08-10" in prompt
     assert "seven days" in prompt
     assert "Do not return a patch" in prompt
+
+
+@pytest.mark.parametrize("plan_days", [1, 3, 7])
+def test_revision_prompt_preserves_existing_length_and_date_range(
+    plan_days: int,
+) -> None:
+    week_start = date(2026, 8, 10)
+    plan = WeeklyPlan(
+        week_start=week_start,
+        days=[PlanDay(day=value) for value in range(1, plan_days + 1)],
+    )
+
+    prompt = build_plan_revision_prompt(
+        UserProfile(name="Alex"), plan, "Avoid mushrooms"
+    )
+
+    week_end = week_start + timedelta(days=plan_days - 1)
+    assert f"{plan_days}-day draft" in prompt
+    assert f"days 1 through {plan_days}" in prompt
+    assert (
+        f"from {week_start.isoformat()} through {week_end.isoformat()}"
+        in prompt
+    )
+    if plan_days < 7:
+        assert "seven-day" not in prompt
+        assert "seven days" not in prompt
 
 
 @pytest.mark.parametrize(

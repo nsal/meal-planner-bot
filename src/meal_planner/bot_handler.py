@@ -52,6 +52,7 @@ from meal_planner.models.schemas import (
     MealLogEntry,
     MealOutcome,
     MealType,
+    PlanDays,
     PlannedMeal,
     PlanStatus,
     PreferenceRequirement,
@@ -70,6 +71,7 @@ from meal_planner.planner_handler import (
     GENERATE_PLAN,
     REVISE_PLAN,
 )
+from meal_planner.preferences import validate_horizon_feasibility
 from meal_planner.router import (
     MealCallback,
     ProfileCallback,
@@ -283,8 +285,9 @@ class BotHandler:
         prefix = "I replaced your unfinished workflow. " if replaced else ""
         self.telegram_api.send_message(
             chat_id,
-            prefix + "Do you have any preferences for the next plan? "
-            "Reply with a preference, or say 'no preference'.",
+            prefix + "How many days should the plan cover, and what preference "
+            "should I use? Reply like '3, fish for dinner' or "
+            "'7, no preference'.",
         )
 
     def _cmd_grocery(self, chat_id: int | str, user_id: str) -> None:
@@ -468,6 +471,8 @@ class BotHandler:
         return ConversationState(
             workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
             step=ConversationWorkflowStep.AWAITING_PREFERENCE,
+            plan_days=7,
+            duration_collected=False,
             request_id=str(uuid4()),
             revision=0,
             created_at=now,
@@ -636,6 +641,24 @@ class BotHandler:
                 acknowledgement = "Inactive plan"
                 self.telegram_api.send_message(
                     route.chat_id, "That check-in belongs to an inactive plan."
+                )
+                return
+            target_day = next(
+                (
+                    plan_day
+                    for plan_day in snapshot.plan.days
+                    if plan_day.day == callback.day
+                ),
+                None,
+            )
+            if target_day is None or not any(
+                meal.meal_type.value == callback.meal_type.value
+                for meal in target_day.meals
+            ):
+                acknowledgement = "Invalid check-in"
+                self.telegram_api.send_message(
+                    route.chat_id,
+                    "That check-in button is invalid or outdated.",
                 )
                 return
             updated = self.repo.update_meal_outcome(
@@ -2149,7 +2172,7 @@ class BotHandler:
                 return
             elif state.step is ConversationWorkflowStep.GENERATING:
                 self.telegram_api.send_message(
-                    chat_id, "Working on your weekly meal plan."
+                    chat_id, self._plan_progress_message(state.plan_days)
                 )
                 return
         if state.step is not ConversationWorkflowStep.AWAITING_PREFERENCE:
@@ -2166,7 +2189,23 @@ class BotHandler:
                 chat_id, "Complete your profile before generating a plan."
             )
             return
-        normalized = text.strip().casefold().rstrip(".!?,;:")
+
+        if state.duration_collected:
+            plan_days = state.plan_days
+            preference_text = text.strip()
+        else:
+            parsed = self._parse_initial_plan_response(text)
+            if parsed is None:
+                self.telegram_api.send_message(
+                    chat_id,
+                    "Please reply in the form '3, fish for dinner'. "
+                    "Choose 1 to 7 days and include a preference, or say "
+                    "'no preference'.",
+                )
+                return
+            plan_days, preference_text = parsed
+
+        normalized = preference_text.casefold().rstrip(".!?,;:")
         preference = (
             None
             if normalized
@@ -2177,7 +2216,7 @@ class BotHandler:
                 "none",
                 "whatever",
             }
-            else text.strip()
+            else preference_text
         )
 
         if preference is None:
@@ -2246,6 +2285,7 @@ class BotHandler:
         ]
         resolution_message: str | None = None
         if not clarification:
+            horizon_start = date.today()
             safety = validate_constraints(constraint_rules)
             if not safety.is_safe:
                 resolution_message = (
@@ -2280,6 +2320,19 @@ class BotHandler:
                             "I couldn't safely combine your dietary rules. "
                             "Please clarify or remove the conflicting rule."
                         )
+                    else:
+                        horizon_result = validate_horizon_feasibility(
+                            effective_rules,
+                            start_date=horizon_start,
+                            end_date=horizon_start
+                            + timedelta(days=int(plan_days) - 1),
+                        )
+                        if not horizon_result.is_feasible:
+                            resolution_message = (
+                                horizon_result.clarification
+                                or "Some preference rules cannot fit the "
+                                "requested plan horizon. Please clarify."
+                            )
         if clarification or resolution_message:
             effective_rules = []
         # Structured interpretations belong exclusively in effective_rules.
@@ -2296,6 +2349,8 @@ class BotHandler:
                     **state.model_dump(),
                     "step": next_step,
                     "preference": preference,
+                    "plan_days": plan_days,
+                    "duration_collected": True,
                     "requirements": planner_requirements,
                     "stored_rules": stored_rules,
                     "current_rules": current_rules
@@ -2331,7 +2386,8 @@ class BotHandler:
             user_id,
             chat_id,
             GENERATE_PLAN,
-            week_start=date.today().isoformat(),
+            week_start=horizon_start.isoformat(),
+            plan_days=plan_days,
             preference=preference,
             requirements=planner_requirements,
             stored_rules=stored_rules,
@@ -2359,8 +2415,31 @@ class BotHandler:
             )
             return
         self.telegram_api.send_message(
-            chat_id, "Working on your weekly meal plan."
+            chat_id, self._plan_progress_message(plan_days)
         )
+
+    @staticmethod
+    def _parse_initial_plan_response(
+        text: str,
+    ) -> tuple[PlanDays, str] | None:
+        """Parse the one-time ``N, preference`` plan response."""
+        duration_text, separator, preference_text = text.partition(",")
+        if not separator:
+            return None
+        if not duration_text.strip().isdecimal():
+            return None
+        plan_days = int(duration_text.strip())
+        preference = preference_text.strip()
+        if not 1 <= plan_days <= 7 or not preference:
+            return None
+        return plan_days, preference
+
+    @staticmethod
+    def _plan_progress_message(plan_days: PlanDays | None) -> str:
+        """Describe plan generation without assuming a seven-day horizon."""
+        if plan_days is None:
+            return "Working on your meal plan."
+        return f"Working on your {plan_days}-day meal plan."
 
     def _prepare_stored_preference_rules(
         self, profile: UserProfile
@@ -2468,6 +2547,38 @@ class BotHandler:
     def _retry_plan_request(
         self, user_id: str, chat_id: int | str, state: ConversationState
     ) -> None:
+        retry_start = (
+            _COMMAND_REFERENCE_DATE.get() or datetime.now(timezone.utc).date()
+        )
+        horizon_result = validate_horizon_feasibility(
+            state.effective_rules,
+            start_date=retry_start,
+            end_date=retry_start + timedelta(days=int(state.plan_days) - 1),
+        )
+        if not horizon_result.is_feasible:
+            candidate = state.model_copy(
+                update={
+                    "step": ConversationWorkflowStep.AWAITING_PREFERENCE,
+                    "revision": state.revision + 1,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
+            if not self.repo.transition_conversation_state(
+                user_id, candidate, expected_revision=state.revision
+            ):
+                self.telegram_api.send_message(
+                    chat_id,
+                    "That plan request changed. Please try /plan again.",
+                )
+                return
+            self.telegram_api.send_message(
+                chat_id,
+                horizon_result.clarification
+                or "Some preference rules cannot fit the requested plan "
+                "horizon. Please clarify.",
+            )
+            return
+
         candidate = state.model_copy(
             update={
                 "step": ConversationWorkflowStep.GENERATING,
@@ -2486,7 +2597,8 @@ class BotHandler:
             user_id,
             chat_id,
             GENERATE_PLAN,
-            week_start=date.today().isoformat(),
+            week_start=retry_start.isoformat(),
+            plan_days=candidate.plan_days,
             preference=candidate.preference,
             requirements=candidate.requirements,
             stored_rules=candidate.stored_rules,
@@ -2512,7 +2624,7 @@ class BotHandler:
             )
             return
         self.telegram_api.send_message(
-            chat_id, "Working on your weekly meal plan."
+            chat_id, self._plan_progress_message(candidate.plan_days)
         )
 
     @staticmethod
@@ -3084,6 +3196,7 @@ class BotHandler:
         action: str,
         *,
         week_start: str,
+        plan_days: PlanDays = 7,
         preference: str | None = None,
         requirements: list[PreferenceRequirement] | None = None,
         stored_rules: list[DietaryRule] | None = None,
@@ -3109,6 +3222,7 @@ class BotHandler:
             if action == GENERATE_PLAN:
                 payload.update(
                     {
+                        "plan_days": plan_days,
                         "preference": preference,
                         "requirements": [
                             requirement.model_dump(mode="json")

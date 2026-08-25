@@ -46,6 +46,15 @@ def test_render_help_uses_every_command_once() -> None:
     assert all(line.count("/") == 1 for line in lines)
 
 
+def test_plan_command_description_is_duration_neutral() -> None:
+    plan_command = next(
+        command for command in BOT_COMMANDS if command.name == "plan"
+    )
+
+    assert plan_command.description == "Create or retry a meal plan"
+    assert "weekly" not in render_help().lower()
+
+
 @pytest.mark.parametrize(
     "name,description",
     [
