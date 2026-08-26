@@ -3362,6 +3362,194 @@ def test_legacy_stored_preference_is_interpreted_before_plan_dispatch(
     handler.llm_client.chat_sync.assert_called_once()
 
 
+def test_one_day_no_preference_dispatches_legacy_bare_preference(
+    handler: BotHandler,
+) -> None:
+    """A legacy bare preference is normalized before stored-rule dispatch."""
+    raw_preference = DietaryPreferenceEntry(
+        id="legacy-bare-eggs",
+        source_text="eggs for breakfast",
+        rule=None,
+    )
+    handler.repo.get_profile.return_value = make_profile().model_copy(
+        update={"dietary_preferences": [raw_preference]}
+    )
+    handler.repo.get_conversation_state.return_value = (
+        BotHandler._new_plan_state()
+    )
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": "stored_preference",
+            "requirements": [
+                {
+                    "id": "provider-eggs",
+                    "source_text": raw_preference.source_text,
+                    "foods_any_of": ["eggs"],
+                    "meal_type": "breakfast",
+                    "weekdays": [],
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+
+    handler.handle_conversational(
+        _plan_route("1, no preference", update_id=607)
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.GENERATING
+    assert saved.plan_days == 1
+    assert saved.requirements == []
+    assert len(saved.effective_rules) == 1
+    rule = saved.effective_rules[0]
+    assert rule.operator is RuleOperator.AT_LEAST
+    assert rule.count == 1
+    assert rule.meal_type is MealType.BREAKFAST
+    assert rule.strength is RuleStrength.STRICT
+
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["plan_days"] == 1
+    assert payload["requirements"] == []
+    assert len(payload["effective_rules"]) == 1
+    assert payload["effective_rules"][0]["operator"] == "at_least"
+    assert payload["effective_rules"][0]["count"] == 1
+    assert payload["effective_rules"][0]["meal_type"] == "breakfast"
+
+
+def test_one_day_current_bare_preferences_dispatch_with_meal_scopes(
+    handler: BotHandler,
+) -> None:
+    """Three bare current clauses become strict minimum-one rules."""
+    handler.repo.get_profile.return_value = make_profile()
+    handler.repo.get_conversation_state.return_value = (
+        BotHandler._new_plan_state()
+    )
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": "current_plan_preference",
+            "requirements": [
+                {
+                    "id": "provider-eggs",
+                    "source_text": "eggs for breakfast",
+                    "foods_any_of": ["eggs"],
+                    "meal_type": "breakfast",
+                    "weekdays": [],
+                },
+                {
+                    "id": "provider-bean-soup",
+                    "source_text": "bean soup for lunch",
+                    "foods_any_of": ["bean soup"],
+                    "meal_type": "lunch",
+                    "weekdays": [],
+                },
+                {
+                    "id": "provider-halloumi",
+                    "source_text": "halloumi for dinner",
+                    "foods_any_of": ["halloumi"],
+                    "meal_type": "dinner",
+                    "weekdays": [],
+                },
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+
+    handler.handle_conversational(
+        _plan_route(
+            "1, eggs for breakfast, bean soup for lunch, halloumi for dinner",
+            update_id=608,
+        )
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.GENERATING
+    assert saved.plan_days == 1
+    assert saved.stored_rules == []
+    assert saved.current_rules
+    assert saved.requirements == []
+    saved_by_food = {
+        rule.foods_any_of[0]: rule for rule in saved.effective_rules
+    }
+    assert set(saved_by_food) == {"eggs", "bean soup", "halloumi"}
+    for rule in saved_by_food.values():
+        assert rule.operator is RuleOperator.AT_LEAST
+        assert rule.count == 1
+        assert rule.strength is RuleStrength.STRICT
+    assert saved_by_food["eggs"].meal_type is MealType.BREAKFAST
+    assert saved_by_food["bean soup"].meal_type is MealType.LUNCH
+    assert saved_by_food["halloumi"].meal_type is MealType.DINNER
+
+    payload = json.loads(
+        handler.lambda_client.invoke.call_args.kwargs["Payload"]
+    )
+    assert payload["plan_days"] == 1
+    assert payload["requirements"] == []
+    payload_by_food = {
+        rule["foods_any_of"][0]: rule for rule in payload["effective_rules"]
+    }
+    assert set(payload_by_food) == set(saved_by_food)
+    assert all(
+        rule["operator"] == "at_least" and rule["count"] == 1
+        for rule in payload_by_food.values()
+    )
+
+
+def test_malformed_legacy_preference_blocks_plan_dispatch(
+    handler: BotHandler,
+) -> None:
+    """Malformed saved provider rules remain fail-closed and actionable."""
+    raw_preference = DietaryPreferenceEntry(
+        id="malformed-legacy-eggs",
+        source_text="eggs for breakfast",
+        rule=None,
+    )
+    handler.repo.get_profile.return_value = make_profile().model_copy(
+        update={"dietary_preferences": [raw_preference]}
+    )
+    handler.repo.get_conversation_state.return_value = (
+        BotHandler._new_plan_state()
+    )
+    handler.llm_client.chat_sync.return_value = json.dumps(
+        {
+            "mode": "stored_preference",
+            "requirements": [
+                {
+                    "id": "provider-malformed-eggs",
+                    "source_text": raw_preference.source_text,
+                    "foods_any_of": ["eggs"],
+                    "meal_type": "breakfast",
+                    "operator": "at_least",
+                    "count": "one",
+                }
+            ],
+            "exclusions": [],
+            "clarification": None,
+            "unparsed_text": [],
+        }
+    )
+
+    handler.handle_conversational(
+        _plan_route("1, no preference", update_id=609)
+    )
+
+    saved = handler.repo.transition_conversation_state.call_args.args[1]
+    assert saved.step is ConversationWorkflowStep.AWAITING_PREFERENCE
+    assert saved.plan_days == 1
+    assert saved.stored_rules == []
+    assert saved.effective_rules == []
+    handler.lambda_client.invoke.assert_not_called()
+    message = handler.telegram_api.send_message.call_args.args[1].lower()
+    assert "saved dietary preference" in message
+    assert "malformed" in message
+
+
 def test_onboarding_raw_preference_is_interpreted_before_plan_dispatch(
     handler: BotHandler,
 ) -> None:

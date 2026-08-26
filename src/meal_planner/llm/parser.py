@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 InterpretationMode = Literal[
     "constraint", "stored_preference", "current_plan_preference"
 ]
+PreferenceValidationReason = Literal["food", "count", "scope", "schema"]
 InterpretationRule = DietaryRule | ConstraintEntry
 PreferenceInterpretation = tuple[list[InterpretationRule], str | None]
 PreferenceSignature = tuple[
@@ -48,6 +49,30 @@ _TOO_MANY_REQUIREMENTS_CLARIFICATION = (
     "prioritize the most important rules, then try again."
 )
 _SAFE_LOCATION_PART = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_NUMBER_WORD = (
+    r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+    r"eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
+    r"eighty|ninety|hundred)"
+)
+_TENS_NUMBER_WORD = r"(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+_UNIT_NUMBER_WORD = r"(?:one|two|three|four|five|six|seven|eight|nine)"
+_NUMBER_TOKEN = (
+    rf"(?:\d+|{_TENS_NUMBER_WORD}-{_UNIT_NUMBER_WORD}|{_NUMBER_WORD})"
+)
+_COMPARATIVE_LIMITING_PATTERN = re.compile(
+    rf"\b(?:less[\s-]+than|fewer[\s-]+than|under)\s+"
+    rf"{_NUMBER_TOKEN}(?![\w-])"
+)
+_FREQUENCY_PERIOD = r"(?:day|week|meal)s?"
+_COMPACT_FREQUENCY_PATTERN = re.compile(
+    rf"(?<![\w-]){_NUMBER_TOKEN}(?:"
+    rf"\s*x\s*(?:(?:a|each|per)\s+{_FREQUENCY_PERIOD}|"
+    rf"\s*/\s*{_FREQUENCY_PERIOD})"
+    rf"|\s*/\s*{_FREQUENCY_PERIOD}"
+    rf"|\s+(?:a|each|per)\s+{_FREQUENCY_PERIOD}"
+    rf")(?![\w-])"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +123,24 @@ def _safe_validation_code(error_type: object) -> str:
     if error_type in {"literal_error", "enum", "value_error"}:
         return "value"
     return "schema_validation"
+
+
+def _preference_validation_reason(
+    error: ValidationError,
+) -> PreferenceValidationReason:
+    """Map validation locations to bounded, application-owned reason codes."""
+    for item in error.errors(include_url=False):
+        location = item.get("loc")
+        if not isinstance(location, tuple) or not location:
+            continue
+        field = location[0]
+        if field in {"foods_any_of", "forbidden_terms"}:
+            return "food"
+        if field in {"count", "exact_count", "operator"}:
+            return "count"
+        if field in {"meal_type", "weekdays"}:
+            return "scope"
+    return "schema"
 
 
 def _schema_feedback(error: ValidationError) -> PlanResponseFeedback:
@@ -260,12 +303,58 @@ def _is_best_effort_wording(source_text: str) -> bool:
     )
 
 
-def _is_positive_request(source_text: str) -> bool:
-    """Return whether wording asks for at least one item."""
+def _has_comparative_limiting_wording(source_text: str) -> bool:
+    """Return whether wording contains a bounded comparative limit."""
+    return bool(_COMPARATIVE_LIMITING_PATTERN.search(source_text))
+
+
+def _has_explicit_frequency_wording(source_text: str) -> bool:
+    """Return whether wording contains a bounded frequency expression."""
+    unit = rf"(?:times?|{_FREQUENCY_PERIOD})"
+    expanded_frequency = re.search(
+        r"\b(?:daily|weekly|biweekly|monthly|yearly|"
+        rf"every[\s-]+{_FREQUENCY_PERIOD}|"
+        rf"each[\s-]+{_FREQUENCY_PERIOD}|"
+        rf"{_NUMBER_TOKEN}[\s-]+{unit}|"
+        rf"{_NUMBER_TOKEN}[\s-]+per[\s-]+{_FREQUENCY_PERIOD})\b",
+        source_text,
+    )
     return bool(
-        re.search(
-            r"\b(i['’]d like|i would like|would like|please include)\b",
-            source_text.casefold(),
+        expanded_frequency or _COMPACT_FREQUENCY_PATTERN.search(source_text)
+    )
+
+
+def _is_positive_request(source_text: str) -> bool:
+    """Return whether wording is an unqualified positive food request."""
+    folded_text = source_text.casefold().replace("’", "'")
+    if re.search(
+        r"\b(no|avoid|without|exclude|excluding|omit|limit|free of|"
+        r"free from|not|never|do not|don't)\b",
+        folded_text,
+    ):
+        return False
+    if re.search(
+        r"\b(exactly|at\s+least|at\s+most|once|twice|thrice|"
+        r"times?|frequency|count)\b",
+        folded_text,
+    ):
+        return False
+    if _has_comparative_limiting_wording(folded_text):
+        return False
+    if _has_explicit_frequency_wording(folded_text):
+        return False
+    return True
+
+
+def _has_valid_food_candidates(payload: dict[str, Any]) -> bool:
+    """Return whether a payload contains at least one matchable food."""
+    foods = payload.get("foods_any_of")
+    return (
+        isinstance(foods, list)
+        and bool(foods)
+        and all(
+            isinstance(food, str) and bool(normalize_food(food))
+            for food in foods
         )
     )
 
@@ -303,6 +392,7 @@ def _prepare_rule_payload(raw_rule: dict[str, Any]) -> dict[str, Any]:
     if (
         not explicit_count
         and not explicit_operator
+        and _has_valid_food_candidates(payload)
         and _is_positive_request(source_text)
     ):
         payload["count"] = 1
@@ -492,8 +582,17 @@ def parse_preference_interpretation(
                 )
             try:
                 exclusion = ConstraintEntry.model_validate(raw_exclusion)
-            except ValidationError:
-                logger.warning("Constraint exclusion failed schema validation")
+            except ValidationError as exc:
+                reason_code = _preference_validation_reason(exc)
+                logger.warning(
+                    "Constraint exclusion failed schema validation "
+                    f"(interpretation_mode={selected_mode} "
+                    f"reason_code={reason_code})",
+                    extra={
+                        "interpretation_mode": selected_mode,
+                        "reason_code": reason_code,
+                    },
+                )
                 return _clarification_response(
                     "One or more constraint exclusions are malformed."
                 )
@@ -540,8 +639,21 @@ def parse_preference_interpretation(
             requirement = DietaryRule.model_validate(
                 _prepare_rule_payload(raw_requirement)
             )
-        except TypeError, ValueError, ValidationError:
-            logger.warning("Preference requirement failed schema validation")
+        except (TypeError, ValueError, ValidationError) as exc:
+            reason_code = (
+                _preference_validation_reason(exc)
+                if isinstance(exc, ValidationError)
+                else "schema"
+            )
+            logger.warning(
+                "Preference requirement failed schema validation "
+                f"(interpretation_mode={selected_mode} "
+                f"reason_code={reason_code})",
+                extra={
+                    "interpretation_mode": selected_mode,
+                    "reason_code": reason_code,
+                },
+            )
             return _clarification_response(
                 "One or more preference requirements are malformed."
             )
