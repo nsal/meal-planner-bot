@@ -1,6 +1,7 @@
 """Tests for LLM response parser functions."""
 
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -318,6 +319,519 @@ def test_parse_interpretation_turns_id_like_into_strict_minimum_one() -> None:
     assert requirements[0].operator is RuleOperator.AT_LEAST
     assert requirements[0].count == 1
     assert requirements[0].strength is RuleStrength.STRICT
+
+
+@pytest.mark.parametrize(
+    "mode", ["stored_preference", "current_plan_preference"]
+)
+@pytest.mark.parametrize(
+    ("source_text", "food", "meal_type"),
+    [
+        ("eggs for breakfast", "eggs", MealType.BREAKFAST),
+        ("bean soup for lunch", "bean soup", MealType.LUNCH),
+        ("halloumi for dinner", "halloumi", MealType.DINNER),
+    ],
+)
+def test_bare_positive_requirements_default_to_minimum_one(
+    mode: str,
+    source_text: str,
+    food: str,
+    meal_type: MealType,
+) -> None:
+    """Bare positive clauses use the same default in both preference modes."""
+    data = {
+        "mode": mode,
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": source_text,
+                "foods_any_of": [food],
+                "meal_type": meal_type.value,
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert clarification is None
+    assert requirements[0].operator is RuleOperator.AT_LEAST
+    assert requirements[0].count == 1
+    assert requirements[0].strength is RuleStrength.STRICT
+    assert requirements[0].meal_type is meal_type
+
+
+def test_bare_positive_best_effort_wording_preserves_flexible_strength() -> (
+    None
+):
+    """A flexible bare clause still defaults to a best-effort rule."""
+    data = {
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": "eggs for breakfast if convenient",
+                "foods_any_of": ["eggs"],
+                "meal_type": "breakfast",
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert clarification is None
+    assert requirements[0].operator is RuleOperator.AT_LEAST
+    assert requirements[0].count == 1
+    assert requirements[0].strength is RuleStrength.BEST_EFFORT
+
+
+def test_legacy_exact_count_remains_exactly_one() -> None:
+    """Legacy exact_count remains explicit rather than receiving a default."""
+    data = {
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": "eggs for breakfast",
+                "foods_any_of": ["eggs"],
+                "meal_type": "breakfast",
+                "exact_count": 2,
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert clarification is None
+    assert requirements[0].operator is RuleOperator.EXACTLY
+    assert requirements[0].count == 2
+
+
+@pytest.mark.parametrize(
+    "mode", ["stored_preference", "current_plan_preference"]
+)
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        "less than 3 eggs",
+        "less than three eggs",
+        "fewer than 2 eggs",
+        "fewer than two eggs",
+        "less than twenty-one eggs",
+        "fewer than thirty-two eggs",
+        "under 4 eggs",
+        "under four eggs",
+        "under twenty-one eggs",
+        "under 4 meals",
+        "under four meals",
+    ],
+)
+def test_comparative_quantities_without_fields_fail_closed(
+    mode: str,
+    source_text: str,
+) -> None:
+    """Comparative upper bounds are not synthesized as minimums."""
+    data = {
+        "mode": mode,
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": source_text,
+                "foods_any_of": [
+                    "eggs" if "meal" not in source_text else "meals"
+                ],
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert requirements == []
+    assert clarification == "One or more preference requirements are malformed."
+
+
+@pytest.mark.parametrize(
+    "mode", ["stored_preference", "current_plan_preference"]
+)
+@pytest.mark.parametrize(
+    ("source_text", "food", "meal_type"),
+    [
+        ("5-spice chicken for dinner", "5-spice chicken", MealType.DINNER),
+        ("7-layer salad for lunch", "7-layer salad", MealType.LUNCH),
+        (
+            "twenty-one-spice chicken for dinner",
+            "twenty-one-spice chicken",
+            MealType.DINNER,
+        ),
+        ("chicken under the broiler for dinner", "chicken", MealType.DINNER),
+        ("chicken for dinner on day 5", "chicken", MealType.DINNER),
+    ],
+)
+def test_comparative_detector_preserves_unrelated_positive_text(
+    mode: str,
+    source_text: str,
+    food: str,
+    meal_type: MealType,
+) -> None:
+    """Unrelated digits and unbounded ``under`` retain the default."""
+    data = {
+        "mode": mode,
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": source_text,
+                "foods_any_of": [food],
+                "meal_type": meal_type.value,
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert clarification is None
+    assert requirements[0].operator is RuleOperator.AT_LEAST
+    assert requirements[0].count == 1
+    assert requirements[0].strength is RuleStrength.STRICT
+    assert requirements[0].meal_type is meal_type
+
+
+@pytest.mark.parametrize(
+    "mode", ["stored_preference", "current_plan_preference"]
+)
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        "omit eggs",
+        "limit eggs",
+        "don't include eggs",
+        "don’t include eggs",
+    ],
+)
+def test_reviewed_negative_wording_without_fields_fails_closed(
+    mode: str,
+    source_text: str,
+) -> None:
+    """Reviewed negative clauses are never inverted into positive rules."""
+    data = {
+        "mode": mode,
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": source_text,
+                "foods_any_of": ["eggs"],
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert requirements == []
+    assert clarification == "One or more preference requirements are malformed."
+
+
+@pytest.mark.parametrize(
+    "mode", ["stored_preference", "current_plan_preference"]
+)
+@pytest.mark.parametrize(
+    "source_text",
+    ["no eggs for breakfast", "avoid eggs", "without eggs", "exclude eggs"],
+)
+def test_negative_wording_without_fields_fails_closed(
+    mode: str,
+    source_text: str,
+) -> None:
+    """Negative clauses are never inverted into positive requirements."""
+    data = {
+        "mode": mode,
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": source_text,
+                "foods_any_of": ["eggs"],
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert requirements == []
+    assert clarification is not None
+    assert "malformed" in clarification.lower()
+
+
+@pytest.mark.parametrize(
+    "mode", ["stored_preference", "current_plan_preference"]
+)
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        "eggs three days a week",
+        "eggs every day",
+        "eggs weekly",
+        "eggs in two meals",
+        "eggs 3 days a week",
+        "eggs 2 meals",
+    ],
+)
+def test_frequency_wording_without_fields_fails_closed(
+    mode: str,
+    source_text: str,
+) -> None:
+    """Frequency clauses are not synthesized as minimum-one rules."""
+    data = {
+        "mode": mode,
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": source_text,
+                "foods_any_of": ["eggs"],
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert requirements == []
+    assert clarification == "One or more preference requirements are malformed."
+
+
+@pytest.mark.parametrize(
+    "mode", ["stored_preference", "current_plan_preference"]
+)
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        "eggs 3x a week",
+        "eggs 3x each day",
+        "eggs 3x per meal",
+        "eggs 3x/week",
+        "eggs 3x/day",
+        "eggs 3x/meal",
+        "eggs 3/week",
+        "eggs 3/day",
+        "eggs 3/meal",
+        "eggs 3 a week",
+        "eggs 3 each day",
+        "eggs 3 per meal",
+        "eggs three a week",
+        "eggs three each week",
+        "eggs twenty-one a week",
+        "eggs twenty-one each week",
+        "eggs twenty-one/week",
+        "eggs 3 / week",
+        "eggs three / week",
+        "eggs twenty-one / week",
+        "eggs three / day",
+        "eggs twenty-one / meal",
+        "eggs 3x / week",
+    ],
+)
+def test_compact_frequency_without_fields_fails_closed(
+    mode: str,
+    source_text: str,
+) -> None:
+    """Compact recurrence clauses are not synthesized as minimums."""
+    data = {
+        "mode": mode,
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": source_text,
+                "foods_any_of": ["eggs"],
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert requirements == []
+    assert clarification == "One or more preference requirements are malformed."
+
+
+@pytest.mark.parametrize(
+    "mode", ["stored_preference", "current_plan_preference"]
+)
+@pytest.mark.parametrize(
+    ("source_text", "food", "meal_type"),
+    [
+        (
+            "5-spice chicken, for dinner",
+            "5-spice chicken",
+            MealType.DINNER,
+        ),
+        ("7-layer salad (classic) for lunch", "7-layer salad", MealType.LUNCH),
+        ("chicken, recipe 2, for breakfast", "chicken", MealType.BREAKFAST),
+        ("chicken 1 / 2, for breakfast", "chicken", MealType.BREAKFAST),
+    ],
+)
+def test_compact_frequency_detector_preserves_numeric_food_controls(
+    mode: str,
+    source_text: str,
+    food: str,
+    meal_type: MealType,
+) -> None:
+    """Digits without recurrence syntax retain the minimum-one default."""
+    data = {
+        "mode": mode,
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": source_text,
+                "foods_any_of": [food],
+                "meal_type": meal_type.value,
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert clarification is None
+    assert requirements[0].operator is RuleOperator.AT_LEAST
+    assert requirements[0].count == 1
+    assert requirements[0].strength is RuleStrength.STRICT
+    assert requirements[0].meal_type is meal_type
+
+
+@pytest.mark.parametrize(
+    "mode", ["stored_preference", "current_plan_preference"]
+)
+@pytest.mark.parametrize(
+    ("source_text", "food", "meal_type"),
+    [
+        ("5-spice chicken for dinner", "5-spice chicken", MealType.DINNER),
+        ("7-layer salad for lunch", "7-layer salad", MealType.LUNCH),
+    ],
+)
+def test_numeric_food_names_default_to_minimum_one(
+    mode: str,
+    source_text: str,
+    food: str,
+    meal_type: MealType,
+) -> None:
+    """Digits in food names do not make a bare request a frequency clause."""
+    data = {
+        "mode": mode,
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": source_text,
+                "foods_any_of": [food],
+                "meal_type": meal_type.value,
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert clarification is None
+    assert requirements[0].operator is RuleOperator.AT_LEAST
+    assert requirements[0].count == 1
+    assert requirements[0].strength is RuleStrength.STRICT
+    assert requirements[0].meal_type is meal_type
+
+
+@pytest.mark.parametrize(
+    ("operator", "count"),
+    [("at_least", "once"), ("not_an_operator", 1)],
+)
+def test_malformed_explicit_values_are_not_defaulted(
+    operator: str,
+    count: object,
+) -> None:
+    """Malformed provider fields remain validation failures."""
+    data = {
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": "eggs for breakfast",
+                "foods_any_of": ["eggs"],
+                "operator": operator,
+                "count": count,
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert requirements == []
+    assert clarification is not None
+    assert "malformed" in clarification.lower()
+
+
+def test_empty_foods_are_not_defaulted() -> None:
+    """A missing food candidate remains a malformed requirement."""
+    data = {
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": "eggs for breakfast",
+                "foods_any_of": [],
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert requirements == []
+    assert clarification == "One or more preference requirements are malformed."
+
+
+def test_conflicting_operator_wording_is_not_defaulted() -> None:
+    """Contradictory wording is clarified before model construction."""
+    data = {
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": "eggs at least once or at most twice",
+                "foods_any_of": ["eggs"],
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    requirements, clarification = parse_preference_interpretation(data)
+
+    assert requirements == []
+    assert clarification is not None
+    assert "multiple count operators" in clarification
 
 
 @pytest.mark.parametrize(
@@ -823,6 +1337,131 @@ def test_parse_preference_interpretation_rejects_normalized_empty_food(
 
     assert requirements == []
     assert clarification == "One or more preference requirements are malformed."
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason_code"),
+    [
+        (
+            {
+                "foods_any_of": ["!!!"],
+            },
+            "food",
+        ),
+        (
+            {
+                "foods_any_of": ["eggs"],
+                "count": "not-a-count",
+            },
+            "count",
+        ),
+        (
+            {
+                "foods_any_of": ["eggs"],
+                "meal_type": "secret-scope-value",
+                "count": 1,
+            },
+            "scope",
+        ),
+        (
+            {
+                "id": None,
+                "foods_any_of": ["eggs"],
+            },
+            "schema",
+        ),
+    ],
+)
+def test_preference_schema_warning_has_safe_reason_and_mode(
+    payload: dict[str, Any],
+    reason_code: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Schema warnings expose only bounded reason and mode metadata."""
+    data = {
+        "mode": "stored_preference",
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": "private preference source text",
+                **payload,
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    with caplog.at_level(logging.WARNING, logger="meal_planner.llm.parser"):
+        requirements, clarification = parse_preference_interpretation(data)
+
+    assert requirements == []
+    assert clarification == "One or more preference requirements are malformed."
+    warning = next(
+        record
+        for record in caplog.records
+        if record.name == "meal_planner.llm.parser"
+    )
+    assert warning.reason_code == reason_code
+    assert warning.interpretation_mode == "stored_preference"
+    assert "interpretation_mode=stored_preference" in warning.getMessage()
+    assert f"reason_code={reason_code}" in warning.getMessage()
+
+
+def test_preference_schema_warning_omits_provider_and_pydantic_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Schema warnings never retain raw preference or validation values."""
+    provider_payload = {
+        "source_text": "private source text",
+        "foods_any_of": ["private-food-value"],
+        "count": "private-count-value",
+        "meal_type": "private-scope-value",
+        "provider_payload": "private-provider-payload",
+    }
+    payload = {
+        "mode": "current_plan_preference",
+        "requirements": [
+            {
+                "id": "private-requirement-id",
+                **provider_payload,
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    with caplog.at_level(logging.WARNING, logger="meal_planner.llm.parser"):
+        requirements, clarification = parse_preference_interpretation(payload)
+
+    assert requirements == []
+    assert clarification == "One or more preference requirements are malformed."
+    assert "interpretation_mode=current_plan_preference" in caplog.text
+    assert "reason_code=scope" in caplog.text
+    assert repr(provider_payload) not in caplog.text
+    assert "private source text" not in caplog.text
+    assert "private-food-value" not in caplog.text
+    assert "private-count-value" not in caplog.text
+    assert "private-scope-value" not in caplog.text
+    assert "private-provider-payload" not in caplog.text
+    assert "private-requirement-id" not in caplog.text
+    assert all(
+        value not in repr(record.__dict__)
+        for record in caplog.records
+        for value in (
+            "private source text",
+            "private-food-value",
+            "private-count-value",
+            "private-scope-value",
+            "private-provider-payload",
+            "private-requirement-id",
+        )
+    )
+    assert all(
+        repr(provider_payload) not in repr(record.__dict__)
+        for record in caplog.records
+    )
 
 
 def test_parse_preference_interpretation_rejects_duplicate_ids() -> None:

@@ -57,8 +57,13 @@ the locked `uv` environment.
   in-progress seven-day requests continue to accept preference-only replies.
   A failed request retains the preference so `/plan` can retry it.
 - Request-specific preferences support structured natural-language rules.
-  `I'd like eggs for breakfast` becomes a strict minimum of one, while
-  `beans for breakfast if convenient` is best effort and may be omitted.
+  An unqualified positive food preference such as `eggs for breakfast` means
+  a strict `at_least 1` rule for both request-specific preferences and saved
+  profile preferences. This includes `I'd like eggs for breakfast`. Explicit
+  counts and operators, exclusion wording, and best-effort qualifiers override
+  this default; for example, `beans for breakfast if convenient` is best effort
+  and may be omitted. Malformed saved rules fail closed and block `/plan`
+  rather than being silently ignored.
   A current plan preference overrides only conflicting stored preferences:
   three stored egg breakfasts plus a current maximum of two resolves to
   exactly two preferred days rather than permitting zero. The conversational
@@ -450,6 +455,11 @@ The Telegram command menu and `/help` show the same command reference:
   fails, no draft is saved, the preference is retained, and `/plan` is the
   manual retry. Cancelling or replacing an in-progress request prevents its
   older asynchronous result from being published.
+- An unqualified positive food preference such as `eggs for breakfast` means
+  a strict `at_least 1` rule for both request-specific preferences and saved
+  profile preferences. Explicit counts and operators, exclusion wording, and
+  best-effort qualifiers override this default. Malformed saved rules fail
+  closed and block `/plan` rather than being silently ignored.
 - Ask conversationally to edit an existing meal; missing days or meal types
   are rejected rather than silently created.
 - Tell the bot to confirm the draft. Confirmation starts grocery generation.

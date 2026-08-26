@@ -128,6 +128,16 @@ def test_readme_documents_rule_strength_override_and_validation_limits() -> (
     """Document strictness, override behavior, and validation boundaries."""
     readme = _normalized_readme()
 
+    assert (
+        "An unqualified positive food preference such as `eggs for breakfast` "
+        "means a strict `at_least 1` rule for both request-specific "
+        "preferences and saved profile preferences"
+    ) in readme
+    assert (
+        "Explicit counts and operators, exclusion wording, and best-effort "
+        "qualifiers override this default"
+    ) in readme
+    assert "Malformed saved rules fail closed and block `/plan`" in readme
     assert "I'd like eggs for breakfast" in readme
     assert "if convenient" in readme
     assert "three stored egg breakfasts" in readme

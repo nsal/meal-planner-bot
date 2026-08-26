@@ -114,8 +114,10 @@ or automatically repair a plan for missing target compliance.
 ## Preference interpretation
 
 When the user provides a constraint or preference, a separate LLM call first
-converts it into the shared structured rule contract. For example, “I'd like
-eggs for breakfast” becomes a strict minimum of one:
+converts it into the shared structured rule contract. An unqualified positive
+food preference, such as “eggs for breakfast”, means a strict `at_least 1`
+rule in both `stored_preference` and `current_plan_preference` modes. For
+example, “I'd like eggs for breakfast” becomes:
 
 ```json
 {
@@ -129,11 +131,14 @@ eggs for breakfast” becomes a strict minimum of one:
 }
 ```
 
-Wording such as “if convenient” produces a `best_effort` rule. The
-interpreter also supports constraint mode and current-plan-preference mode;
-each interpretation is shown with its source wording and meaning for user
-confirmation before persistence. Ambiguous or partially interpreted input is
-clarified instead of guessed.
+Explicit counts and operators, exclusion wording, and best-effort qualifiers
+override this default. Wording such as “if convenient” produces a
+`best_effort` rule. The interpreter also supports constraint mode and
+current-plan-preference mode; each interpretation is shown with its source
+wording and meaning for user confirmation before persistence. Ambiguous or
+partially interpreted input is clarified instead of guessed. A malformed
+saved rule fails closed and blocks plan generation rather than being silently
+ignored.
 
 This prompt is built by `build_preference_interpretation_prompt()` in
 [`src/meal_planner/llm/prompts.py`](../src/meal_planner/llm/prompts.py).

@@ -606,6 +606,40 @@ def test_interpretation_prompt_documents_wording_strength_defaults() -> None:
     assert "best_effort" in prompt
 
 
+@pytest.mark.parametrize(
+    "mode", ["stored_preference", "current_plan_preference"]
+)
+def test_interpretation_prompt_defaults_unqualified_positive_foods(
+    mode: str,
+) -> None:
+    """Bare positive food preferences use the application minimum."""
+    prompt = build_preference_interpretation_prompt(
+        "eggs for breakfast",
+        mode=mode,  # type: ignore[arg-type]
+    )
+
+    assert f'"mode": "{mode}"' in prompt
+    assert (
+        "Every unqualified positive food preference without an explicit "
+        "count or operator means strict at_least 1."
+    ) in prompt
+
+
+def test_interpretation_prompt_preserves_explicit_and_negative_intent() -> None:
+    """Explicit provider fields and exclusions are not replaced by defaults."""
+    prompt = build_preference_interpretation_prompt("no eggs twice a week")
+
+    assert "Preserve every explicit count and operator from the user" in prompt
+    assert (
+        "Do not apply that default to negative or exclusion wording such as "
+        "'no', 'avoid', 'without', or 'exclude'."
+    ) in prompt
+    assert (
+        "Do not invent a count or operator unless applying the "
+        "application-owned default above"
+    ) in prompt
+
+
 def test_preference_interpretation_prompt_requires_clarification() -> None:
     prompt = build_preference_interpretation_prompt("Make it healthy and fun")
 
