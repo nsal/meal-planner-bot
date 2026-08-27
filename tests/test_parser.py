@@ -14,6 +14,8 @@ from meal_planner.llm.parser import (
     parse_preference_interpretation,
 )
 from meal_planner.models.schemas import (
+    BatchMealRole,
+    BatchRule,
     ConstraintEntry,
     ConversationIntent,
     DietaryRule,
@@ -157,6 +159,90 @@ def test_parse_plan_response_rejects_duplicate_meal_types_in_a_day() -> None:
     assert parse_plan_response(data) is None
 
 
+def test_parse_plan_response_accepts_complete_batch_links() -> None:
+    """Preparation and linked leftover metadata parse as typed links."""
+    data = make_plan_data()
+    data["days"][0]["meals"][0]["meal_type"] = "dinner"
+    data["days"][0]["meals"][0]["name"] = "Chicken dinner"
+    data["days"][0]["meals"][0]["ingredients"] = [{"item": "chicken"}]
+    data["days"][0]["meals"][0]["batch_link"] = {
+        "batch_id": "batch-chicken",
+        "role": "preparation",
+    }
+    data["days"][1]["meals"][0]["meal_type"] = "lunch"
+    data["days"][1]["meals"][0]["batch_link"] = {
+        "batch_id": "batch-chicken",
+        "role": "leftover",
+        "source_date": "2026-08-10",
+        "source_meal_type": "dinner",
+        "portion": 2,
+    }
+
+    plan = parse_plan_response(data)
+
+    assert plan is not None
+    assert plan.days[0].meals[0].batch_role is BatchMealRole.PREPARATION
+    assert plan.days[1].meals[0].batch_id == "batch-chicken"
+
+
+def test_parse_plan_response_preserves_preparation_batch_yield() -> None:
+    """A preparation link carries the bounded yield into the plan model."""
+    data = make_plan_data()
+    data["days"][0]["meals"][0].update(
+        {
+            "meal_type": "dinner",
+            "name": "Chicken dinner",
+            "ingredients": [{"item": "chicken"}],
+            "batch_link": {
+                "batch_id": "batch-chicken",
+                "role": "preparation",
+                "total_yield": 3,
+            },
+        }
+    )
+
+    plan = parse_plan_response(data)
+
+    assert plan is not None
+    assert plan.days[0].meals[0].batch_link is not None
+    assert plan.days[0].meals[0].batch_link.total_yield == 3
+
+
+def test_parse_plan_response_rejects_breakfast_batch_source_scope() -> None:
+    """Batch source metadata may only identify lunch or dinner."""
+    data = make_plan_data()
+    data["days"][0]["meals"][0]["batch_link"] = {
+        "batch_id": "batch-chicken",
+        "role": "leftover",
+        "source_date": "2026-08-10",
+        "source_meal_type": "breakfast",
+        "portion": 2,
+    }
+
+    plan, feedback = parse_plan_response_with_metadata(data)
+
+    assert plan is None
+    assert feedback is not None
+    assert feedback.category == "structural"
+
+
+def test_parse_plan_response_reports_malformed_batch_metadata_safely() -> None:
+    """Malformed batch metadata is a bounded structural parser failure."""
+    data = make_plan_data()
+    data["days"][0]["meals"][0]["batch_link"] = {
+        "batch_id": "batch-chicken",
+        "role": "leftover",
+        "portion": 1,
+    }
+
+    plan, feedback = parse_plan_response_with_metadata(data)
+
+    assert plan is None
+    assert feedback is not None
+    assert feedback.category == "structural"
+    assert "batch_link" in feedback.render()
+
+
 def test_plan_response_metadata_has_safe_codes_and_locations() -> None:
     """Repair feedback does not include provider values or raw response text."""
     data = make_plan_data()
@@ -214,9 +300,208 @@ def test_parse_preference_interpretation_complete_requirements() -> None:
     requirements, clarification = parse_preference_interpretation(data)
 
     assert clarification is None
-    assert [item.id for item in requirements] == ["r1", "r2"]
+    assert all(
+        item.id.startswith("r-current-plan-preference-")
+        for item in requirements
+    )
     assert requirements[0].meal_type is MealType.BREAKFAST
     assert requirements[0].foods_any_of == ["crepes", "pancakes"]
+
+
+def test_parse_profile_interpretation_emits_food_and_batch_rules() -> None:
+    """One profile response preserves every supported typed clause."""
+    data = {
+        "mode": "stored_preference",
+        "requirements": [
+            {
+                "id": "provider-eggs",
+                "source_text": "eggs three breakfasts weekly",
+                "foods_any_of": ["eggs"],
+                "meal_type": "breakfast",
+                "operator": "exactly",
+                "count": 3,
+            },
+            {
+                "id": "provider-pancakes",
+                "source_text": "pancakes or crepes on Saturday",
+                "foods_any_of": ["pancakes", "crepes"],
+                "meal_type": "breakfast",
+                "weekdays": ["saturday"],
+                "operator": "exactly",
+                "count": 1,
+            },
+            {
+                "id": "provider-fish",
+                "source_text": "fish at least once for dinner weekly",
+                "foods_any_of": ["fish"],
+                "meal_type": "dinner",
+                "operator": "at_least",
+                "count": 1,
+            },
+        ],
+        "batch_rules": [
+            {
+                "id": "provider-batch",
+                "source_text": "cook once for two or three lunches and dinners",
+                "foods_any_of": ["chicken"],
+                "preparation_meal_types": ["dinner"],
+                "reuse_meal_types": ["lunch", "dinner"],
+                "total_yield": 3,
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    rules, clarification = parse_preference_interpretation(data)
+
+    assert clarification is None
+    food_rules = [rule for rule in rules if isinstance(rule, DietaryRule)]
+    batch_rules = [rule for rule in rules if isinstance(rule, BatchRule)]
+    assert len(food_rules) == 3
+    assert len(batch_rules) == 1
+    eggs, pancakes, fish = food_rules
+    assert eggs.target_weekdays == [
+        Weekday.MONDAY,
+        Weekday.WEDNESDAY,
+        Weekday.FRIDAY,
+    ]
+    assert pancakes.weekdays == [Weekday.SATURDAY]
+    assert pancakes.target_weekdays == []
+    assert fish.target_weekdays == [Weekday.MONDAY]
+    assert all(
+        rule.id.startswith("r-profile-preference-") for rule in food_rules
+    )
+    assert batch_rules[0].total_yield == 3
+    assert batch_rules[0].id.startswith("r-profile-batch-")
+
+
+def test_mixed_frequency_and_batch_output_is_atomic() -> None:
+    """A malformed batch never leaves a partially accepted frequency rule."""
+    data = {
+        "mode": "stored_preference",
+        "requirements": [
+            {
+                "id": "eggs",
+                "source_text": "eggs three times",
+                "foods_any_of": ["eggs"],
+                "operator": "exactly",
+                "count": 3,
+            }
+        ],
+        "batch_rules": [
+            {
+                "id": "batch",
+                "source_text": "cook once for four meals",
+                "foods_any_of": ["chicken"],
+                "preparation_meal_types": ["dinner"],
+                "reuse_meal_types": ["lunch"],
+                "total_yield": 4,
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    rules, clarification = parse_preference_interpretation(data)
+
+    assert rules == []
+    assert clarification == "One or more batch rules are malformed."
+
+
+def test_batch_only_profile_interpretation_is_not_vacuous() -> None:
+    """A batch rule is a complete profile interpretation without a quota."""
+    data = {
+        "mode": "stored_preference",
+        "requirements": [],
+        "batch_rules": [
+            {
+                "id": "batch",
+                "source_text": "cook once for two lunches",
+                "foods_any_of": ["chicken"],
+                "preparation_meal_types": ["dinner"],
+                "reuse_meal_types": ["lunch"],
+                "total_yield": 2,
+            }
+        ],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    rules, clarification = parse_preference_interpretation(data)
+
+    assert clarification is None
+    assert len(rules) == 1
+    assert isinstance(rules[0], BatchRule)
+
+
+def test_subjective_requirement_is_rejected_without_partial_rules() -> None:
+    """Subjective profile wording cannot be converted into a quota."""
+    data = {
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": "make it healthy and fun",
+                "foods_any_of": ["healthy"],
+                "count": 1,
+            }
+        ],
+        "batch_rules": [],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    rules, clarification = parse_preference_interpretation(data)
+
+    assert rules == []
+    assert clarification is not None
+    assert "subjective" in clarification
+
+
+def test_interpretation_rejects_fallback_prose_around_json() -> None:
+    """Strict profile interpretation rejects provider fallback text."""
+    payload = {
+        "requirements": [],
+        "batch_rules": [],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    rules, clarification = parse_preference_interpretation(
+        f"I could not do that.\n```json\n{json.dumps(payload)}\n```"
+    )
+
+    assert rules == []
+    assert clarification == "I could not parse the preference interpretation."
+
+
+def test_interpretation_rejects_unknown_provider_fields() -> None:
+    """Ignored provider fields cannot hide an unrepresented clause."""
+    data = {
+        "requirements": [
+            {
+                "id": "r1",
+                "source_text": "eggs three times",
+                "foods_any_of": ["eggs"],
+                "count": 3,
+                "unrepresented_clause": "private wording",
+            }
+        ],
+        "batch_rules": [],
+        "exclusions": [],
+        "clarification": None,
+        "unparsed_text": [],
+    }
+
+    rules, clarification = parse_preference_interpretation(data)
+
+    assert rules == []
+    assert clarification == "One or more preference requirements are malformed."
 
 
 def test_parse_interpretation_supports_shared_rule_operators_and_scopes() -> (
@@ -280,7 +565,7 @@ def test_parse_interpretation_rejects_impossible_strict_named_day_count(
                 "meal_type": "breakfast",
                 "weekdays": ["monday", "wednesday"],
                 "operator": operator,
-                "count": 2,
+                "count": 3,
                 "strength": "strict",
             }
         ],
@@ -1577,7 +1862,10 @@ def test_parse_preference_interpretation_accepts_compatible_rules(
     requirements, clarification = parse_preference_interpretation(data)
 
     assert clarification is None
-    assert [requirement.id for requirement in requirements] == ["r1", "r2"]
+    assert all(
+        requirement.id.startswith("r-current-plan-preference-")
+        for requirement in requirements
+    )
 
 
 def test_parse_preference_interpretation_rejects_omitted_clauses() -> None:

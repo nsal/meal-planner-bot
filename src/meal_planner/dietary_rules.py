@@ -1,4 +1,4 @@
-"""Deterministic expansion and conflict checks for dietary constraints.
+"""Deterministic scheduling, expansion, and conflict checks for dietary rules.
 
 This module deliberately contains no language-model or network behavior.  A
 constraint is safe to use only when each of its terms can be represented as
@@ -7,20 +7,438 @@ weekday scopes: a preference cannot evade a constraint by narrowing its
 scope.
 """
 
+import json
 from dataclasses import dataclass
+from datetime import date, timedelta
+from math import floor
 from types import MappingProxyType
 from typing import Literal, Mapping, Sequence
 
 from meal_planner.models.schemas import (
+    BatchRule,
     ConstraintEntry,
+    DietaryObligation,
     DietaryRule,
+    MealLogEntry,
+    MealType,
+    RuleCadence,
     RuleOperator,
+    ScheduleKind,
     Weekday,
+    application_owned_text_id,
+    canonicalize_constraint_entry,
+    canonicalize_dietary_rule,
+    daily_meal_capacity,
 )
 from meal_planner.normalization import normalize_food, normalize_match_text
 
 AliasRegistry = Mapping[str, tuple[str, ...]]
 ConstraintReferenceKind = Literal["constraint", "preference"]
+
+
+def assign_generated_target_weekdays(rule: DietaryRule) -> DietaryRule:
+    """Assign stable, Monday-anchored targets to an unscoped weekly rule.
+
+    The returned rule preserves explicit weekdays exactly.  Generated targets
+    use the first ``count`` evenly distributed positions in a seven-day,
+    Monday-anchored calendar.  Profile rules are deliberately copied through
+    Pydantic so invalid meal-scope counts remain impossible to schedule.
+    """
+    if rule.schedule_kind is ScheduleKind.EXPLICIT or rule.weekdays:
+        return rule
+    if not 0 <= rule.count <= 7:
+        raise ValueError(
+            "generated target weekday assignment supports counts from 0 to 7"
+        )
+    if rule.count == 0:
+        targets: list[Weekday] = []
+    else:
+        targets = [
+            Weekday(floor(index * 7 / rule.count) + 1)
+            for index in range(rule.count)
+        ]
+    return rule.model_copy(
+        update={
+            "target_weekdays": targets,
+            "schedule_kind": ScheduleKind.GENERATED,
+        }
+    )
+
+
+def assign_generated_target_days(rule: DietaryRule) -> DietaryRule:
+    """Compatibility name for assigning application-owned target weekdays."""
+    return assign_generated_target_weekdays(rule)
+
+
+def canonicalize_batch_rule(
+    rule: BatchRule, *, namespace: str = "profile-batch"
+) -> BatchRule:
+    """Replace a provider batch ID with a deterministic application ID."""
+    payload = {
+        "source_text": rule.source_text.casefold().strip(),
+        "foods_any_of": sorted(
+            " ".join(normalize_food(food)) for food in rule.foods_any_of
+        ),
+        "preparation_meal_types": sorted(
+            meal_type.value for meal_type in rule.preparation_meal_types
+        ),
+        "reuse_meal_types": sorted(
+            meal_type.value for meal_type in rule.reuse_meal_types
+        ),
+        "total_yield": rule.total_yield,
+    }
+    return rule.model_copy(
+        update={
+            "id": application_owned_text_id(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                namespace=namespace,
+            )
+        }
+    )
+
+
+def canonicalize_interpretation_rules(
+    rules: Sequence[DietaryRule | BatchRule | ConstraintEntry],
+    *,
+    mode: str,
+) -> list[DietaryRule | BatchRule | ConstraintEntry]:
+    """Canonicalize all successfully parsed rules without partial writes."""
+    if mode == "constraint":
+        return [
+            canonicalize_constraint_entry(rule, namespace="profile-constraint")
+            for rule in rules
+            if isinstance(rule, ConstraintEntry)
+        ]
+
+    canonical: list[DietaryRule | BatchRule | ConstraintEntry] = []
+    for rule in rules:
+        if isinstance(rule, DietaryRule):
+            scheduled = assign_generated_target_weekdays(rule)
+            namespace = (
+                "profile-preference"
+                if mode == "stored_preference"
+                else "current-plan-preference"
+            )
+            canonical.append(
+                canonicalize_dietary_rule(scheduled, namespace=namespace)
+            )
+        elif isinstance(rule, BatchRule):
+            canonical.append(
+                canonicalize_batch_rule(
+                    rule,
+                    namespace=(
+                        "profile-batch"
+                        if mode == "stored_preference"
+                        else "current-plan-batch"
+                    ),
+                )
+            )
+    return canonical
+
+
+@dataclass(frozen=True, slots=True)
+class SubmittedMealEvidence:
+    """One distinct, persisted meal that matches a dietary rule."""
+
+    evidence_id: str
+    date: date
+    meal_type: MealType
+    description: str
+    matched_foods: tuple[str, ...]
+
+
+def meal_log_evidence_id(entry: MealLogEntry) -> str:
+    """Return a stable, bounded ID for one normalized meal-history slot."""
+    payload = {
+        "date": entry.date.isoformat(),
+        "meal_type": entry.meal_type.value,
+        "description": normalize_match_text(entry.description),
+    }
+    return application_owned_text_id(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        namespace="submitted-meal",
+    )
+
+
+def match_submitted_meal(
+    entry: MealLogEntry, rule: DietaryRule
+) -> SubmittedMealEvidence | None:
+    """Match one submitted meal using normalized whole-word alternatives."""
+    if rule.meal_type is not None and entry.meal_type is not rule.meal_type:
+        return None
+    if rule.weekdays and Weekday(entry.date.isoweekday()) not in rule.weekdays:
+        return None
+    matched_foods = tuple(
+        food
+        for food in rule.foods_any_of
+        if _contains_token_sequence(
+            normalize_food(entry.description), normalize_food(food)
+        )
+    )
+    if not matched_foods:
+        return None
+    return SubmittedMealEvidence(
+        evidence_id=meal_log_evidence_id(entry),
+        date=entry.date,
+        meal_type=entry.meal_type,
+        description=entry.description,
+        matched_foods=matched_foods,
+    )
+
+
+def obligation_covers_date(
+    obligation: DietaryObligation, target_date: date
+) -> bool:
+    """Return whether an obligation owns one exact ISO-week plan date."""
+    iso = target_date.isocalendar()
+    target_iso_week = f"{iso.year:04d}-W{iso.week:02d}"
+    return (
+        obligation.iso_week == target_iso_week
+        and obligation.horizon_start <= target_date <= obligation.horizon_end
+        and target_date in obligation.eligible_dates
+    )
+
+
+def _projection_segments(
+    start_date: date, end_date: date
+) -> tuple[tuple[str, date, date], ...]:
+    """Split an inclusive horizon into bounded ISO-week segments."""
+    if end_date < start_date:
+        raise ValueError("end_date must not precede start_date")
+    if (end_date - start_date).days + 1 > 7:
+        raise ValueError("dietary projection horizons may cover at most 7 days")
+    segments: list[tuple[str, date, date]] = []
+    current = start_date
+    while current <= end_date:
+        iso = current.isocalendar()
+        week_start = date.fromisocalendar(iso.year, iso.week, 1)
+        week_end = week_start + timedelta(days=6)
+        segment_end = min(week_end, end_date)
+        segments.append(
+            (f"{iso.year:04d}-W{iso.week:02d}", current, segment_end)
+        )
+        current = segment_end + timedelta(days=1)
+    return tuple(segments)
+
+
+def _dates_between(start_date: date, end_date: date) -> tuple[date, ...]:
+    """Return every date in an already validated inclusive interval."""
+    return tuple(
+        start_date + timedelta(days=offset)
+        for offset in range((end_date - start_date).days + 1)
+    )
+
+
+def _distinct_rule_evidence(
+    rule: DietaryRule,
+    submitted_meals: Sequence[MealLogEntry],
+    *,
+    week_start: date,
+    cutoff: date,
+) -> tuple[SubmittedMealEvidence, ...]:
+    """Match and deduplicate history before a segment's application cutoff."""
+    distinct: dict[tuple[date, MealType, str], SubmittedMealEvidence] = {}
+    for entry in submitted_meals:
+        if not week_start <= entry.date < cutoff:
+            continue
+        evidence = match_submitted_meal(entry, rule)
+        if evidence is None:
+            continue
+        key = (
+            entry.date,
+            entry.meal_type,
+            normalize_match_text(entry.description),
+        )
+        distinct.setdefault(key, evidence)
+    return tuple(
+        sorted(
+            distinct.values(),
+            key=lambda item: (
+                item.date,
+                item.meal_type.value,
+                item.evidence_id,
+            ),
+        )
+    )
+
+
+def _scheduled_target_dates(
+    rule: DietaryRule, week_start: date
+) -> tuple[date, ...]:
+    """Resolve one rule's explicit or generated weekdays to dates."""
+    if rule.weekdays:
+        return tuple(
+            week_start + timedelta(days=int(weekday) - 1)
+            for weekday in rule.weekdays
+        )
+    scheduled = rule
+    if not rule.target_weekdays:
+        scheduled = assign_generated_target_weekdays(rule)
+    return tuple(
+        week_start + timedelta(days=int(weekday) - 1)
+        for weekday in scheduled.target_weekdays
+    )
+
+
+def _eligible_slots(
+    rule: DietaryRule,
+    start_date: date,
+    end_date: date,
+) -> tuple[date, ...]:
+    """Return bounded, deterministic meal-slot dates for a rule."""
+    dates = _dates_between(start_date, end_date)
+    if rule.weekdays:
+        dates = tuple(
+            current
+            for current in dates
+            if Weekday(current.isoweekday()) in rule.weekdays
+        )
+    capacity = daily_meal_capacity(rule.meal_type)
+    return tuple(current for current in dates for _ in range(capacity))
+
+
+def _generated_obligation_dates(
+    rule: DietaryRule,
+    week_start: date,
+    segment_start: date,
+    segment_end: date,
+    due_count: int,
+) -> tuple[date, ...]:
+    """Place generated overdue slots before in-horizon target slots."""
+    targets = _scheduled_target_dates(rule, week_start)
+    overdue = [target for target in targets if target < segment_start]
+    current_targets = [
+        target for target in targets if segment_start <= target <= segment_end
+    ]
+    open_slots = list(_eligible_slots(rule, segment_start, segment_end))
+    selected: list[date] = []
+    for target in overdue + current_targets:
+        if len(selected) >= due_count:
+            break
+        try:
+            slot_index = open_slots.index(target)
+        except ValueError:
+            slot_index = 0 if open_slots else -1
+        if slot_index < 0:
+            break
+        selected.append(open_slots.pop(slot_index))
+    return tuple(selected)
+
+
+def _project_rule_segment(
+    rule: DietaryRule,
+    submitted_meals: Sequence[MealLogEntry],
+    *,
+    iso_week: str,
+    segment_start: date,
+    segment_end: date,
+) -> DietaryObligation | None:
+    """Project one rule into one ISO-week horizon segment."""
+    week_start = date.fromisocalendar(int(iso_week[:4]), int(iso_week[6:]), 1)
+    evidence = _distinct_rule_evidence(
+        rule,
+        submitted_meals,
+        week_start=week_start,
+        cutoff=segment_start,
+    )
+    slots = _eligible_slots(rule, segment_start, segment_end)
+    if not slots:
+        return None
+
+    if rule.weekdays:
+        due_count = min(rule.count, len(slots))
+        selected_dates = tuple(dict.fromkeys(slots))
+    else:
+        targets = _scheduled_target_dates(rule, week_start)
+        due_count = sum(target <= segment_end for target in targets)
+        selected_dates = tuple(
+            dict.fromkeys(
+                _generated_obligation_dates(
+                    rule,
+                    week_start,
+                    segment_start,
+                    segment_end,
+                    due_count,
+                )
+            )
+        )
+
+    if rule.operator is RuleOperator.AT_MOST:
+        required_count = max(rule.count - len(evidence), 0)
+        required_count = min(required_count, len(slots))
+        selected_dates = tuple(dict.fromkeys(slots))
+    else:
+        required_count = max(due_count - len(evidence), 0)
+        selected_date_count = len(set(selected_dates))
+        required_count = min(
+            required_count,
+            daily_meal_capacity(rule.meal_type) * selected_date_count,
+        )
+
+    if rule.operator is not RuleOperator.AT_MOST and required_count == 0:
+        return None
+    if not selected_dates:
+        return None
+    return DietaryObligation(
+        id=f"{rule.id}-{iso_week}-{segment_start.isoformat()}",
+        source_rule_id=rule.id,
+        iso_week=iso_week,
+        horizon_start=segment_start,
+        horizon_end=segment_end,
+        eligible_dates=list(selected_dates),
+        operator=rule.operator,
+        count=required_count,
+        foods_any_of=rule.foods_any_of,
+        meal_type=rule.meal_type,
+        strength=rule.strength,
+        evidence_ids=[item.evidence_id for item in evidence[:20]],
+    )
+
+
+def project_dietary_obligations(
+    rules: Sequence[DietaryRule],
+    submitted_meals: Sequence[MealLogEntry],
+    *,
+    start_date: date,
+    end_date: date,
+) -> tuple[DietaryObligation, ...]:
+    """Project weekly quotas into deterministic, dated horizon obligations.
+
+    Submitted history is the only evidence consumed here.  Drafts and
+    confirmed plans are intentionally not accepted as an input type.  A
+    short horizon caps catch-up at its meal-slot capacity; callers can ask
+    again later for any remaining weekly quota.
+    """
+    if len({rule.id for rule in rules}) != len(rules):
+        raise ValueError("dietary rule IDs must be unique")
+    if any(rule.cadence is not RuleCadence.ISO_WEEK for rule in rules):
+        raise ValueError("dietary rules must use ISO-week cadence")
+    contradiction = _find_same_tier_contradiction(rules)
+    if contradiction is not None:
+        raise ValueError(
+            "contradictory dietary rules: " + ", ".join(contradiction.rule_ids)
+        )
+    obligations: list[DietaryObligation] = []
+    for iso_week, segment_start, segment_end in _projection_segments(
+        start_date, end_date
+    ):
+        for rule in sorted(rules, key=lambda item: item.id):
+            obligation = _project_rule_segment(
+                rule,
+                submitted_meals,
+                iso_week=iso_week,
+                segment_start=segment_start,
+                segment_end=segment_end,
+            )
+            if obligation is not None:
+                obligations.append(obligation)
+    return tuple(obligations)
+
+
+project_weekly_obligations = project_dietary_obligations
+project_weekly_rule_obligations = project_dietary_obligations
+match_logged_meal = match_submitted_meal
+
 
 # Keep this registry intentionally small and application-owned.  Values are
 # ordered so expansion and all derived conflict results are reproducible.

@@ -12,11 +12,17 @@ from meal_planner.models import (
     PreferenceRequirement as ExportedPreferenceRequirement,
 )
 from meal_planner.models.schemas import (
+    BatchLedgerEntry,
+    BatchLedgerState,
+    BatchMealRole,
+    BatchRule,
     ConstraintEntry,
     ConversationIntent,
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
+    DietaryObligation,
+    DietaryPreferenceEntry,
     DietaryRule,
     FamilyMember,
     GrocerySection,
@@ -30,6 +36,7 @@ from meal_planner.models.schemas import (
     PlanDay,
     PlanDays,
     PlanGenerationContext,
+    PlannedBatchLink,
     PlannedMeal,
     PlanRevisionContext,
     PlanStatus,
@@ -37,13 +44,259 @@ from meal_planner.models.schemas import (
     ProfileEditCategory,
     ProfileEditOperation,
     ProfileUpdateEntities,
+    RuleCadence,
     RuleOperator,
     RuleStrength,
+    ScheduleKind,
+    SubmittedMealBatchLink,
     UserProfile,
     Weekday,
+    WeeklyBatchLedger,
     WeeklyPlan,
 )
 from tests.factories import make_plan, make_profile
+
+
+def test_weekly_rule_and_schedule_contract_round_trips() -> None:
+    """Persist weekly cadence and distinguish explicit from generated days."""
+    explicit = DietaryRule(
+        id="eggs",
+        source_text="eggs three breakfasts weekly",
+        foods_any_of=["eggs"],
+        meal_type=MealType.BREAKFAST,
+        weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY, Weekday.FRIDAY],
+        cadence=RuleCadence.ISO_WEEK,
+        schedule_kind=ScheduleKind.EXPLICIT,
+        operator=RuleOperator.AT_LEAST,
+        count=3,
+    )
+    generated = DietaryRule(
+        id="fish",
+        source_text="fish weekly",
+        foods_any_of=["fish"],
+        cadence=RuleCadence.ISO_WEEK,
+        schedule_kind=ScheduleKind.GENERATED,
+        target_weekdays=[Weekday.MONDAY, Weekday.THURSDAY],
+        count=2,
+    )
+
+    restored = DietaryRule.model_validate_json(explicit.model_dump_json())
+
+    assert restored.cadence is RuleCadence.ISO_WEEK
+    assert restored.schedule_kind is ScheduleKind.EXPLICIT
+    assert generated.weekdays == []
+    assert generated.target_weekdays == [Weekday.MONDAY, Weekday.THURSDAY]
+
+
+def test_dated_obligation_validates_exact_week_and_horizon() -> None:
+    """An obligation carries independent dates and its owning rule."""
+    obligation = DietaryObligation(
+        id="obligation-1",
+        source_rule_id="eggs",
+        iso_week="2026-W34",
+        horizon_start=date(2026, 8, 19),
+        horizon_end=date(2026, 8, 21),
+        eligible_dates=[date(2026, 8, 19), date(2026, 8, 21)],
+        operator=RuleOperator.AT_LEAST,
+        count=2,
+        foods_any_of=["eggs"],
+        meal_type=MealType.BREAKFAST,
+        strength=RuleStrength.STRICT,
+        evidence_ids=["meal-1"],
+    )
+
+    assert obligation.week_start == date(2026, 8, 17)
+    assert obligation.iso_week == "2026-W34"
+    assert obligation.eligible_dates == [
+        date(2026, 8, 19),
+        date(2026, 8, 21),
+    ]
+
+
+def test_batch_rules_links_and_weekly_ledger_round_trip() -> None:
+    """Batch rules, planned links, and durable weekly entries are typed."""
+    rule = BatchRule(
+        id="batch-rule-1",
+        source_text="cook once for two lunches",
+        foods_any_of=["chicken"],
+        preparation_meal_types=[MealType.DINNER],
+        reuse_meal_types=[MealType.LUNCH, MealType.DINNER],
+        total_yield=2,
+    )
+    preparation = PlannedBatchLink(
+        batch_id="batch-1", role=BatchMealRole.PREPARATION
+    )
+    leftover = PlannedBatchLink(
+        batch_id="batch-1",
+        role=BatchMealRole.LEFTOVER,
+        source_date=date(2026, 8, 19),
+        source_meal_type=MealType.DINNER,
+        portion=2,
+    )
+    entry = BatchLedgerEntry(
+        batch_id="batch-1",
+        source_plan_id="plan-1",
+        source_request_id="request-1",
+        source_revision=1,
+        preparation_date=date(2026, 8, 19),
+        preparation_meal_type=MealType.DINNER,
+        food="chicken",
+        meal_name="Roast chicken",
+        total_portions=2,
+        remaining_portions=1,
+        state=BatchLedgerState.PROVISIONAL,
+        week_end=date(2026, 8, 23),
+    )
+    ledger = WeeklyBatchLedger(iso_week="2026-W34", entries=[entry])
+
+    assert rule.total_yield == 2
+    assert preparation.role is BatchMealRole.PREPARATION
+    assert leftover.role is BatchMealRole.LEFTOVER
+    assert ledger.entries[0].week_end == date(2026, 8, 23)
+
+
+def test_meal_log_batch_link_is_optional_for_existing_records() -> None:
+    """Historical ordinary meal records remain valid without batch data."""
+    entry = MealLogEntry(
+        date=date(2026, 8, 19),
+        meal_type=MealType.LUNCH,
+        description="Salad",
+        created_at=datetime(2026, 8, 19, 12, tzinfo=timezone.utc),
+    )
+    linked = entry.model_copy(
+        update={
+            "batch_link": SubmittedMealBatchLink(
+                batch_id="batch-1", role=BatchMealRole.LEFTOVER
+            )
+        }
+    )
+
+    assert entry.batch_link is None
+    assert linked.batch_link is not None
+    assert linked.batch_link.batch_id == "batch-1"
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"weekdays": [Weekday.MONDAY, Weekday.MONDAY]},
+        {"target_weekdays": [Weekday.TUESDAY, Weekday.TUESDAY]},
+        {"count": 8, "meal_type": MealType.DINNER},
+    ],
+)
+def test_weekly_rules_reject_duplicate_scopes_and_over_capacity(
+    values: dict[str, object],
+) -> None:
+    """Rules reject duplicate dates/scopes and impossible weekly quotas."""
+    payload: dict[str, object] = {
+        "id": "invalid",
+        "source_text": "invalid weekly rule",
+        "foods_any_of": ["food"],
+        **values,
+    }
+    with pytest.raises(ValidationError):
+        DietaryRule(**payload)
+
+
+def test_obligations_reject_duplicate_or_out_of_horizon_dates() -> None:
+    """Obligation dates are unique and bounded by both horizon and week."""
+    values = {
+        "id": "obligation-1",
+        "source_rule_id": "rule-1",
+        "iso_week": "2026-W34",
+        "horizon_start": date(2026, 8, 19),
+        "horizon_end": date(2026, 8, 21),
+        "operator": RuleOperator.AT_LEAST,
+        "count": 1,
+        "foods_any_of": ["eggs"],
+    }
+    with pytest.raises(ValidationError):
+        DietaryObligation(
+            **values,
+            eligible_dates=[date(2026, 8, 19), date(2026, 8, 19)],
+        )
+    with pytest.raises(ValidationError):
+        DietaryObligation(
+            **values,
+            eligible_dates=[date(2026, 8, 22)],
+        )
+
+
+def test_batch_models_reject_bad_yields_roles_and_cross_week_entries() -> None:
+    """Batch contracts enforce 2-3 yields, role consistency, and one week."""
+    with pytest.raises(ValidationError):
+        BatchRule(
+            id="batch-rule-1",
+            source_text="too small",
+            foods_any_of=["beans"],
+            preparation_meal_types=[MealType.DINNER],
+            reuse_meal_types=[MealType.LUNCH],
+            total_yield=4,
+        )
+    with pytest.raises(ValidationError):
+        PlannedBatchLink(
+            batch_id="batch-1",
+            role=BatchMealRole.PREPARATION,
+            source_date=date(2026, 8, 19),
+        )
+    entry = BatchLedgerEntry(
+        batch_id="batch-1",
+        source_plan_id="plan-1",
+        source_request_id="request-1",
+        source_revision=1,
+        preparation_date=date(2026, 8, 19),
+        preparation_meal_type=MealType.DINNER,
+        food="beans",
+        total_portions=2,
+        remaining_portions=1,
+        state=BatchLedgerState.AVAILABLE,
+        week_end=date(2026, 8, 23),
+    )
+    with pytest.raises(ValidationError):
+        WeeklyBatchLedger(
+            iso_week="2026-W34",
+            entries=[
+                entry.model_copy(update={"preparation_date": date(2026, 8, 24)})
+            ],
+        )
+
+
+def test_weekly_batch_ledger_is_bounded() -> None:
+    """A ledger cannot grow without bound in a persisted user item."""
+    entry = BatchLedgerEntry(
+        batch_id="batch-1",
+        source_plan_id="plan-1",
+        source_request_id="request-1",
+        source_revision=1,
+        preparation_date=date(2026, 8, 19),
+        preparation_meal_type=MealType.DINNER,
+        food="beans",
+        total_portions=2,
+        remaining_portions=1,
+        state=BatchLedgerState.PROVISIONAL,
+        week_end=date(2026, 8, 23),
+    )
+    with pytest.raises(ValidationError):
+        WeeklyBatchLedger(
+            iso_week="2026-W34",
+            entries=[
+                entry.model_copy(update={"batch_id": f"batch-{i}"})
+                for i in range(21)
+            ],
+        )
+
+
+def test_raw_saved_preference_strings_and_missing_rules_are_rejected() -> None:
+    """Only confirmed typed dietary rules can enter the canonical profile."""
+    with pytest.raises(ValidationError):
+        UserProfile(name="Alex", dietary_preferences=["eggs"])
+    with pytest.raises(ValidationError):
+        UserProfile(
+            name="Alex",
+            dietary_preferences=[
+                {"id": "raw", "source_text": "eggs", "rule": None}
+            ],
+        )
 
 
 def test_preference_requirement_valid_exact_count_and_optional_scope() -> None:
@@ -95,8 +348,8 @@ def test_dietary_rule_supports_operators_strength_and_weekdays() -> None:
 def test_dietary_rule_rejects_impossible_strict_named_day_count(
     operator: RuleOperator,
 ) -> None:
-    """Reject strict counts that exceed one selected meal per named day."""
-    with pytest.raises(ValidationError, match="per named weekday"):
+    """Reject strict counts that exceed selected weekday capacity."""
+    with pytest.raises(ValidationError, match="named weekday"):
         DietaryRule(
             id="r1",
             source_text="eggs twice for breakfast on Monday and Wednesday",
@@ -104,7 +357,7 @@ def test_dietary_rule_rejects_impossible_strict_named_day_count(
             meal_type=MealType.BREAKFAST,
             weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY],
             operator=operator,
-            count=2,
+            count=3,
             strength=RuleStrength.STRICT,
         )
 
@@ -122,7 +375,7 @@ def test_dietary_rule_uses_bounded_unscoped_daily_capacity() -> None:
     )
 
     assert valid.count == 4
-    with pytest.raises(ValidationError, match="per named weekday"):
+    with pytest.raises(ValidationError, match="named weekday"):
         DietaryRule(
             id="r2",
             source_text="eggs five times on Monday",
@@ -373,6 +626,22 @@ def test_plan_generation_context_carries_bounded_preference_metadata() -> None:
     assert context.attempt == 2
     assert context.repair_feedback is not None
     assert context.repair_id == "repair-123"
+
+
+def test_plan_generation_context_carries_typed_batch_rules() -> None:
+    """Planner events preserve confirmed batch rules independently."""
+    rule = BatchRule(
+        id="batch-1",
+        source_text="cook chicken for two dinners",
+        foods_any_of=["chicken"],
+        preparation_meal_types=[MealType.DINNER],
+        reuse_meal_types=[MealType.DINNER],
+        total_yield=2,
+    )
+
+    context = PlanGenerationContext(batch_rules=[rule])
+
+    assert context.batch_rules == [rule]
 
 
 @pytest.mark.parametrize(
@@ -1289,6 +1558,36 @@ def test_user_profile_defaults() -> None:
     assert profile.people_count == 1
 
 
+def test_user_profile_batch_rules_round_trip_and_bounded() -> None:
+    """Batch rules default safely and round-trip as bounded typed data."""
+    historical = UserProfile(name="Historical")
+    assert historical.batch_rules == []
+
+    rule = BatchRule(
+        id="provider-batch",
+        source_text="cook chicken for two dinners",
+        foods_any_of=["chicken"],
+        preparation_meal_types=[MealType.DINNER],
+        reuse_meal_types=[MealType.DINNER],
+        total_yield=2,
+    )
+    profile = UserProfile(name="Current", batch_rules=[rule])
+    restored = UserProfile.model_validate(profile.model_dump(mode="json"))
+    assert restored.batch_rules == [rule]
+
+    with pytest.raises(ValidationError):
+        UserProfile.model_validate(
+            {"name": "Malformed", "batch_rules": [{"id": "bad"}]}
+        )
+    with pytest.raises(ValidationError):
+        UserProfile.model_validate(
+            {
+                "name": "Oversized",
+                "batch_rules": [rule.model_dump(mode="json")] * 21,
+            }
+        )
+
+
 def test_user_profile_full() -> None:
     """Test UserProfile model with full data."""
     member = FamilyMember(name="Bob", calorie_target=2200)
@@ -1299,7 +1598,19 @@ def test_user_profile_full() -> None:
             FamilyMember(name="Jane Doe", calorie_target=1800),
         ],
         dietary_constraints=["peanuts", "gluten-free"],
-        dietary_preferences=["keto"],
+        dietary_preferences=[
+            DietaryPreferenceEntry(
+                id="keto",
+                source_text="keto",
+                rule=DietaryRule(
+                    id="keto",
+                    source_text="keto",
+                    foods_any_of=["vegetables"],
+                    operator=RuleOperator.AT_LEAST,
+                    count=1,
+                ),
+            )
+        ],
         goals=["weight-loss"],  # legacy input is intentionally discarded
         people_count=2,
     )
@@ -1521,7 +1832,7 @@ def test_profile_update_normalizes_field_specific_no_value_phrases(
     "field",
     ["dietary_constraints", "dietary_preferences"],
 )
-@pytest.mark.parametrize("value", [None, [], ["peanuts"]])
+@pytest.mark.parametrize("value", [None, []])
 def test_profile_update_preserves_none_and_lists(
     field: str, value: object
 ) -> None:
@@ -1533,6 +1844,14 @@ def test_profile_update_preserves_none_and_lists(
         assert actual == value
     else:
         assert [entry.source_text for entry in actual] == value
+
+
+def test_profile_update_rejects_raw_dietary_preference_lists() -> None:
+    """Profile updates cannot persist unconfirmed preference prose."""
+    with pytest.raises(ValidationError):
+        ProfileUpdateEntities.model_validate(
+            {"dietary_preferences": ["peanuts"]}
+        )
 
 
 @pytest.mark.parametrize(

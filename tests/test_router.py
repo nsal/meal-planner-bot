@@ -10,6 +10,7 @@ from uuid import UUID
 import pytest
 
 from meal_planner.models.schemas import (
+    BatchMealRole,
     MealOutcome,
     MealType,
     ProfileEditCategory,
@@ -317,6 +318,25 @@ def test_parse_meal_callback_accepts_all_actions(action: str) -> None:
     assert callback.action is MealCallbackAction(action)
     assert callback.submission_id == submission_id
     assert UUID(callback.submission_id)
+
+
+def test_parse_batch_meal_confirmation_callback_is_bounded_and_typed() -> None:
+    callback = parse_meal_callback(
+        "meal:confirm:123e4567-e89b-12d3-a456-426614174000:preparation"
+    )
+
+    assert callback is not None
+    assert callback.action is MealCallbackAction.CONFIRM
+    assert callback.batch_role is BatchMealRole.PREPARATION
+
+
+def test_parse_batch_role_is_rejected_for_non_confirmation_callbacks() -> None:
+    assert (
+        parse_meal_callback(
+            "meal:add:123e4567-e89b-12d3-a456-426614174000:leftover"
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(

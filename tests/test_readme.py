@@ -122,6 +122,74 @@ def test_readme_documents_two_field_priority_and_safe_confirmation() -> None:
     assert "never saves or displays a failing candidate" in readme
 
 
+def test_readme_documents_wednesday_no_preference_safety_boundary() -> None:
+    """Keep the regression workflow's safety and evidence boundary visible."""
+    readme = _normalized_readme().lower()
+
+    assert "`1, no preference`" in readme
+    assert "saved family profile is never changed" in readme
+    assert "actual meals" in readme
+    assert "historical" in readme
+    assert "malformed saved rules fail closed and block `/plan`" in readme
+
+
+def test_readme_documents_profile_calendar_and_batch_boundaries() -> None:
+    """Document the application-owned dietary scheduling boundaries."""
+    readme = _normalized_readme().lower()
+
+    assert "only `/profile` interprets dietary text for saved rules" in readme
+    assert "/plan` never reinterprets saved dietary text" in readme
+    assert "iso-week quotas" in readme
+    assert "submitted meal history before each weekly segment" in readme
+    assert "draft or confirmed plan meals do not count as evidence" in readme
+    assert "explicit weekdays remain exact" in readme
+    assert "monday-anchored, evenly spaced target weekdays" in readme
+    assert "2 or 3 total lunch/dinner portions" in readme
+    assert "remaining portions become available" in readme
+    assert "consumes exactly one portion" in readme
+    assert "provisional reservations" in readme
+    assert "expire after the preparation date" in readme
+    assert "expire at the iso-week boundary" in readme
+
+
+def test_readme_documents_exact_plan_retry_snapshot_semantics() -> None:
+    """Document the bounded repair and retry snapshot contract."""
+    readme = _normalized_readme().lower()
+
+    assert "one whole-plan provider request" in readme
+    assert "one automatic repair in a fresh asynchronous invocation" in readme
+    assert (
+        "same immutable horizon, evidence, obligation, and batch snapshot"
+        in (readme)
+    )
+    assert "if the repair also fails, no draft is saved or displayed" in readme
+    assert "the previous draft remains unchanged" in readme
+    assert "the saved preference is retained" in readme
+    assert "a manual `/plan` retry reuses that snapshot" in readme
+
+
+def test_prompt_documentation_covers_planner_json_and_owned_validation() -> (
+    None
+):
+    """Keep the prompt reference aligned with the planner JSON contract."""
+    prompt = " ".join(_read_prompt_documentation().split()).lower()
+
+    assert '"batch_link"' in prompt
+    assert '"batch_id"' in prompt
+    assert '"source_date"' in prompt
+    assert '"source_meal_type"' in prompt
+    assert '"portion"' in prompt
+    assert '"total_yield"' in prompt
+    assert "application-owned `batch_id`" in prompt
+    assert "horizon obligations" in prompt
+    assert "exact listed dates" in prompt
+    assert (
+        "application validates constraints, obligations, and batch links"
+        in (prompt)
+    )
+    assert "model response is not proof of compliance" in prompt
+
+
 def test_readme_documents_rule_strength_override_and_validation_limits() -> (
     None
 ):

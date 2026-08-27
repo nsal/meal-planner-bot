@@ -1,5 +1,6 @@
 """DynamoDB repository integration tests."""
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from threading import Barrier
@@ -10,13 +11,18 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 from moto import mock_aws
+from pydantic import ValidationError
 
 from meal_planner.bot_handler import BotHandler
 from meal_planner.db.dynamo import (
     DynamoRepository,
     RepairPublicationOutcome,
+    TransactionConflictKind,
 )
 from meal_planner.models.schemas import (
+    BatchLedgerEntry,
+    BatchLedgerState,
+    BatchMealRole,
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
@@ -26,12 +32,16 @@ from meal_planner.models.schemas import (
     MealLogDraft,
     MealLogEntry,
     MealOutcome,
+    MealType,
+    PlannedBatchLink,
     PlanStatus,
     ProfileEditCategory,
     ProfileEditOperation,
     ProfileUpdateEntities,
     RuleOperator,
+    SubmittedMealBatchLink,
     UserProfile,
+    WeeklyBatchLedger,
     canonicalize_profile_rule_ids,
 )
 from meal_planner.router import RouteResult, RouteType
@@ -117,7 +127,7 @@ def test_canonical_profile_round_trip_discards_goals_on_read_and_write(
     assert "goals" not in item
 
 
-def test_legacy_profile_entries_are_normalized_without_retaining_goals(
+def test_malformed_legacy_profile_entries_are_rejected(
     repo: DynamoRepository,
 ) -> None:
     """Raw legacy entries remain visible as deterministic canonical entries."""
@@ -129,16 +139,8 @@ def test_legacy_profile_entries_are_normalized_without_retaining_goals(
         }
     )
 
-    profile = repo.get_profile("user")
-    assert profile is not None
-    assert profile.dietary_constraints[0].source_text == "Peanuts"
-    assert profile.dietary_preferences[0].source_text == "More vegetables"
-    repo.save_profile("user", profile, expected_revision=0)
-
-    item = repo.table.get_item(Key={"PK": "USER#user", "SK": "PROFILE"})["Item"]
-    assert item["dietary_constraints"][0]["source_text"] == "Peanuts"
-    assert item["dietary_preferences"][0]["source_text"] == ("More vegetables")
-    assert "goals" not in item
+    with pytest.raises(ValidationError):
+        repo.get_profile("user")
 
 
 def test_profile_transaction_rejects_conflicting_preference_atomically(
@@ -1506,6 +1508,719 @@ def test_confirm_meal_atomically_writes_stable_key_and_continuation_state(
     assert saved["Item"]["description"] == "Soup"
 
 
+def _batch_submission_fixture(
+    *,
+    state: ConversationState,
+    role: str,
+    ledger_state: BatchLedgerState,
+    remaining: int,
+    ledger_revision: int = 0,
+    portion: int = 2,
+    total_portions: int = 2,
+) -> tuple[ConversationState, MealLogEntry, WeeklyBatchLedger]:
+    if role == "preparation":
+        meal_date = date(2026, 8, 8)
+        meal_type = MealType.DINNER
+        batch_link = SubmittedMealBatchLink(
+            batch_id="batch-1", role=role, portion=1
+        )
+    else:
+        meal_date = date(2026, 8, 9)
+        meal_type = MealType.DINNER
+        batch_link = SubmittedMealBatchLink(
+            batch_id="batch-1",
+            role=role,
+            portion=portion,
+            source_date=date(2026, 8, 8),
+            source_meal_type=MealType.DINNER,
+        )
+    entry = MealLogEntry(
+        date=meal_date,
+        meal_type=meal_type,
+        description="roast chicken",
+        created_at=datetime(2026, 8, 8, 12, tzinfo=timezone.utc),
+        batch_link=batch_link,
+    )
+    continuation = state.model_copy(
+        update={
+            "step": ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
+            "revision": state.revision + 1,
+            "updated_at": state.updated_at + timedelta(seconds=1),
+            "pending_batch_link": None,
+        }
+    )
+    ledger = WeeklyBatchLedger(
+        iso_week="2026-W32",
+        revision=ledger_revision,
+        entries=[
+            BatchLedgerEntry(
+                batch_id="batch-1",
+                source_plan_id="plan-2026-08-03",
+                source_request_id="request-1",
+                source_revision=1,
+                preparation_date=date(2026, 8, 8),
+                preparation_meal_type=MealType.DINNER,
+                food="chicken",
+                meal_name="Roast chicken",
+                total_portions=total_portions,
+                remaining_portions=remaining,
+                state=ledger_state,
+                week_end=date(2026, 8, 9),
+            )
+        ],
+    )
+    return continuation, entry, ledger
+
+
+def test_confirm_meal_activates_preparation_and_writes_marker_atomically(
+    repo: DynamoRepository,
+) -> None:
+    review = _review_meal_state().model_copy(
+        update={
+            "meal_draft": MealLogDraft(
+                date=date(2026, 8, 8),
+                meal_type=MealType.DINNER,
+                description="roast chicken",
+            ),
+            "pending_batch_link": PlannedBatchLink(
+                batch_id="batch-1", role="preparation", total_yield=2
+            ),
+        }
+    )
+    continuation, entry, ledger = _batch_submission_fixture(
+        state=review,
+        role="preparation",
+        ledger_state=BatchLedgerState.PROVISIONAL,
+        remaining=1,
+    )
+    assert repo.save_conversation_state("user", review)
+    repo.put_weekly_batch_ledger("user", ledger)
+
+    assert repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        continuation,
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+    )
+
+    saved = repo.get_weekly_batch_ledger("user", "2026-W32")
+    assert saved.revision == 1
+    assert saved.entries[0].state is BatchLedgerState.AVAILABLE
+    assert saved.entries[0].remaining_portions == 1
+    assert repo.table.get_item(
+        Key={"PK": "USER#user", "SK": f"MEAL_UPDATE#{review.request_id}"}
+    ).get("Item")
+
+
+@pytest.mark.parametrize("materialize_expiry", [False, True])
+def test_late_preparation_activation_is_rejected_before_or_after_expiry_read(
+    repo: DynamoRepository, materialize_expiry: bool
+) -> None:
+    """A Friday source cannot activate during Saturday processing."""
+    preparation_date = date(2026, 8, 7)
+    processing_date = date(2026, 8, 8)
+    review = _review_meal_state().model_copy(
+        update={
+            "meal_draft": MealLogDraft(
+                date=preparation_date,
+                meal_type=MealType.DINNER,
+                description="roast chicken",
+            ),
+            "pending_batch_link": PlannedBatchLink(
+                batch_id="batch-1", role="preparation", total_yield=2
+            ),
+        }
+    )
+    continuation, entry, ledger = _batch_submission_fixture(
+        state=review,
+        role="preparation",
+        ledger_state=BatchLedgerState.PROVISIONAL,
+        remaining=1,
+    )
+    entry = entry.model_copy(
+        update={
+            "date": preparation_date,
+            "created_at": datetime(2026, 8, 7, 12, tzinfo=timezone.utc),
+        }
+    )
+    ledger = ledger.model_copy(
+        update={
+            "iso_week": "2026-W32",
+            "entries": [
+                ledger.entries[0].model_copy(
+                    update={
+                        "preparation_date": preparation_date,
+                        "week_end": date(2026, 8, 9),
+                    }
+                )
+            ],
+        }
+    )
+    assert repo.save_conversation_state("user", review)
+    repo.put_weekly_batch_ledger("user", ledger)
+
+    if materialize_expiry:
+        expired = repo.get_weekly_batch_ledger(
+            "user", "2026-W32", as_of=processing_date
+        )
+        assert expired.entries[0].state is BatchLedgerState.EXPIRED
+
+    assert not repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        continuation,
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+        processing_date=processing_date,
+    )
+    assert repo.get_conversation_state("user") == review
+    assert repo.get_meal_history("user", days=2, on_date=processing_date) == []
+    saved = repo.get_weekly_batch_ledger("user", "2026-W32").entries[0]
+    assert saved.state is (
+        BatchLedgerState.EXPIRED
+        if materialize_expiry
+        else BatchLedgerState.PROVISIONAL
+    )
+    assert saved.remaining_portions == (0 if materialize_expiry else 1)
+
+
+@pytest.mark.parametrize(
+    ("preparation_date", "processing_date", "expected"),
+    [
+        (date(2026, 8, 7), date(2026, 8, 7), True),
+        (date(2026, 8, 7), date(2026, 8, 8), False),
+        (date(2026, 8, 9), date(2026, 8, 9), True),
+        (date(2026, 8, 9), date(2026, 8, 10), False),
+    ],
+)
+def test_preparation_activation_requires_processing_on_source_day_and_week(
+    repo: DynamoRepository,
+    preparation_date: date,
+    processing_date: date,
+    expected: bool,
+) -> None:
+    """Activation is bounded to the source preparation day and ISO week."""
+    iso = preparation_date.isocalendar()
+    iso_week = f"{iso.year:04d}-W{iso.week:02d}"
+    week_end = date.fromisocalendar(iso.year, iso.week, 7)
+    review = _review_meal_state().model_copy(
+        update={
+            "meal_draft": MealLogDraft(
+                date=preparation_date,
+                meal_type=MealType.DINNER,
+                description="roast chicken",
+            ),
+            "pending_batch_link": PlannedBatchLink(
+                batch_id="batch-1", role="preparation", total_yield=2
+            ),
+        }
+    )
+    continuation = _continuation_meal_state(review)
+    entry = MealLogEntry(
+        date=preparation_date,
+        meal_type=MealType.DINNER,
+        description="roast chicken",
+        created_at=datetime.combine(
+            preparation_date, datetime.min.time(), tzinfo=timezone.utc
+        ),
+        batch_link=SubmittedMealBatchLink(
+            batch_id="batch-1", role=BatchMealRole.PREPARATION
+        ),
+    )
+    ledger = WeeklyBatchLedger(
+        iso_week=iso_week,
+        entries=[
+            BatchLedgerEntry(
+                batch_id="batch-1",
+                source_plan_id="plan-1",
+                source_request_id="request-1",
+                source_revision=1,
+                preparation_date=preparation_date,
+                preparation_meal_type=MealType.DINNER,
+                food="chicken",
+                total_portions=2,
+                remaining_portions=1,
+                state=BatchLedgerState.PROVISIONAL,
+                week_end=week_end,
+            )
+        ],
+    )
+    assert repo.save_conversation_state("user", review)
+    repo.put_weekly_batch_ledger("user", ledger)
+
+    result = repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        continuation,
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+        processing_date=processing_date,
+    )
+    assert result is expected
+
+
+def test_confirm_meal_consumes_one_leftover_portion_atomically(
+    repo: DynamoRepository,
+) -> None:
+    review = _review_meal_state().model_copy(
+        update={
+            "meal_draft": MealLogDraft(
+                date=date(2026, 8, 9),
+                meal_type=MealType.DINNER,
+                description="roast chicken",
+            ),
+            "pending_batch_link": PlannedBatchLink(
+                batch_id="batch-1",
+                role="leftover",
+                source_date=date(2026, 8, 8),
+                source_meal_type=MealType.DINNER,
+                portion=2,
+            ),
+        }
+    )
+    continuation, entry, ledger = _batch_submission_fixture(
+        state=review,
+        role="leftover",
+        ledger_state=BatchLedgerState.AVAILABLE,
+        remaining=1,
+    )
+    assert repo.save_conversation_state("user", review)
+    repo.put_weekly_batch_ledger("user", ledger)
+
+    assert repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        continuation,
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+    )
+
+    consumed = repo.get_weekly_batch_ledger("user", "2026-W32").entries[0]
+    assert consumed.state is BatchLedgerState.EXHAUSTED
+    assert consumed.remaining_portions == 0
+
+
+@pytest.mark.parametrize(
+    ("total", "remaining", "portion"),
+    [(2, 1, 2), (3, 2, 2), (3, 1, 3)],
+)
+def test_confirm_meal_accepts_each_canonical_available_portion(
+    repo: DynamoRepository, total: int, remaining: int, portion: int
+) -> None:
+    """Submission accepts only the next canonical available ordinal."""
+    review = _review_meal_state().model_copy(
+        update={
+            "meal_draft": MealLogDraft(
+                date=date(2026, 8, 9),
+                meal_type=MealType.DINNER,
+                description="roast chicken",
+            ),
+            "pending_batch_link": PlannedBatchLink(
+                batch_id="batch-1",
+                role="leftover",
+                source_date=date(2026, 8, 8),
+                source_meal_type=MealType.DINNER,
+                portion=portion,
+            ),
+        }
+    )
+    continuation, entry, ledger = _batch_submission_fixture(
+        state=review,
+        role="leftover",
+        ledger_state=BatchLedgerState.AVAILABLE,
+        remaining=remaining,
+        portion=portion,
+        total_portions=total,
+    )
+    assert repo.save_conversation_state("user", review)
+    repo.put_weekly_batch_ledger("user", ledger)
+
+    assert repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        continuation,
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+    )
+
+    saved = repo.get_weekly_batch_ledger("user", "2026-W32").entries[0]
+    assert saved.remaining_portions == remaining - 1
+
+
+def test_confirm_meal_consumes_three_portions_in_order_without_replay(
+    repo: DynamoRepository,
+) -> None:
+    """Distinct submissions claim leftover ordinals in durable order."""
+    batch = BatchLedgerEntry(
+        batch_id="ordered-batch",
+        source_plan_id="plan-2026-08-03",
+        source_request_id="request-1",
+        source_revision=1,
+        preparation_date=date(2026, 8, 8),
+        preparation_meal_type=MealType.DINNER,
+        food="chicken",
+        meal_name="Roast chicken",
+        total_portions=3,
+        remaining_portions=2,
+        state=BatchLedgerState.AVAILABLE,
+        week_end=date(2026, 8, 9),
+    )
+    repo.put_weekly_batch_ledger(
+        "user",
+        WeeklyBatchLedger(iso_week="2026-W32", revision=7, entries=[batch]),
+    )
+
+    def review(
+        request_id: str, revision: int, portion: int
+    ) -> ConversationState:
+        state = _review_meal_state(request_id=request_id, revision=revision)
+        return state.model_copy(
+            update={
+                "meal_draft": MealLogDraft(
+                    date=date(2026, 8, 9),
+                    meal_type=MealType.DINNER,
+                    description=f"portion {portion}",
+                )
+            }
+        )
+
+    def submitted(
+        review_state: ConversationState, portion: int
+    ) -> MealLogEntry:
+        return MealLogEntry(
+            date=date(2026, 8, 9),
+            meal_type=MealType.DINNER,
+            description=f"portion {portion}",
+            created_at=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
+            batch_link=SubmittedMealBatchLink(
+                batch_id="ordered-batch",
+                role=BatchMealRole.LEFTOVER,
+                source_date=date(2026, 8, 8),
+                source_meal_type=MealType.DINNER,
+                portion=portion,
+            ),
+        )
+
+    def marker(request_id: str) -> dict[str, Any] | None:
+        return repo.table.get_item(
+            Key={"PK": "USER#user", "SK": f"MEAL_UPDATE#{request_id}"}
+        ).get("Item")
+
+    def assert_snapshot(
+        expected_state: ConversationState,
+        *,
+        revision: int,
+        remaining: int,
+        meal_count: int,
+        request_id: str,
+        marker_present: bool,
+    ) -> None:
+        saved = repo.get_weekly_batch_ledger("user", "2026-W32")
+        assert saved.revision == revision
+        assert saved.entries[0].remaining_portions == remaining
+        assert saved.entries[0].state is (
+            BatchLedgerState.EXHAUSTED
+            if remaining == 0
+            else BatchLedgerState.AVAILABLE
+        )
+        assert (
+            len(
+                repo.get_submitted_meals(
+                    "user",
+                    start_date=date(2026, 8, 8),
+                    end_date=date(2026, 8, 9),
+                )
+            )
+            == meal_count
+        )
+        assert repo.get_conversation_state("user") == expected_state
+        assert (marker(request_id) is not None) is marker_present
+
+    early = review("123e4567-e89b-12d3-a456-426614174001", 0, 3)
+    assert repo.save_conversation_state("user", early)
+    assert not repo.confirm_meal_and_transition(
+        "user",
+        submitted(early, 3),
+        _continuation_meal_state(early),
+        expected_revision=early.revision,
+        submission_id=early.request_id or "",
+    )
+    assert_snapshot(
+        early,
+        revision=7,
+        remaining=2,
+        meal_count=0,
+        request_id=early.request_id or "",
+        marker_present=False,
+    )
+
+    second = review("123e4567-e89b-12d3-a456-426614174002", 0, 2)
+    assert repo.save_conversation_state(
+        "user", second, expected_revision=early.revision
+    )
+    assert repo.confirm_meal_and_transition(
+        "user",
+        submitted(second, 2),
+        _continuation_meal_state(second),
+        expected_revision=second.revision,
+        submission_id=second.request_id or "",
+    )
+    second_saved = _continuation_meal_state(second)
+    assert_snapshot(
+        second_saved,
+        revision=8,
+        remaining=1,
+        meal_count=1,
+        request_id=second.request_id or "",
+        marker_present=True,
+    )
+
+    third = review("123e4567-e89b-12d3-a456-426614174003", 1, 3)
+    assert repo.save_conversation_state(
+        "user", third, expected_revision=second_saved.revision
+    )
+    assert repo.confirm_meal_and_transition(
+        "user",
+        submitted(third, 3),
+        _continuation_meal_state(third),
+        expected_revision=third.revision,
+        submission_id=third.request_id or "",
+    )
+    third_saved = _continuation_meal_state(third)
+    assert_snapshot(
+        third_saved,
+        revision=9,
+        remaining=0,
+        meal_count=2,
+        request_id=third.request_id or "",
+        marker_present=True,
+    )
+
+    replay = review("123e4567-e89b-12d3-a456-426614174004", 2, 3)
+    assert repo.save_conversation_state(
+        "user", replay, expected_revision=third_saved.revision
+    )
+    assert not repo.confirm_meal_and_transition(
+        "user",
+        submitted(replay, 3),
+        _continuation_meal_state(replay),
+        expected_revision=replay.revision,
+        submission_id=replay.request_id or "",
+    )
+    assert_snapshot(
+        replay,
+        revision=9,
+        remaining=0,
+        meal_count=2,
+        request_id=replay.request_id or "",
+        marker_present=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_date", date(2026, 8, 7)),
+        ("source_meal_type", MealType.LUNCH),
+    ],
+)
+def test_leftover_rejects_wrong_source_metadata_without_mutation(
+    repo: DynamoRepository, field: str, value: Any
+) -> None:
+    """Wrong source metadata cannot consume inventory or workflow state."""
+    review, entry, ledger = _batch_submission_fixture(
+        state=_review_meal_state(),
+        role="leftover",
+        ledger_state=BatchLedgerState.AVAILABLE,
+        remaining=1,
+    )
+    assert repo.save_conversation_state("user", review)
+    repo.put_weekly_batch_ledger("user", ledger)
+    assert entry.batch_link is not None
+    entry = entry.model_copy(
+        update={
+            "batch_link": entry.batch_link.model_copy(update={field: value})
+        }
+    )
+
+    assert not repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        _continuation_meal_state(review),
+        expected_revision=review.revision,
+        submission_id=review.request_id or "",
+    )
+    assert repo.get_conversation_state("user") == review
+    assert repo.get_meal_history("user", days=2, on_date=date(2026, 8, 9)) == []
+    saved = repo.get_weekly_batch_ledger("user", "2026-W32")
+    assert saved.revision == ledger.revision
+    assert saved.entries == ledger.entries
+    assert (
+        repo.table.get_item(
+            Key={"PK": "USER#user", "SK": f"MEAL_UPDATE#{review.request_id}"}
+        ).get("Item")
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("total", "remaining", "portion"),
+    [(3, 1, 2), (2, 1, 3)],
+)
+def test_confirm_meal_rejects_portions_outside_canonical_range(
+    repo: DynamoRepository, total: int, remaining: int, portion: int
+) -> None:
+    """Submission rejects consumed and out-of-range portion ordinals."""
+    review = _review_meal_state().model_copy(
+        update={
+            "meal_draft": MealLogDraft(
+                date=date(2026, 8, 9),
+                meal_type=MealType.DINNER,
+                description="roast chicken",
+            ),
+            "pending_batch_link": PlannedBatchLink(
+                batch_id="batch-1",
+                role="leftover",
+                source_date=date(2026, 8, 8),
+                source_meal_type=MealType.DINNER,
+                portion=portion,
+            ),
+        }
+    )
+    continuation, entry, ledger = _batch_submission_fixture(
+        state=review,
+        role="leftover",
+        ledger_state=BatchLedgerState.AVAILABLE,
+        remaining=remaining,
+        portion=portion,
+        total_portions=total,
+    )
+    assert repo.save_conversation_state("user", review)
+    repo.put_weekly_batch_ledger("user", ledger)
+
+    assert not repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        continuation,
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+    )
+
+    assert repo.get_conversation_state("user") == review
+    saved = repo.get_weekly_batch_ledger("user", "2026-W32").entries[0]
+    assert saved.remaining_portions == remaining
+
+
+@pytest.mark.parametrize(
+    ("role", "ledger_state", "remaining", "expected_ledger_revision"),
+    [
+        ("preparation", BatchLedgerState.AVAILABLE, 1, None),
+        ("leftover", BatchLedgerState.EXHAUSTED, 0, None),
+        ("leftover", BatchLedgerState.PROVISIONAL, 1, None),
+        ("preparation", BatchLedgerState.PROVISIONAL, 1, 1),
+    ],
+)
+def test_batch_confirmation_rejects_insufficient_wrong_or_stale_inventory(
+    repo: DynamoRepository,
+    role: str,
+    ledger_state: BatchLedgerState,
+    remaining: int,
+    expected_ledger_revision: int | None,
+) -> None:
+    review = _review_meal_state().model_copy(
+        update={
+            "meal_draft": MealLogDraft(
+                date=date(2026, 8, 8 if role == "preparation" else 9),
+                meal_type=MealType.DINNER,
+                description="roast chicken",
+            ),
+            "pending_batch_link": PlannedBatchLink(
+                batch_id="batch-1",
+                role=role,
+                **(
+                    {}
+                    if role == "preparation"
+                    else {
+                        "source_date": date(2026, 8, 8),
+                        "source_meal_type": MealType.DINNER,
+                        "portion": 2,
+                    }
+                ),
+            ),
+        }
+    )
+    continuation, entry, ledger = _batch_submission_fixture(
+        state=review,
+        role=role,
+        ledger_state=ledger_state,
+        remaining=remaining,
+    )
+    assert repo.save_conversation_state("user", review)
+    repo.put_weekly_batch_ledger("user", ledger)
+
+    assert not repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        continuation,
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+        expected_ledger_revision=expected_ledger_revision,
+    )
+    assert repo.get_conversation_state("user") == review
+    assert repo.get_meal_history("user", days=2, on_date=date(2026, 8, 9)) == []
+    assert (
+        repo.get_weekly_batch_ledger("user", "2026-W32").entries[0].state
+        is ledger_state
+    )
+
+
+def test_duplicate_batch_confirmation_does_not_consume_another_portion(
+    repo: DynamoRepository,
+) -> None:
+    review = _review_meal_state().model_copy(
+        update={
+            "meal_draft": MealLogDraft(
+                date=date(2026, 8, 8),
+                meal_type=MealType.DINNER,
+                description="roast chicken",
+            ),
+            "pending_batch_link": PlannedBatchLink(
+                batch_id="batch-1", role="preparation"
+            ),
+        }
+    )
+    continuation, entry, ledger = _batch_submission_fixture(
+        state=review,
+        role="preparation",
+        ledger_state=BatchLedgerState.PROVISIONAL,
+        remaining=1,
+    )
+    assert repo.save_conversation_state("user", review)
+    repo.put_weekly_batch_ledger("user", ledger)
+    assert repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        continuation,
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+    )
+
+    assert not repo.confirm_meal_and_transition(
+        "user",
+        entry,
+        continuation,
+        expected_revision=review.revision,
+        submission_id=review.request_id,
+    )
+    assert (
+        repo.get_weekly_batch_ledger("user", "2026-W32")
+        .entries[0]
+        .remaining_portions
+        == 1
+    )
+
+
 def test_confirm_meal_rejects_duplicate_submission_without_state_change(
     repo: DynamoRepository,
 ) -> None:
@@ -1953,6 +2668,1195 @@ def test_meal_history_paginates_and_skips_malformed_items(mocker: Any) -> None:
     assert table.query.call_count == 2
 
 
+def test_bounded_week_range_query_returns_only_submitted_meals_and_is_inclusive(
+    repo: DynamoRepository,
+) -> None:
+    """The scheduler query cannot accidentally read plans or other weeks."""
+    before = _meal(2, 8, "before")
+    inside = _meal(3, 8, "inside")
+    after = _meal(10, 8, "after")
+    repo.log_meal("user", before)
+    repo.log_meal("user", inside)
+    repo.log_meal("user", after)
+    repo.save_plan("user", make_plan(week_start=date(2026, 8, 3)))
+
+    history = repo.get_submitted_meals(
+        "user", start_date=date(2026, 8, 3), end_date=date(2026, 8, 9)
+    )
+
+    assert [entry.description for entry in history] == ["inside"]
+
+
+def test_bounded_week_range_query_rejects_unbounded_ranges(
+    repo: DynamoRepository,
+) -> None:
+    """Range reads stay bounded to the two ISO weeks a seven-day plan needs."""
+    with pytest.raises(ValueError, match="at most 14 days"):
+        repo.get_submitted_meals(
+            "user",
+            start_date=date(2026, 8, 1),
+            end_date=date(2026, 8, 20),
+        )
+
+
+def test_weekly_batch_ledger_empty_read_is_exact_and_bounded(
+    mocker: Any,
+) -> None:
+    """An absent week returns an empty ledger without a partition scan."""
+    table = mocker.MagicMock()
+    table.get_item.return_value = {}
+    repo = DynamoRepository(table)
+    ledger = repo.get_weekly_batch_ledger("user", "2026-W34")
+
+    assert ledger == WeeklyBatchLedger(iso_week="2026-W34")
+    table.get_item.assert_called_once_with(
+        Key={"PK": "USER#user", "SK": "BATCH_LEDGER#2026-W34"}
+    )
+    table.scan.assert_not_called()
+    table.query.assert_not_called()
+
+
+def test_weekly_batch_ledger_round_trip_is_bounded_and_selects_available(
+    repo: DynamoRepository,
+) -> None:
+    """Weekly entries round-trip and only eligible available portions select."""
+    available = BatchLedgerEntry(
+        batch_id="available-batch",
+        source_plan_id="plan-1",
+        source_request_id="request-1",
+        source_revision=1,
+        preparation_date=date(2026, 8, 19),
+        preparation_meal_type=MealType.DINNER,
+        food="chicken",
+        meal_name="Roast chicken",
+        total_portions=3,
+        remaining_portions=2,
+        state=BatchLedgerState.AVAILABLE,
+        week_end=date(2026, 8, 23),
+    )
+    not_ready = available.model_copy(
+        update={
+            "batch_id": "provisional-batch",
+            "state": BatchLedgerState.PROVISIONAL,
+        }
+    )
+    repo.put_weekly_batch_ledger(
+        "user",
+        WeeklyBatchLedger(iso_week="2026-W34", entries=[available, not_ready]),
+    )
+
+    loaded = repo.get_weekly_batch_ledger("user", "2026-W34")
+    selected = repo.get_available_batch_portions(
+        "user", date(2026, 8, 21), meal_type=MealType.LUNCH
+    )
+
+    assert loaded.entries == [available, not_ready]
+    assert [entry.batch_id for entry in selected] == ["available-batch"]
+
+
+def test_weekly_batch_ledger_expires_provisional_sources_and_week_remainders(
+    repo: DynamoRepository,
+) -> None:
+    """Preparation-day and Sunday expiry do not leave usable portions."""
+    provisional = BatchLedgerEntry(
+        batch_id="unsubmitted",
+        source_plan_id="plan-1",
+        source_request_id="request-1",
+        source_revision=1,
+        preparation_date=date(2026, 8, 21),
+        preparation_meal_type=MealType.DINNER,
+        food="beans",
+        total_portions=2,
+        remaining_portions=1,
+        state=BatchLedgerState.PROVISIONAL,
+        week_end=date(2026, 8, 23),
+    )
+    available = provisional.model_copy(
+        update={
+            "batch_id": "submitted-source",
+            "preparation_date": date(2026, 8, 20),
+            "state": BatchLedgerState.AVAILABLE,
+        }
+    )
+    repo.put_weekly_batch_ledger(
+        "user",
+        WeeklyBatchLedger(
+            iso_week="2026-W34", entries=[provisional, available]
+        ),
+    )
+
+    before_week_end = repo.get_weekly_batch_ledger(
+        "user", "2026-W34", as_of=date(2026, 8, 22)
+    )
+    after_week_end = repo.get_weekly_batch_ledger(
+        "user", "2026-W34", as_of=date(2026, 8, 24)
+    )
+
+    assert before_week_end.entries[0].state is BatchLedgerState.EXPIRED
+    assert before_week_end.entries[0].remaining_portions == 0
+    assert after_week_end.entries[0].state is BatchLedgerState.EXPIRED
+    assert after_week_end.entries[0].remaining_portions == 0
+    assert after_week_end.entries[1].state is BatchLedgerState.EXPIRED
+    assert after_week_end.entries[1].remaining_portions == 0
+
+
+def test_expiry_materialization_advances_the_ledger_revision(
+    repo: DynamoRepository,
+) -> None:
+    """Materialized expiry must never reset a nonzero ledger revision."""
+    entry = _batch_entry_for_test(
+        "expiring",
+        date(2026, 8, 3),
+        0,
+        state=BatchLedgerState.AVAILABLE,
+    )
+    original = WeeklyBatchLedger(
+        iso_week="2026-W32", revision=7, entries=[entry]
+    )
+    repo.put_weekly_batch_ledger("user", original)
+
+    materialized = repo.get_weekly_batch_ledger(
+        "user", "2026-W32", as_of=date(2026, 8, 10)
+    )
+
+    assert materialized.revision == 8
+    assert repo.get_weekly_batch_ledger("user", "2026-W32").revision == 8
+
+
+def test_concurrent_expiry_loser_reloads_the_winning_ledger(
+    repo: DynamoRepository, mocker: Any
+) -> None:
+    """A conditional expiry loser returns the winner's materialized state."""
+    entry = _batch_entry_for_test(
+        "expiring",
+        date(2026, 8, 3),
+        0,
+        state=BatchLedgerState.AVAILABLE,
+    )
+    repo.put_weekly_batch_ledger(
+        "user",
+        WeeklyBatchLedger(iso_week="2026-W32", revision=4, entries=[entry]),
+    )
+    barrier = Barrier(2)
+    original_put = repo._put_weekly_batch_ledger_conditionally
+
+    def synchronized_put(*args: Any, **kwargs: Any) -> None:
+        barrier.wait()
+        original_put(*args, **kwargs)
+
+    mocker.patch.object(
+        repo,
+        "_put_weekly_batch_ledger_conditionally",
+        side_effect=synchronized_put,
+    )
+
+    def materialize() -> WeeklyBatchLedger:
+        return repo.get_weekly_batch_ledger(
+            "user", "2026-W32", as_of=date(2026, 8, 10)
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: materialize(), range(2)))
+
+    assert results[0] == results[1]
+    assert results[0].revision == 5
+    assert results[0].entries[0].state is BatchLedgerState.EXPIRED
+    saved = repo.get_weekly_batch_ledger("user", "2026-W32")
+    assert saved == results[0]
+
+
+def test_expiry_retry_preserves_unrelated_winner_and_original_as_of(
+    repo: DynamoRepository, mocker: Any
+) -> None:
+    """A losing expiry CAS reapplies the same date to the new revision."""
+    expiring = _batch_entry_for_test(
+        "expiring", date(2026, 8, 3), 0, state=BatchLedgerState.AVAILABLE
+    )
+    unrelated = _batch_entry_for_test(
+        "unrelated", date(2026, 8, 3), 0, state=BatchLedgerState.AVAILABLE
+    )
+    original = WeeklyBatchLedger(
+        iso_week="2026-W32", revision=10, entries=[expiring, unrelated]
+    )
+    competing = original.model_copy(
+        update={
+            "revision": 11,
+            "entries": [
+                expiring,
+                unrelated.model_copy(
+                    update={
+                        "remaining_portions": 0,
+                        "state": BatchLedgerState.EXHAUSTED,
+                    }
+                ),
+            ],
+        }
+    )
+    repo.put_weekly_batch_ledger("user", original)
+    original_put = repo._put_weekly_batch_ledger_conditionally
+    calls = 0
+
+    def race_then_put(*args: Any, **kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            repo.put_weekly_batch_ledger("user", competing)
+            raise ClientError(
+                {"Error": {"Code": "ConditionalCheckFailedException"}},
+                "PutItem",
+            )
+        original_put(*args, **kwargs)
+
+    mocker.patch.object(
+        repo,
+        "_put_weekly_batch_ledger_conditionally",
+        side_effect=race_then_put,
+    )
+
+    result = repo.get_weekly_batch_ledger(
+        "user", "2026-W32", as_of=date(2026, 8, 10)
+    )
+
+    assert result.revision == 12
+    assert result.entries[0].state is BatchLedgerState.EXPIRED
+    assert result.entries[0].remaining_portions == 0
+    assert result.entries[1] == competing.entries[1]
+    assert calls == 2
+    assert repo.get_weekly_batch_ledger("user", "2026-W32") == result
+
+
+def test_expiry_loser_strongly_reloads_expiry_winner_without_rewrite(
+    repo: DynamoRepository, mocker: Any
+) -> None:
+    """An already-expired winner is returned without another revision."""
+    entry = _batch_entry_for_test(
+        "expiring", date(2026, 8, 3), 0, state=BatchLedgerState.AVAILABLE
+    )
+    original = WeeklyBatchLedger(
+        iso_week="2026-W32", revision=4, entries=[entry]
+    )
+    winner = original.model_copy(
+        update={
+            "revision": 5,
+            "entries": [
+                entry.model_copy(
+                    update={
+                        "state": BatchLedgerState.EXPIRED,
+                        "remaining_portions": 0,
+                    }
+                )
+            ],
+        }
+    )
+    repo.put_weekly_batch_ledger("user", original)
+
+    def publish_winner_then_fail(*args: Any, **kwargs: Any) -> None:
+        repo.put_weekly_batch_ledger("user", winner)
+        raise ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException"}},
+            "PutItem",
+        )
+
+    put = mocker.patch.object(
+        repo,
+        "_put_weekly_batch_ledger_conditionally",
+        side_effect=publish_winner_then_fail,
+    )
+    get_item = mocker.spy(repo.table, "get_item")
+
+    result = repo.get_weekly_batch_ledger(
+        "user", "2026-W32", as_of=date(2026, 8, 10)
+    )
+
+    assert result == winner
+    put.assert_called_once()
+    assert get_item.call_args_list[1].kwargs == {
+        "Key": repo._batch_ledger_key("user", "2026-W32"),
+        "ConsistentRead": True,
+    }
+
+
+def test_final_expiry_conflict_returns_strongly_reloaded_winner(
+    mocker: Any,
+) -> None:
+    """The final expiry conflict evaluates its already-expired winner."""
+    table = mocker.MagicMock()
+    repo = DynamoRepository(table)
+    expiring = _batch_entry_for_test(
+        "expiring", date(2026, 8, 3), 0, state=BatchLedgerState.AVAILABLE
+    )
+    unrelated = _batch_entry_for_test(
+        "unrelated", date(2026, 8, 3), 0, state=BatchLedgerState.AVAILABLE
+    )
+    original = WeeklyBatchLedger(
+        iso_week="2026-W32", revision=10, entries=[expiring, unrelated]
+    )
+    winner = original.model_copy(
+        update={
+            "revision": 42,
+            "entries": [
+                expiring.model_copy(
+                    update={
+                        "state": BatchLedgerState.EXPIRED,
+                        "remaining_portions": 0,
+                    }
+                ),
+                unrelated.model_copy(
+                    update={
+                        "state": BatchLedgerState.EXHAUSTED,
+                        "remaining_portions": 0,
+                    }
+                ),
+            ],
+        }
+    )
+
+    def raw(ledger: WeeklyBatchLedger) -> dict[str, Any]:
+        return {
+            "Item": {
+                **repo._batch_ledger_key("user", "2026-W32"),
+                **ledger.model_dump(mode="json"),
+            }
+        }
+
+    table.get_item.side_effect = [
+        raw(original),
+        raw(original),
+        raw(original),
+        raw(winner),
+    ]
+    conflict = ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException"}},
+        "PutItem",
+    )
+    put = mocker.patch.object(
+        repo,
+        "_put_weekly_batch_ledger_conditionally",
+        side_effect=conflict,
+    )
+
+    result = repo.get_weekly_batch_ledger(
+        "user", "2026-W32", as_of=date(2026, 8, 10)
+    )
+
+    assert result == winner
+    assert put.call_count == 3
+    assert table.get_item.call_count == 4
+    assert all(
+        call.kwargs
+        == {
+            "Key": repo._batch_ledger_key("user", "2026-W32"),
+            "ConsistentRead": True,
+        }
+        for call in table.get_item.call_args_list[1:]
+    )
+
+
+def test_expiry_retry_keeps_original_as_of_after_stale_reload(
+    mocker: Any,
+) -> None:
+    """Stale post-conflict data cannot be returned as a false success."""
+    table = mocker.MagicMock()
+    repo = DynamoRepository(table)
+    entry = _batch_entry_for_test(
+        "expiring", date(2026, 8, 3), 0, state=BatchLedgerState.AVAILABLE
+    )
+    original = WeeklyBatchLedger(
+        iso_week="2026-W32", revision=7, entries=[entry]
+    )
+    current = original.model_copy(update={"revision": 8})
+    responses = [original, original, current]
+    table.get_item.side_effect = [
+        {
+            "Item": {
+                **repo._batch_ledger_key("user", "2026-W32"),
+                **ledger.model_dump(mode="json"),
+            }
+        }
+        for ledger in responses
+    ]
+    conflict = ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException"}},
+        "PutItem",
+    )
+    put = mocker.patch.object(
+        repo,
+        "_put_weekly_batch_ledger_conditionally",
+        side_effect=[conflict, conflict, None],
+    )
+
+    result = repo.get_weekly_batch_ledger(
+        "user", "2026-W32", as_of=date(2026, 8, 10)
+    )
+
+    assert result.revision == 9
+    assert result.entries[0].state is BatchLedgerState.EXPIRED
+    assert put.call_count == 3
+    assert all(
+        call.kwargs.get("ConsistentRead") is True
+        for call in repo.table.get_item.call_args_list[1:]
+    )
+
+
+def test_expiry_conflict_exhaustion_raises_last_retryable_conflict(
+    mocker: Any,
+) -> None:
+    """Repeated expiry conflicts never return known-unexpired state."""
+    table = mocker.MagicMock()
+    repo = DynamoRepository(table)
+    entry = _batch_entry_for_test(
+        "expiring", date(2026, 8, 3), 0, state=BatchLedgerState.AVAILABLE
+    )
+    ledger = WeeklyBatchLedger(iso_week="2026-W32", entries=[entry])
+    raw = {
+        "Item": {
+            **repo._batch_ledger_key("user", "2026-W32"),
+            **ledger.model_dump(mode="json"),
+        }
+    }
+    table.get_item.return_value = raw
+    conflict = ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException"}},
+        "PutItem",
+    )
+    put = mocker.patch.object(
+        repo,
+        "_put_weekly_batch_ledger_conditionally",
+        side_effect=conflict,
+    )
+
+    with pytest.raises(ClientError) as raised:
+        repo.get_weekly_batch_ledger(
+            "user", "2026-W32", as_of=date(2026, 8, 10)
+        )
+
+    assert raised.value is conflict
+    assert put.call_count == 3
+    assert table.get_item.call_count == 4
+    assert all(
+        call.kwargs.get("ConsistentRead") is True
+        for call in table.get_item.call_args_list[1:]
+    )
+
+
+def test_expiry_malformed_strong_reload_is_not_reported_as_success(
+    mocker: Any,
+) -> None:
+    """Malformed reloads fail validation instead of returning stale data."""
+    table = mocker.MagicMock()
+    repo = DynamoRepository(table)
+    entry = _batch_entry_for_test(
+        "expiring", date(2026, 8, 3), 0, state=BatchLedgerState.AVAILABLE
+    )
+    ledger = WeeklyBatchLedger(iso_week="2026-W32", entries=[entry])
+    table.get_item.side_effect = [
+        {
+            "Item": {
+                **repo._batch_ledger_key("user", "2026-W32"),
+                **ledger.model_dump(mode="json"),
+            }
+        },
+        {
+            "Item": {
+                **repo._batch_ledger_key("user", "2026-W32"),
+                "iso_week": "not-an-iso-week",
+            }
+        },
+    ]
+    mocker.patch.object(
+        repo,
+        "_put_weekly_batch_ledger_conditionally",
+        side_effect=ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException"}},
+            "PutItem",
+        ),
+    )
+
+    with pytest.raises(ValidationError):
+        repo.get_weekly_batch_ledger(
+            "user", "2026-W32", as_of=date(2026, 8, 10)
+        )
+
+
+def test_weekly_batch_ledger_cas_requires_revision_and_exact_entries(
+    repo: DynamoRepository,
+) -> None:
+    """Stale revisions or changed entries cannot overwrite a ledger."""
+    entry = _batch_entry_for_test(
+        "expiring",
+        date(2026, 8, 3),
+        0,
+        state=BatchLedgerState.AVAILABLE,
+    )
+    original = WeeklyBatchLedger(
+        iso_week="2026-W32", revision=6, entries=[entry]
+    )
+    repo.put_weekly_batch_ledger("user", original)
+    expired = original.model_copy(
+        update={
+            "revision": 7,
+            "entries": [
+                entry.model_copy(
+                    update={
+                        "state": BatchLedgerState.EXPIRED,
+                        "remaining_portions": 0,
+                    }
+                )
+            ],
+        }
+    )
+
+    assert not repo.save_weekly_batch_ledger(
+        "user",
+        expired,
+        expected_revision=5,
+        expected_entries=original.entries,
+    )
+    assert not repo.save_weekly_batch_ledger(
+        "user",
+        expired,
+        expected_revision=6,
+        expected_entries=[
+            entry.model_copy(
+                update={
+                    "state": BatchLedgerState.EXPIRED,
+                    "remaining_portions": 0,
+                }
+            )
+        ],
+    )
+    assert repo.get_weekly_batch_ledger("user", "2026-W32") == original
+
+
+def test_repeated_current_expiry_reads_are_no_ops(
+    repo: DynamoRepository, mocker: Any
+) -> None:
+    """Reads without a new expiry transition do not write or increment."""
+    entry = _batch_entry_for_test(
+        "expiring",
+        date(2026, 8, 3),
+        0,
+        state=BatchLedgerState.AVAILABLE,
+    )
+    repo.put_weekly_batch_ledger(
+        "user",
+        WeeklyBatchLedger(iso_week="2026-W32", revision=3, entries=[entry]),
+    )
+    put = mocker.spy(repo, "_put_weekly_batch_ledger_conditionally")
+
+    before_expiry = repo.get_weekly_batch_ledger(
+        "user", "2026-W32", as_of=date(2026, 8, 8)
+    )
+    assert before_expiry.revision == 3
+    assert put.call_count == 0
+
+    first_expired = repo.get_weekly_batch_ledger(
+        "user", "2026-W32", as_of=date(2026, 8, 10)
+    )
+    repeated_expired = repo.get_weekly_batch_ledger(
+        "user", "2026-W32", as_of=date(2026, 8, 10)
+    )
+    assert first_expired.revision == 4
+    assert repeated_expired == first_expired
+    assert put.call_count == 1
+
+
+def test_malformed_meal_history_warning_does_not_log_meal_content(
+    mocker: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Malformed history is skipped with a bounded reason code only."""
+    table = mocker.MagicMock()
+    table.query.return_value = {
+        "Items": [
+            {
+                "PK": "USER#user",
+                "SK": "MEAL#2026-08-26#secret-raw-payload",
+                "date": "2026-08-26",
+                "meal_type": "lunch",
+                "description": "secret meal foods source text secret-batch-id",
+                "created_at": "not-a-timestamp",
+            }
+        ]
+    }
+
+    with caplog.at_level(logging.WARNING, logger="meal_planner.db.dynamo"):
+        history = DynamoRepository(table).get_meal_history(
+            "secret-user", days=1, on_date=date(2026, 8, 26)
+        )
+
+    assert history == []
+    assert "secret" not in caplog.text
+    assert caplog.records[0].message == (
+        "Skipping malformed meal history item reason_code=malformed"
+    )
+
+
+def test_replacement_cleanup_preserves_other_provisional_owner(
+    repo: DynamoRepository,
+) -> None:
+    """Replacing one draft cannot remove another draft's reservation."""
+    week = date(2026, 8, 17)
+    replaced = _batch_entry_for_test(
+        "replaced", week, 0, request_id="replaced-request"
+    )
+    other = _batch_entry_for_test("other", week, 0, request_id="other-request")
+    repo.put_weekly_batch_ledger(
+        "user",
+        WeeklyBatchLedger(iso_week="2026-W34", entries=[replaced, other]),
+    )
+    repo.save_plan("user", make_plan(week_start=week, revision=0))
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REVISION,
+        step=ConversationWorkflowStep.GENERATING,
+        amendment="change",
+        target_week=week,
+        expected_plan_revision=0,
+        request_id="replacement-request",
+        revision=2,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    assert repo.save_conversation_state("user", state)
+
+    replacement = _batch_entry_for_test(
+        "new", week, 1, request_id="replacement-request"
+    )
+    assert repo.replace_draft_and_clear_revision_state(
+        "user",
+        make_plan(week_start=week, revision=1),
+        expected_plan_revision=0,
+        request_id=state.request_id,
+        expected_state_revision=state.revision,
+        batch_entries=[replacement],
+        replaced_request_id="replaced-request",
+    )
+
+    entries = repo.get_weekly_batch_ledger("user", "2026-W34").entries
+    assert [entry.batch_id for entry in entries] == ["new", "other"]
+
+
+def test_simultaneous_fresh_plan_state_starts_have_one_winner(
+    repo: DynamoRepository,
+) -> None:
+    """Two fresh workflows cannot both acquire the conversation slot."""
+    barrier = Barrier(2)
+    states = [
+        ConversationState(
+            workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+            step=ConversationWorkflowStep.AWAITING_PREFERENCE,
+            request_id=f"123e4567-e89b-12d3-a456-42661417400{index}",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        )
+        for index in range(2)
+    ]
+
+    def start(state: ConversationState) -> bool:
+        barrier.wait()
+        return repo.save_conversation_state("user", state)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(start, states))
+
+    assert sorted(results) == [False, True]
+
+
+def test_two_consumers_cannot_decrement_the_last_batch_portion(
+    repo: DynamoRepository,
+) -> None:
+    """Exact ledger CAS permits one simultaneous last-portion consumer."""
+    entry = _batch_entry_for_test(
+        "last-portion", date(2026, 8, 3), 0, state=BatchLedgerState.AVAILABLE
+    )
+    repo.put_weekly_batch_ledger(
+        "user", WeeklyBatchLedger(iso_week="2026-W32", entries=[entry])
+    )
+    submitted = MealLogEntry(
+        date=date(2026, 8, 9),
+        meal_type=MealType.DINNER,
+        description="chicken",
+        created_at=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
+        batch_link=SubmittedMealBatchLink(
+            batch_id=entry.batch_id,
+            role=BatchMealRole.LEFTOVER,
+            source_date=entry.preparation_date,
+            source_meal_type=entry.preparation_meal_type,
+            portion=2,
+        ),
+    )
+    puts = [
+        repo._batch_submission_ledger_item(
+            "user", submitted, expected_ledger_revision=None
+        )
+        for _ in range(2)
+    ]
+    assert all(put is not None for put in puts)
+    barrier = Barrier(2)
+
+    def consume(put: dict[str, Any]) -> bool:
+        barrier.wait()
+        try:
+            repo.table.meta.client.transact_write_items(TransactItems=[put])
+        except ClientError as exc:
+            assert (
+                DynamoRepository._classify_transaction_conflict(
+                    exc, operation="ledger_mutation"
+                )
+                is TransactionConflictKind.INVENTORY_CHANGED
+            )
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(consume, puts))  # type: ignore[arg-type]
+
+    assert sorted(results) == [False, True]
+    saved = repo.get_weekly_batch_ledger("user", "2026-W32").entries[0]
+    assert saved.remaining_portions == 0
+    assert saved.state is BatchLedgerState.EXHAUSTED
+
+
+def test_concurrent_leftover_candidates_require_next_ordinal(
+    repo: DynamoRepository,
+) -> None:
+    """Only the next ordinal is eligible, even when candidates race."""
+    batch = BatchLedgerEntry(
+        batch_id="racing-batch",
+        source_plan_id="plan-2026-08-03",
+        source_request_id="request-1",
+        source_revision=1,
+        preparation_date=date(2026, 8, 8),
+        preparation_meal_type=MealType.DINNER,
+        food="chicken",
+        meal_name="Chicken batch",
+        total_portions=3,
+        remaining_portions=2,
+        state=BatchLedgerState.AVAILABLE,
+        week_end=date(2026, 8, 9),
+    )
+    repo.put_weekly_batch_ledger(
+        "user", WeeklyBatchLedger(iso_week="2026-W32", entries=[batch])
+    )
+
+    def submitted(portion: int, request_id: str) -> MealLogEntry:
+        return MealLogEntry(
+            date=date(2026, 8, 9),
+            meal_type=MealType.DINNER,
+            description=f"portion {portion}",
+            created_at=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
+            batch_link=SubmittedMealBatchLink(
+                batch_id="racing-batch",
+                role=BatchMealRole.LEFTOVER,
+                source_date=date(2026, 8, 8),
+                source_meal_type=MealType.DINNER,
+                portion=portion,
+            ),
+        ).model_copy(update={"created_at": datetime.fromisoformat(request_id)})
+
+    barrier = Barrier(2)
+    candidates = [
+        submitted(2, "2026-08-09T12:00:01+00:00"),
+        submitted(3, "2026-08-09T12:00:02+00:00"),
+    ]
+
+    def build_candidate(entry: MealLogEntry) -> dict[str, Any] | None:
+        barrier.wait()
+        return repo._batch_submission_ledger_item(
+            "user", entry, expected_ledger_revision=None
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        puts = list(executor.map(build_candidate, candidates))
+
+    assert puts[0] is not None
+    assert puts[1] is None
+    repo.table.meta.client.transact_write_items(TransactItems=[puts[0]])
+    after_portion_two = repo.get_weekly_batch_ledger("user", "2026-W32")
+    assert after_portion_two.revision == 1
+    assert after_portion_two.entries[0].remaining_portions == 1
+
+    portion_three = submitted(3, "2026-08-09T12:00:03+00:00")
+    refreshed_put = repo._batch_submission_ledger_item(
+        "user", portion_three, expected_ledger_revision=1
+    )
+    assert refreshed_put is not None
+    replay_entry = portion_three.model_copy(
+        update={
+            "created_at": datetime(2026, 8, 9, 12, 0, 4, tzinfo=timezone.utc)
+        }
+    )
+    replay_put = repo._batch_submission_ledger_item(
+        "user", replay_entry, expected_ledger_revision=1
+    )
+    assert replay_put is not None
+
+    def atomic_submission(
+        ledger_put: dict[str, Any],
+        entry: MealLogEntry,
+        submission_id: str,
+    ) -> list[dict[str, Any]]:
+        """Add distinct workflow records to the shared ledger CAS race."""
+        return [
+            {
+                "Put": {
+                    "TableName": repo.table.name,
+                    "Item": {
+                        "PK": "USER#user",
+                        "SK": (
+                            f"MEAL#{entry.date_key}#SUBMISSION#{submission_id}"
+                        ),
+                        **entry.model_dump(mode="json"),
+                    },
+                    "ConditionExpression": "attribute_not_exists(PK)",
+                }
+            },
+            {
+                "Put": {
+                    "TableName": repo.table.name,
+                    "Item": {
+                        "PK": "USER#user",
+                        "SK": f"MEAL_UPDATE#{submission_id}",
+                    },
+                    "ConditionExpression": "attribute_not_exists(PK)",
+                }
+            },
+            ledger_put,
+        ]
+
+    submissions = [
+        atomic_submission(
+            refreshed_put,
+            portion_three,
+            "123e4567-e89b-12d3-a456-426614174005",
+        ),
+        atomic_submission(
+            replay_put,
+            replay_entry,
+            "123e4567-e89b-12d3-a456-426614174006",
+        ),
+    ]
+    barrier = Barrier(2)
+
+    def consume(items: list[dict[str, Any]]) -> bool:
+        barrier.wait()
+        try:
+            repo.table.meta.client.transact_write_items(TransactItems=items)
+        except ClientError as exc:
+            assert (
+                DynamoRepository._classify_transaction_conflict(
+                    exc, operation="ledger_mutation"
+                )
+                is TransactionConflictKind.INVENTORY_CHANGED
+            )
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(consume, submissions))
+
+    assert sorted(results) == [False, True]
+    saved = repo.get_weekly_batch_ledger("user", "2026-W32")
+    assert saved.revision == 2
+    assert saved.entries[0].remaining_portions == 0
+    assert saved.entries[0].state is BatchLedgerState.EXHAUSTED
+
+
+def test_draft_replacement_and_batch_activation_have_one_ledger_winner(
+    repo: DynamoRepository,
+) -> None:
+    """Replacement cannot overwrite an activation based on stale inventory."""
+    week = date(2026, 8, 3)
+    old = _batch_entry_for_test("old", week, 0)
+    repo.put_weekly_batch_ledger(
+        "user", WeeklyBatchLedger(iso_week="2026-W32", entries=[old])
+    )
+    preparation = MealLogEntry(
+        date=week,
+        meal_type=MealType.DINNER,
+        description="chicken",
+        created_at=datetime(2026, 8, 3, 12, tzinfo=timezone.utc),
+        batch_link=SubmittedMealBatchLink(
+            batch_id=old.batch_id, role=BatchMealRole.PREPARATION
+        ),
+    )
+    activation = repo._batch_submission_ledger_item(
+        "user", preparation, expected_ledger_revision=None
+    )
+    replacement = _batch_entry_for_test("replacement", week, 1)
+    replacement_items = repo._batch_ledger_transaction_items(
+        "user",
+        make_plan(week_start=week, revision=1),
+        [replacement],
+        expected_revision=0,
+    )
+    assert activation is not None
+    assert len(replacement_items) == 1
+    barrier = Barrier(2)
+
+    def write(items: list[dict[str, Any]]) -> bool:
+        barrier.wait()
+        try:
+            repo.table.meta.client.transact_write_items(TransactItems=items)
+        except ClientError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(write, [[activation], replacement_items]))
+
+    assert sorted(results) == [False, True]
+    ledger = repo.get_weekly_batch_ledger("user", "2026-W32")
+    assert len(ledger.entries) == 1
+    assert ledger.entries[0].batch_id in {"old", "replacement"}
+
+
+@pytest.mark.parametrize(
+    ("as_of", "state", "remaining"),
+    [
+        (date(2026, 8, 7), BatchLedgerState.PROVISIONAL, 1),
+        (date(2026, 8, 8), BatchLedgerState.EXPIRED, 0),
+        (date(2026, 8, 9), BatchLedgerState.AVAILABLE, 1),
+        (date(2026, 8, 10), BatchLedgerState.EXPIRED, 0),
+    ],
+)
+def test_batch_expiry_is_exact_at_preparation_and_iso_week_boundaries(
+    repo: DynamoRepository,
+    as_of: date,
+    state: BatchLedgerState,
+    remaining: int,
+) -> None:
+    """Provisional stock expires after preparation day and after Sunday."""
+    provisional = _batch_entry_for_test(
+        "provisional", date(2026, 8, 3), 0
+    ).model_copy(update={"preparation_date": date(2026, 8, 7)})
+    available = _batch_entry_for_test(
+        "available", date(2026, 8, 3), 0, state=BatchLedgerState.AVAILABLE
+    )
+    repo.put_weekly_batch_ledger(
+        "user",
+        WeeklyBatchLedger(
+            iso_week="2026-W32", entries=[provisional, available]
+        ),
+    )
+
+    loaded = repo.get_weekly_batch_ledger("user", "2026-W32", as_of=as_of)
+    selected = {entry.batch_id: entry for entry in loaded.entries}
+    target_id = "provisional" if as_of <= date(2026, 8, 8) else "available"
+    assert selected[target_id].state is state
+    assert selected[target_id].remaining_portions == remaining
+
+
+@pytest.mark.parametrize(
+    ("reasons", "operation", "expected"),
+    [
+        (
+            [
+                {"Code": "None"},
+                {"Code": "None"},
+                {"Code": "None"},
+                {"Code": "ConditionalCheckFailed"},
+            ],
+            "meal_confirmation",
+            TransactionConflictKind.INVENTORY_CHANGED,
+        ),
+        (
+            [
+                {"Code": "None"},
+                {"Code": "ConditionalCheckFailed"},
+                {"Code": "None"},
+                {"Code": "None"},
+            ],
+            "meal_confirmation",
+            TransactionConflictKind.STALE_WORK,
+        ),
+        (
+            [{"Code": "None"}, {"Code": "TransactionConflict"}],
+            None,
+            TransactionConflictKind.RETRYABLE,
+        ),
+    ],
+)
+def test_transaction_conflicts_have_bounded_classification(
+    reasons: list[dict[str, str]],
+    operation: str | None,
+    expected: TransactionConflictKind,
+) -> None:
+    """Cancellation positions distinguish stale work from live inventory."""
+    error = ClientError(
+        {
+            "Error": {"Code": "TransactionCanceledException"},
+            "CancellationReasons": reasons,
+        },
+        "TransactWriteItems",
+    )
+
+    assert (
+        DynamoRepository._classify_transaction_conflict(
+            error, operation=operation
+        )
+        is expected
+    )
+
+
+def test_retryable_meal_transaction_is_retried_once_without_relaxing_guards(
+    mocker: Any,
+) -> None:
+    """A service conflict retries the same exact conditional transaction."""
+    table = mocker.MagicMock()
+    table.name = "test-meal-planner"
+    error = ClientError(
+        {
+            "Error": {"Code": "TransactionCanceledException"},
+            "CancellationReasons": [
+                {"Code": "None"},
+                {"Code": "TransactionConflict"},
+            ],
+        },
+        "TransactWriteItems",
+    )
+    table.meta.client.transact_write_items.side_effect = error
+    review = _review_meal_state()
+    continuation = _continuation_meal_state(review)
+    entry = _meal(8, 12, "Soup")
+
+    with pytest.raises(ClientError) as raised:
+        DynamoRepository(table).confirm_meal_and_transition(
+            "user",
+            entry,
+            continuation,
+            expected_revision=review.revision,
+            submission_id=review.request_id,
+        )
+
+    assert raised.value is error
+    assert table.meta.client.transact_write_items.call_count == 2
+
+
+def test_tracked_draft_publication_writes_plan_ledger_and_state_atomically(
+    repo: DynamoRepository,
+) -> None:
+    """A tracked draft and provisional source share one transaction."""
+    week = date(2026, 8, 17)
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REQUEST,
+        step=ConversationWorkflowStep.GENERATING,
+        request_id="request-1",
+        revision=4,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    repo.save_conversation_state("user", state)
+    entry = _batch_entry_for_test("provisional-1", week, state.revision)
+
+    assert repo.save_generated_draft_and_clear_conversation_state(
+        "user",
+        make_plan(week_start=week),
+        expected_revision=None,
+        request_id=state.request_id,
+        expected_state_revision=state.revision,
+        batch_entries=[entry],
+    )
+
+    saved = repo.get_weekly_batch_ledger("user", "2026-W34")
+    assert saved.entries == [entry]
+    assert repo.get_plan("user", week) is not None
+    assert repo.get_conversation_state("user") is None
+
+
+def test_untracked_draft_publication_writes_provisional_ledger_atomically(
+    repo: DynamoRepository,
+) -> None:
+    """An untracked draft cannot leave its plan without its reservation."""
+    week = date(2026, 8, 17)
+    entry = _batch_entry_for_test("provisional-1", week, 0)
+
+    assert repo.save_generated_draft(
+        "user",
+        make_plan(week_start=week),
+        expected_revision=None,
+        batch_entries=[entry],
+    )
+
+    assert repo.get_plan("user", week) is not None
+    assert repo.get_weekly_batch_ledger("user", "2026-W34").entries == [entry]
+
+
+def test_replacing_draft_removes_only_owned_provisional_entries(
+    repo: DynamoRepository,
+) -> None:
+    """Replacement cleanup retains available inventory and other owners."""
+    week = date(2026, 8, 17)
+    available = _batch_entry_for_test(
+        "available-1", week, 0, state=BatchLedgerState.AVAILABLE
+    )
+    old = _batch_entry_for_test("old-provisional", week, 0)
+    repo.put_weekly_batch_ledger(
+        "user", WeeklyBatchLedger(iso_week="2026-W34", entries=[available, old])
+    )
+    repo.save_plan("user", make_plan(week_start=week, revision=0))
+    now = datetime.now(timezone.utc)
+    state = ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_REVISION,
+        step=ConversationWorkflowStep.GENERATING,
+        amendment="change",
+        target_week=week,
+        expected_plan_revision=0,
+        request_id="replacement-request",
+        revision=2,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+    repo.save_conversation_state("user", state)
+    replacement = _batch_entry_for_test(
+        "new-provisional", week, 1, request_id=state.request_id
+    )
+
+    assert repo.replace_draft_and_clear_revision_state(
+        "user",
+        make_plan(week_start=week, revision=1),
+        expected_plan_revision=0,
+        request_id=state.request_id,
+        expected_state_revision=state.revision,
+        batch_entries=[replacement],
+    )
+
+    assert [
+        entry.batch_id
+        for entry in repo.get_weekly_batch_ledger("user", "2026-W34").entries
+    ] == ["available-1", "new-provisional"]
+
+
+def _batch_entry_for_test(
+    batch_id: str,
+    week: date,
+    revision: int,
+    *,
+    state: BatchLedgerState = BatchLedgerState.PROVISIONAL,
+    request_id: str = "request-1",
+) -> BatchLedgerEntry:
+    """Build a valid ledger entry for repository transaction tests."""
+    return BatchLedgerEntry(
+        batch_id=batch_id,
+        source_plan_id=f"plan-{week.isoformat()}",
+        source_request_id=request_id,
+        source_revision=revision,
+        preparation_date=week,
+        preparation_meal_type=MealType.DINNER,
+        food="chicken",
+        meal_name="Chicken batch",
+        total_portions=2,
+        remaining_portions=1,
+        state=state,
+        week_end=week + timedelta(days=6),
+    )
+
+
 def test_plan_selection_distinguishes_latest_exact_and_active(
     repo: DynamoRepository,
 ) -> None:
@@ -1964,6 +3868,139 @@ def test_plan_selection_distinguishes_latest_exact_and_active(
     assert repo.get_plan("user", "2026-08-04") == active
     assert repo.get_active_plan("user", date(2026, 8, 10)) == active
     assert repo.get_active_plan("user", date(2026, 8, 11)) is None
+
+
+def _plan_with_batch_link(
+    *,
+    week_start: date,
+    target_date: date,
+    batch_id: str,
+    revision: int = 0,
+    status: PlanStatus = PlanStatus.DRAFT,
+    role: BatchMealRole = BatchMealRole.PREPARATION,
+) -> Any:
+    """Build one plan containing a link at a selected date."""
+    plan = make_plan(
+        week_start=week_start,
+        status=status,
+        revision=revision,
+        plan_days=(target_date - week_start).days + 1,
+    )
+    link = PlannedBatchLink(batch_id=batch_id, role=role)
+    if role is BatchMealRole.LEFTOVER:
+        link = PlannedBatchLink(
+            batch_id=batch_id,
+            role=role,
+            source_date=week_start,
+            source_meal_type=MealType.LUNCH,
+            portion=2,
+        )
+    plan.days[-1].meals[0].batch_link = link
+    return plan
+
+
+def test_planned_batch_link_uses_covering_plan_when_newer_plan_does_not(
+    repo: DynamoRepository,
+) -> None:
+    """A newer non-covering plan cannot hide an older matching plan."""
+    target = date(2026, 8, 20)
+    covering = _plan_with_batch_link(
+        week_start=date(2026, 8, 17),
+        target_date=target,
+        batch_id="covering-batch",
+    )
+    newer = make_plan(week_start=date(2026, 8, 24), revision=4)
+    repo.save_plan("user", covering)
+    repo.save_plan("user", newer)
+
+    link = repo.get_planned_batch_link("user", target, MealType.LUNCH)
+
+    assert link is not None
+    assert link.batch_id == "covering-batch"
+
+
+def test_planned_batch_link_precedence_skips_stale_malformed_and_ambiguous(
+    repo: DynamoRepository,
+) -> None:
+    """Overlapping candidates use status, revision, and date precedence."""
+    target = date(2026, 8, 20)
+    stale = _plan_with_batch_link(
+        week_start=date(2026, 8, 17),
+        target_date=target,
+        batch_id="stale-batch",
+        revision=1,
+    )
+    current_draft = _plan_with_batch_link(
+        week_start=date(2026, 8, 18),
+        target_date=target,
+        batch_id="draft-batch",
+        revision=3,
+    )
+    current_confirmed = _plan_with_batch_link(
+        week_start=date(2026, 8, 19),
+        target_date=target,
+        batch_id="confirmed-batch",
+        revision=4,
+        status=PlanStatus.CONFIRMED,
+    )
+    repo.save_plan("user", stale)
+    repo.save_plan("user", current_draft)
+    repo.save_plan("user", current_confirmed)
+    repo.table.put_item(
+        Item={
+            "PK": "USER#user",
+            "SK": "PLAN#2026-08-20",
+            "week_start_date": "2026-08-20",
+            "status": "not-a-plan-status",
+            "revision": 99,
+            "days": [],
+        }
+    )
+
+    link = repo.get_planned_batch_link("user", target, MealType.LUNCH)
+
+    assert link is not None
+    assert link.batch_id == "confirmed-batch"
+
+
+def test_planned_batch_link_returns_none_for_an_ordinary_meal_slot(
+    repo: DynamoRepository,
+) -> None:
+    """A covered ordinary meal does not inherit an unrelated batch link."""
+    target = date(2026, 8, 20)
+    plan = _plan_with_batch_link(
+        week_start=date(2026, 8, 17),
+        target_date=target,
+        batch_id="planned-batch",
+    )
+    repo.save_plan("user", plan)
+
+    assert repo.get_planned_batch_link("user", target, MealType.DINNER) is None
+
+
+def test_planned_batch_link_query_is_bounded_to_user_partition(
+    mocker: Any,
+) -> None:
+    """Lookup uses one bounded key query and never scans the table."""
+    table = mocker.MagicMock()
+    table.query.return_value = {"Items": []}
+
+    assert (
+        DynamoRepository(table).get_planned_batch_link(
+            "user", date(2026, 8, 20), MealType.LUNCH
+        )
+        is None
+    )
+
+    query = table.query.call_args.kwargs
+    assert query["ScanIndexForward"] is False
+    assert query["Limit"] == 32
+    expression = query["KeyConditionExpression"].get_expression()
+    partition_condition = expression["values"][0].get_expression()
+    sort_condition = expression["values"][1].get_expression()
+    assert partition_condition["values"][1] == "USER#user"
+    assert sort_condition["values"][1] == "PLAN#"
+    table.scan.assert_not_called()
 
 
 @pytest.mark.parametrize("plan_days", [1, 3])

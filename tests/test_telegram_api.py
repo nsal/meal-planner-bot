@@ -1,6 +1,7 @@
 """Telegram API safety, formatting, and failure tests."""
 
 import json
+from datetime import date
 from io import BytesIO
 from urllib.error import HTTPError, URLError
 from uuid import UUID
@@ -9,9 +10,11 @@ import pytest
 from pytest_mock import MockerFixture
 
 from meal_planner.models.schemas import (
+    BatchMealRole,
     FamilyMember,
     MealOutcome,
     MealType,
+    PlannedBatchLink,
     ProfileEditCategory,
     ProfileEditOperation,
     UserProfile,
@@ -24,7 +27,7 @@ from meal_planner.telegram.api import (
     split_text,
 )
 from meal_planner.telegram.commands import TelegramCommand
-from tests.factories import make_plan, make_profile
+from tests.factories import make_batch_rule, make_plan, make_profile
 
 
 def _response() -> BytesIO:
@@ -302,6 +305,31 @@ def test_profile_summary_renders_optional_targets_and_not_set_copy(
     assert "- Alex (2000 kcal/day, " + expected_targets + ")" in payload["text"]
 
 
+def test_profile_summary_renders_bounded_batch_rules_without_storage_id(
+    mocker: MockerFixture,
+) -> None:
+    """Profile display includes batch semantics but never its internal ID."""
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+    rule = make_batch_rule(
+        source_text="cook chicken once for two lunches",
+        identifier="storage-only-batch-id",
+        total_yield=2,
+    )
+    profile = make_profile().model_copy(update={"batch_rules": [rule]})
+
+    TelegramAPI("token").send_profile(1, profile)
+
+    payload = _last_payload(urlopen)
+    assert (
+        "Batch rules: cook chicken once for two lunches "
+        "(prepare dinner; reuse lunch, dinner; 2 meals)"
+    ) in payload["text"]
+    assert "storage-only-batch-id" not in payload["text"]
+
+
 def test_profile_root_renders_all_categories_and_close(
     mocker: MockerFixture,
 ) -> None:
@@ -464,6 +492,33 @@ def test_profile_operations_render_target_guidance(
         assert fragment in payload["text"]
 
 
+def test_profile_rule_review_renders_batch_rules_without_storage_id(
+    mocker: MockerFixture,
+) -> None:
+    """Batch review shows user wording and yield, not provider identifiers."""
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+    rule = make_batch_rule(
+        source_text="cook chicken once for two lunches",
+        identifier="provider-only-batch-id",
+    )
+
+    TelegramAPI("token").send_profile_rule_review(
+        1,
+        ProfileEditCategory.DIETARY_PREFERENCES,
+        rule.source_text,
+        [rule],
+        "review-token",
+    )
+
+    payload = _last_payload(urlopen)
+    assert rule.source_text in payload["text"]
+    assert "2 meals" in payload["text"]
+    assert rule.id not in payload["text"]
+
+
 def test_send_meal_review_renders_exact_text_and_review_buttons(
     mocker: MockerFixture,
 ) -> None:
@@ -502,6 +557,82 @@ def test_send_meal_review_renders_exact_text_and_review_buttons(
             ]
         ]
     }
+
+
+def test_send_meal_review_renders_one_explicit_batch_role_confirmation(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch("urllib.request.urlopen", return_value=_response())
+    submission_id = UUID("12345678-1234-5678-1234-567812345678")
+    link = PlannedBatchLink(
+        batch_id="storage-hidden-batch",
+        role=BatchMealRole.LEFTOVER,
+        source_date=date(2026, 8, 21),
+        source_meal_type=MealType.DINNER,
+        portion=2,
+    )
+
+    TelegramAPI("token").send_meal_review(
+        1,
+        "today, dinner, roast chicken",
+        submission_id,
+        batch_link=link,
+    )
+
+    payload = json.loads(urlopen.call_args.args[0].data.decode())
+    assert "planned batch leftover" in payload["text"].lower()
+    callbacks = [
+        button["callback_data"]
+        for row in payload["reply_markup"]["inline_keyboard"]
+        for button in row
+    ]
+    assert (
+        "meal:confirm:12345678-1234-5678-1234-567812345678:leftover"
+        in callbacks
+    )
+    assert all("storage-hidden-batch" not in callback for callback in callbacks)
+
+
+def test_send_plan_labels_batch_preparation_and_leftover_without_ownership(
+    mocker: MockerFixture,
+) -> None:
+    """Draft text makes batch intent clear without storage-only fields."""
+    urlopen = mocker.patch("urllib.request.urlopen", return_value=_response())
+    plan = make_plan(week_start=date(2026, 8, 10))
+    plan.days[0].meals[0].batch_link = PlannedBatchLink(
+        batch_id="batch-chicken", role="preparation"
+    )
+    plan.days[1].meals[0].batch_link = PlannedBatchLink(
+        batch_id="batch-chicken",
+        role="leftover",
+        source_date="2026-08-10",
+        source_meal_type="dinner",
+        portion=2,
+    )
+
+    TelegramAPI("token").send_plan(1, plan)
+
+    payload = json.loads(urlopen.call_args.args[0].data.decode())
+    assert "Batch preparation" in payload["text"]
+    assert "Batch leftover" in payload["text"]
+    assert "batch-chicken" not in payload["text"]
+
+
+def test_send_plan_labels_explicit_batch_yield_without_ownership(
+    mocker: MockerFixture,
+) -> None:
+    """Draft text uses the preparation yield without storage identifiers."""
+    urlopen = mocker.patch("urllib.request.urlopen", return_value=_response())
+    plan = make_plan(week_start=date(2026, 8, 10))
+    plan.days[0].meals[0].batch_link = PlannedBatchLink(
+        batch_id="batch-chicken", role="preparation", total_yield=3
+    )
+
+    TelegramAPI("token").send_plan(1, plan)
+
+    payload = json.loads(urlopen.call_args.args[0].data.decode())
+    assert "Batch preparation; makes 3 meals" in payload["text"]
+    assert "batch-chicken" not in payload["text"]
 
 
 def test_send_meal_saved_renders_continuation_buttons(

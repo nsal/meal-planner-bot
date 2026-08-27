@@ -38,7 +38,9 @@ PlanInstruction = Annotated[
 ]
 PlanningInstruction = PlanInstruction
 MAX_PLAN_REQUIREMENTS = 20
+MAX_PLAN_OBLIGATIONS = MAX_PLAN_REQUIREMENTS * 2
 MAX_MEALS_PER_DAY = 4
+MAX_BATCH_LEDGER_ENTRIES = 20
 RequestId = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
@@ -315,6 +317,35 @@ class RuleStrength(str, Enum):
     BEST_EFFORT = "best_effort"
 
 
+class RuleCadence(str, Enum):
+    """Persistence cadence for a dietary quota."""
+
+    ISO_WEEK = "iso_week"
+
+
+class ScheduleKind(str, Enum):
+    """Whether weekday scope came from the user or the scheduler."""
+
+    EXPLICIT = "explicit"
+    GENERATED = "generated"
+
+
+class BatchMealRole(str, Enum):
+    """The role a meal has in a batch-cooking lifecycle."""
+
+    PREPARATION = "preparation"
+    LEFTOVER = "leftover"
+
+
+class BatchLedgerState(str, Enum):
+    """Bounded states for a persisted batch reservation."""
+
+    PROVISIONAL = "provisional"
+    AVAILABLE = "available"
+    EXHAUSTED = "exhausted"
+    EXPIRED = "expired"
+
+
 class Weekday(int, Enum):
     """ISO weekday values used in persisted dietary rule scopes."""
 
@@ -325,6 +356,15 @@ class Weekday(int, Enum):
     FRIDAY = 5
     SATURDAY = 6
     SUNDAY = 7
+
+
+ISO_WEEK = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        pattern=r"^\d{4}-W(?:0[1-9]|[1-4]\d|5[0-3])$",
+    ),
+]
 
 
 class ProfileEditCategory(str, Enum):
@@ -361,16 +401,45 @@ class ProfileEditOperation(str, Enum):
 
 
 class DietaryRule(BaseModel):
-    """One bounded, structured dietary preference rule."""
+    """One bounded, structured dietary preference rule.
+
+    Stored positive preferences are quotas within an ISO week.  ``weekdays``
+    is reserved for user-selected weekdays; the scheduler writes generated
+    targets to ``target_weekdays`` instead.
+    """
 
     id: RequirementId
     source_text: PlanPreference
     foods_any_of: list[PreferenceFood] = Field(min_length=1, max_length=20)
     meal_type: MealType | None = None
     weekdays: list[Weekday] = Field(default_factory=list, max_length=7)
+    target_weekdays: list[Weekday] = Field(
+        default_factory=list,
+        max_length=7,
+        validation_alias=AliasChoices("target_weekdays", "generated_weekdays"),
+    )
+    cadence: RuleCadence = Field(
+        default=RuleCadence.ISO_WEEK,
+        validation_alias=AliasChoices("cadence", "period"),
+    )
+    schedule_kind: ScheduleKind = Field(
+        default=ScheduleKind.GENERATED,
+        validation_alias=AliasChoices("schedule_kind", "schedule_source"),
+    )
     operator: RuleOperator = RuleOperator.EXACTLY
     count: int = Field(ge=0, le=28)
     strength: RuleStrength = RuleStrength.STRICT
+
+    @model_validator(mode="before")
+    @classmethod
+    def infer_explicit_schedule(cls, value: Any) -> Any:
+        """Treat legacy non-empty weekday scopes as explicit schedules."""
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        if normalized.get("weekdays") and "schedule_kind" not in normalized:
+            normalized["schedule_kind"] = ScheduleKind.EXPLICIT
+        return normalized
 
     @field_validator("foods_any_of")
     @classmethod
@@ -393,20 +462,61 @@ class DietaryRule(BaseModel):
             raise ValueError("weekdays must not contain duplicates")
         return value
 
+    @field_validator("target_weekdays")
+    @classmethod
+    def reject_duplicate_target_weekdays(
+        cls, value: list[Weekday]
+    ) -> list[Weekday]:
+        """Reject duplicate scheduler-generated weekday targets."""
+        if len(value) != len(set(value)):
+            raise ValueError("target_weekdays must not contain duplicates")
+        return value
+
     @model_validator(mode="after")
     def validate_count_for_scope(self) -> "DietaryRule":
-        """Keep strict weekday rules within one day's capacity."""
+        """Keep strict weekly rules within the available meal capacity."""
+        if self.schedule_kind is ScheduleKind.EXPLICIT:
+            if not self.weekdays:
+                raise ValueError(
+                    "explicit schedules require at least one weekday"
+                )
+            if self.target_weekdays:
+                raise ValueError(
+                    "explicit schedules cannot contain generated targets"
+                )
+        elif self.weekdays:
+            raise ValueError(
+                "generated schedules cannot contain explicit weekdays"
+            )
         if self.weekdays:
             if (
                 self.strength is RuleStrength.STRICT
                 and self.operator
                 in {RuleOperator.EXACTLY, RuleOperator.AT_LEAST}
-                and self.count > daily_meal_capacity(self.meal_type)
+                and self.count
+                > daily_meal_capacity(self.meal_type) * len(self.weekdays)
             ):
-                raise ValueError("count must fit per named weekday capacity")
+                raise ValueError("count must fit named weekday capacity")
         elif self.meal_type is not None and self.count > 7:
             raise ValueError("count must fit the selected meal scope")
+        elif self.count > MAX_MEALS_PER_DAY * 7:
+            raise ValueError("count must fit the ISO-week meal capacity")
         return self
+
+    @property
+    def period(self) -> RuleCadence:
+        """Return the cadence using the period terminology."""
+        return self.cadence
+
+    @property
+    def explicit_weekdays(self) -> list[Weekday]:
+        """Return weekdays explicitly named by the user."""
+        return self.weekdays
+
+    @property
+    def generated_weekdays(self) -> list[Weekday]:
+        """Return weekdays assigned by the application scheduler."""
+        return self.target_weekdays
 
 
 class ConstraintEntry(BaseModel):
@@ -460,11 +570,371 @@ class ConstraintEntry(BaseModel):
 
 
 class DietaryPreferenceEntry(BaseModel):
-    """Stored preference wording with an optional interpreted rule."""
+    """Stored preference wording with its confirmed interpreted rule."""
 
     id: RequirementId
     source_text: PlanPreference
-    rule: DietaryRule | None = None
+    rule: DietaryRule
+
+
+class DietaryObligation(BaseModel):
+    """One dated projection of a weekly dietary rule."""
+
+    id: RequirementId
+    source_rule_id: RequirementId = Field(
+        validation_alias=AliasChoices("source_rule_id", "rule_id")
+    )
+    iso_week: ISO_WEEK
+    horizon_start: date
+    horizon_end: date
+    eligible_dates: list[date] = Field(min_length=1, max_length=7)
+    operator: RuleOperator
+    count: int = Field(ge=0, le=28)
+    foods_any_of: list[PreferenceFood] = Field(min_length=1, max_length=20)
+    meal_type: MealType | None = None
+    strength: RuleStrength = RuleStrength.STRICT
+    evidence_ids: list[RequirementId] = Field(
+        default_factory=list, max_length=MAX_PLAN_REQUIREMENTS
+    )
+
+    @field_validator("eligible_dates")
+    @classmethod
+    def reject_duplicate_dates(cls, value: list[date]) -> list[date]:
+        """Keep each dated obligation slot unique."""
+        if len(value) != len(set(value)):
+            raise ValueError("eligible_dates must not contain duplicates")
+        return value
+
+    @field_validator("foods_any_of")
+    @classmethod
+    def reject_duplicate_foods(cls, value: list[str]) -> list[str]:
+        """Reject alternatives that identify the same normalized food."""
+        normalized = [normalize_food(food) for food in value]
+        if any(not food_tokens for food_tokens in normalized):
+            raise ValueError(
+                "foods_any_of entries must contain matchable food tokens"
+            )
+        if len(set(normalized)) != len(value):
+            raise ValueError("foods_any_of must not contain duplicates")
+        return value
+
+    @model_validator(mode="after")
+    def validate_dates_and_capacity(self) -> "DietaryObligation":
+        """Keep an obligation inside one ISO week and its horizon."""
+        try:
+            week_start = date.fromisocalendar(
+                int(self.iso_week[:4]), int(self.iso_week[6:]), 1
+            )
+        except TypeError, ValueError:
+            raise ValueError(
+                "iso_week must identify a valid ISO week"
+            ) from None
+        week_end = week_start.fromordinal(week_start.toordinal() + 6)
+        if self.horizon_start > self.horizon_end:
+            raise ValueError("horizon_start must not be after horizon_end")
+        if self.horizon_start < week_start or self.horizon_end > week_end:
+            raise ValueError("obligation horizon must fit its ISO week")
+        if any(
+            current < self.horizon_start
+            or current > self.horizon_end
+            or current < week_start
+            or current > week_end
+            for current in self.eligible_dates
+        ):
+            raise ValueError("eligible_dates must fit the obligation horizon")
+        capacity = daily_meal_capacity(self.meal_type) * len(
+            self.eligible_dates
+        )
+        if self.count > capacity:
+            raise ValueError("count must fit the obligation date capacity")
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_week_start_alias(cls, value: Any) -> Any:
+        """Accept a Monday date when callers do not have an ISO label."""
+        if not isinstance(value, dict):
+            return value
+        if value.get("iso_week") is not None or value.get("week_start") is None:
+            return value
+        start = value["week_start"]
+        if isinstance(start, datetime):
+            start = start.date()
+        if isinstance(start, str):
+            try:
+                start = date.fromisoformat(start)
+            except ValueError:
+                return value
+        if isinstance(start, date):
+            iso = start.isocalendar()
+            normalized = dict(value)
+            normalized["iso_week"] = f"{iso.year:04d}-W{iso.week:02d}"
+            return normalized
+        return value
+
+    @property
+    def rule_id(self) -> str:
+        """Return the owning rule ID using the shorter domain name."""
+        return self.source_rule_id
+
+    @property
+    def week_start(self) -> date:
+        """Return the Monday identified by ``iso_week``."""
+        return date.fromisocalendar(
+            int(self.iso_week[:4]), int(self.iso_week[6:]), 1
+        )
+
+
+class BatchRule(BaseModel):
+    """A confirmed rule allowing one preparation to cover later meals."""
+
+    id: RequirementId
+    source_text: PlanPreference
+    foods_any_of: list[PreferenceFood] = Field(min_length=1, max_length=20)
+    preparation_meal_types: list[MealType] = Field(
+        min_length=1,
+        max_length=2,
+        validation_alias=AliasChoices(
+            "preparation_meal_types", "eligible_preparation_meal_types"
+        ),
+    )
+    reuse_meal_types: list[MealType] = Field(
+        min_length=1,
+        max_length=2,
+        validation_alias=AliasChoices(
+            "reuse_meal_types", "eligible_reuse_meal_types"
+        ),
+    )
+    total_yield: int = Field(
+        ge=2,
+        le=3,
+        validation_alias=AliasChoices("total_yield", "total_portions", "yield"),
+    )
+
+    @field_validator("foods_any_of")
+    @classmethod
+    def reject_duplicate_foods(cls, value: list[str]) -> list[str]:
+        """Reject alternatives that identify the same normalized food."""
+        normalized = [normalize_food(food) for food in value]
+        if any(not food_tokens for food_tokens in normalized):
+            raise ValueError(
+                "foods_any_of entries must contain matchable food tokens"
+            )
+        if len(set(normalized)) != len(value):
+            raise ValueError("foods_any_of must not contain duplicates")
+        return value
+
+    @property
+    def total_portions(self) -> int:
+        """Return the total number of meals covered by the preparation."""
+        return self.total_yield
+
+    @field_validator("preparation_meal_types", "reuse_meal_types")
+    @classmethod
+    def validate_batch_meal_types(cls, value: list[MealType]) -> list[MealType]:
+        """Restrict batch cooking to lunch and dinner slots."""
+        if len(value) != len(set(value)):
+            raise ValueError("batch meal types must not contain duplicates")
+        if any(
+            meal_type not in {MealType.LUNCH, MealType.DINNER}
+            for meal_type in value
+        ):
+            raise ValueError("batch meal types must be lunch or dinner")
+        return value
+
+
+class PlannedBatchLink(BaseModel):
+    """Application-owned batch metadata attached to a planned meal."""
+
+    batch_id: RequirementId
+    role: BatchMealRole
+    source_date: date | None = Field(
+        default=None,
+        validation_alias=AliasChoices("source_date", "preparation_date"),
+    )
+    source_meal_type: MealType | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "source_meal_type", "preparation_meal_type"
+        ),
+    )
+    portion: int = Field(
+        default=1,
+        ge=1,
+        le=3,
+        validation_alias=AliasChoices("portion", "portion_number"),
+    )
+    total_yield: int | None = Field(
+        default=None,
+        ge=2,
+        le=3,
+        validation_alias=AliasChoices("total_yield", "total_portions", "yield"),
+    )
+
+    @model_validator(mode="after")
+    def validate_role_shape(self) -> "PlannedBatchLink":
+        """Keep preparation and leftover metadata unambiguous."""
+        has_source_date = self.source_date is not None
+        has_source_type = self.source_meal_type is not None
+        if self.role is BatchMealRole.PREPARATION:
+            if has_source_date or has_source_type or self.portion != 1:
+                raise ValueError(
+                    "preparation links cannot identify a leftover source"
+                )
+        else:
+            if not has_source_date or not has_source_type or self.portion < 2:
+                raise ValueError(
+                    "leftover links require a source and portion number"
+                )
+            if self.source_meal_type not in {
+                MealType.LUNCH,
+                MealType.DINNER,
+            }:
+                raise ValueError(
+                    "leftover source meal type must be lunch or dinner"
+                )
+            if self.total_yield is not None:
+                raise ValueError("only preparation links declare total yield")
+        return self
+
+    @property
+    def portion_number(self) -> int:
+        """Return the stable portion number used by the ledger."""
+        return self.portion
+
+
+class SubmittedMealBatchLink(BaseModel):
+    """Optional confirmed batch metadata on a submitted meal."""
+
+    batch_id: RequirementId
+    role: BatchMealRole
+    source_date: date | None = Field(
+        default=None,
+        validation_alias=AliasChoices("source_date", "preparation_date"),
+    )
+    source_meal_type: MealType | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "source_meal_type", "preparation_meal_type"
+        ),
+    )
+    portion: int = Field(
+        default=1,
+        ge=1,
+        le=3,
+        validation_alias=AliasChoices("portion", "portion_number"),
+    )
+
+    @property
+    def portion_number(self) -> int:
+        """Return the stable portion number used by the ledger."""
+        return self.portion
+
+
+class BatchLedgerEntry(BaseModel):
+    """One weekly batch reservation or available inventory record."""
+
+    batch_id: RequirementId
+    source_plan_id: RequirementId
+    source_request_id: RequestId
+    source_revision: int = Field(ge=0)
+    preparation_date: date
+    preparation_meal_type: MealType
+    food: PreferenceFood = Field(
+        validation_alias=AliasChoices("food", "food_identity")
+    )
+    meal_name: ShortText | None = Field(
+        default=None,
+        validation_alias=AliasChoices("meal_name", "meal_identity"),
+    )
+    total_portions: int = Field(ge=2, le=3)
+    remaining_portions: int = Field(ge=0, le=3)
+    state: BatchLedgerState
+    week_end: date = Field(
+        validation_alias=AliasChoices("week_end", "expires_at")
+    )
+
+    @model_validator(mode="after")
+    def validate_ledger_entry(self) -> "BatchLedgerEntry":
+        """Keep portions and expiry in the preparation week."""
+        if self.preparation_meal_type not in {
+            MealType.LUNCH,
+            MealType.DINNER,
+        }:
+            raise ValueError("batch preparation must be lunch or dinner")
+        if self.remaining_portions > self.total_portions - 1:
+            raise ValueError(
+                "remaining_portions must leave the preparation portion used"
+            )
+        if self.week_end.weekday() != 6:
+            raise ValueError("batch week_end must be a Sunday")
+        preparation_week = self.preparation_date.isocalendar()[:2]
+        expiry_week = self.week_end.isocalendar()[:2]
+        if preparation_week != expiry_week:
+            raise ValueError("batch ledger entries cannot cross ISO weeks")
+        if self.state is BatchLedgerState.EXHAUSTED and self.remaining_portions:
+            raise ValueError("exhausted batches cannot have portions")
+        if (
+            self.state is BatchLedgerState.AVAILABLE
+            and self.remaining_portions == 0
+        ):
+            raise ValueError("available batches must have portions")
+        return self
+
+
+class WeeklyBatchLedger(BaseModel):
+    """Bounded batch inventory for exactly one ISO week."""
+
+    iso_week: ISO_WEEK
+    revision: int = Field(
+        default=0,
+        ge=0,
+        validation_alias=AliasChoices("revision", "ledger_revision"),
+    )
+    entries: list[BatchLedgerEntry] = Field(
+        default_factory=list, max_length=MAX_BATCH_LEDGER_ENTRIES
+    )
+
+    @model_validator(mode="after")
+    def validate_entries(self) -> "WeeklyBatchLedger":
+        """Keep entries unique and within this ledger's ISO week."""
+        try:
+            week_start = date.fromisocalendar(
+                int(self.iso_week[:4]), int(self.iso_week[6:]), 1
+            )
+        except TypeError, ValueError:
+            raise ValueError(
+                "iso_week must identify a valid ISO week"
+            ) from None
+        week_end = week_start.fromordinal(week_start.toordinal() + 6)
+        batch_ids = [entry.batch_id for entry in self.entries]
+        if len(batch_ids) != len(set(batch_ids)):
+            raise ValueError("weekly batch ledger entries must be unique")
+        if any(
+            entry.preparation_date < week_start
+            or entry.preparation_date > week_end
+            or entry.week_end != week_end
+            for entry in self.entries
+        ):
+            raise ValueError("batch ledger entries cannot cross ISO weeks")
+        return self
+
+    @property
+    def ledger_revision(self) -> int:
+        """Expose the CAS revision using explicit ledger terminology."""
+        return self.revision
+
+
+# Domain aliases make the contracts discoverable under the terminology used
+# by repository callers while retaining one canonical Pydantic implementation.
+RulePeriod = RuleCadence
+ScheduleSource = ScheduleKind
+BatchRole = BatchMealRole
+BatchState = BatchLedgerState
+BatchReuseRule = BatchRule
+ProjectedDietaryObligation = DietaryObligation
+BatchLedger = WeeklyBatchLedger
+MealBatchLink = SubmittedMealBatchLink
 
 
 class PreferenceRequirement(BaseModel):
@@ -550,8 +1020,15 @@ class ConversationState(BaseModel):
     workflow_kind: ConversationWorkflowKind
     step: ConversationWorkflowStep
     meal_draft: MealLogDraft | None = None
+    pending_batch_link: PlannedBatchLink | None = None
     preference: PlanPreference | None = None
     plan_days: PlanDays = 7
+    plan_start: date | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "plan_start", "week_start", "horizon_start"
+        ),
+    )
     duration_collected: bool = Field(default=True, strict=True)
     requirements: list[PreferenceRequirement] = Field(
         default_factory=list, max_length=20
@@ -566,6 +1043,7 @@ class ConversationState(BaseModel):
         max_length=20,
         validation_alias=AliasChoices("current_rules", "current_preferences"),
     )
+    batch_rules: list[BatchRule] = Field(default_factory=list, max_length=20)
     effective_rules: list[DietaryRule] = Field(
         default_factory=list,
         max_length=20,
@@ -577,6 +1055,13 @@ class ConversationState(BaseModel):
         default_factory=list,
         max_length=20,
         validation_alias=AliasChoices("constraint_rules", "constraints"),
+    )
+    obligations: list[DietaryObligation] = Field(
+        default_factory=list,
+        max_length=MAX_PLAN_OBLIGATIONS,
+        validation_alias=AliasChoices(
+            "obligations", "obligation_snapshot", "projected_obligations"
+        ),
     )
     profile_category: ProfileEditCategory | None = None
     profile_operation: ProfileEditOperation | None = None
@@ -592,6 +1077,27 @@ class ConversationState(BaseModel):
     updated_at: datetime
     expires_at: int = Field(ge=1)
     last_update_id: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def route_plan_week_start_alias(cls, value: Any) -> Any:
+        """Keep the legacy revision alias from capturing plan requests."""
+        if not isinstance(value, dict):
+            return value
+        workflow_kind = value.get("workflow_kind")
+        if (
+            workflow_kind
+            in {
+                ConversationWorkflowKind.PLAN_REQUEST,
+                ConversationWorkflowKind.PLAN_REQUEST.value,
+            }
+            and "week_start" in value
+            and "plan_start" not in value
+        ):
+            normalized = dict(value)
+            normalized["plan_start"] = normalized.pop("week_start")
+            return normalized
+        return value
 
     @property
     def stored_preferences(self) -> list[DietaryRule]:
@@ -673,13 +1179,22 @@ class ConversationState(BaseModel):
         if self.workflow_kind is ConversationWorkflowKind.MEAL_LOG:
             if self.step not in meal_steps or self.meal_draft is None:
                 raise ValueError("meal workflows require a meal draft step")
+            if self.pending_batch_link is not None and self.step is not (
+                ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION
+            ):
+                raise ValueError(
+                    "pending batch links require a meal review step"
+                )
             if (
                 self.preference is not None
                 or self.requirements
                 or self.stored_rules
                 or self.current_rules
+                or self.batch_rules
                 or self.effective_rules
                 or self.constraint_rules
+                or self.obligations
+                or self.plan_start is not None
                 or self.profile_category is not None
                 or self.profile_operation is not None
                 or self.amendment is not None
@@ -731,7 +1246,10 @@ class ConversationState(BaseModel):
                 raise ValueError(
                     "plan generation steps require a collected duration"
                 )
-            if self.meal_draft is not None:
+            if (
+                self.meal_draft is not None
+                or self.pending_batch_link is not None
+            ):
                 raise ValueError("plan workflows cannot contain meal fields")
             if (
                 self.amendment is not None
@@ -753,12 +1271,16 @@ class ConversationState(BaseModel):
                 raise ValueError("revision workflows require a generation step")
             if (
                 self.meal_draft is not None
+                or self.pending_batch_link is not None
                 or self.preference is not None
                 or self.requirements
                 or self.stored_rules
                 or self.current_rules
+                or self.batch_rules
                 or self.effective_rules
                 or self.constraint_rules
+                or self.obligations
+                or self.plan_start is not None
                 or self.profile_category is not None
                 or self.profile_operation is not None
             ):
@@ -782,15 +1304,19 @@ class ConversationState(BaseModel):
                 raise ValueError("profile workflows require a profile step")
             if (
                 self.meal_draft is not None
+                or self.pending_batch_link is not None
                 or self.preference is not None
                 or self.requirements
                 or self.stored_rules
                 or self.current_rules
+                or self.batch_rules
                 or self.effective_rules
                 or self.constraint_rules
+                or self.obligations
                 or self.request_id is not None
                 or self.amendment is not None
                 or self.target_week is not None
+                or self.plan_start is not None
                 or self.expected_plan_revision is not None
             ):
                 raise ValueError(
@@ -848,7 +1374,12 @@ class ConversationState(BaseModel):
     @property
     def week_start(self) -> date | None:
         """Return the revision's target week using plan terminology."""
-        return self.target_week
+        return self.target_week or self.plan_start
+
+    @property
+    def obligation_snapshot(self) -> list[DietaryObligation]:
+        """Return the immutable projected obligations for this request."""
+        return self.obligations
 
 
 # Short aliases keep the public contract convenient for callers and tests.
@@ -862,6 +1393,7 @@ class PlanGenerationContext(BaseModel):
 
     preference: PlanPreference | None = None
     plan_days: PlanDays = 7
+    week_start: date | None = None
     requirements: list[PreferenceRequirement] = Field(
         default_factory=list, max_length=MAX_PLAN_REQUIREMENTS
     )
@@ -875,6 +1407,7 @@ class PlanGenerationContext(BaseModel):
         max_length=MAX_PLAN_REQUIREMENTS,
         validation_alias=AliasChoices("current_rules", "current_preferences"),
     )
+    batch_rules: list[BatchRule] = Field(default_factory=list, max_length=20)
     effective_rules: list[DietaryRule] = Field(
         default_factory=list,
         max_length=MAX_PLAN_REQUIREMENTS,
@@ -886,6 +1419,13 @@ class PlanGenerationContext(BaseModel):
         default_factory=list,
         max_length=MAX_PLAN_REQUIREMENTS,
         validation_alias=AliasChoices("constraint_rules", "constraints"),
+    )
+    obligations: list[DietaryObligation] = Field(
+        default_factory=list,
+        max_length=MAX_PLAN_OBLIGATIONS,
+        validation_alias=AliasChoices(
+            "obligations", "obligation_snapshot", "projected_obligations"
+        ),
     )
     attempt: int = Field(default=1, ge=1, le=2)
     repair_feedback: RepairFeedback | None = None
@@ -933,6 +1473,7 @@ class PlanGenerationContext(BaseModel):
         for rules, label in (
             (self.stored_rules, "stored rules"),
             (self.current_rules, "current rules"),
+            (self.batch_rules, "batch rules"),
             (self.effective_rules, "effective rules"),
             (self.constraint_rules, "constraint rules"),
         ):
@@ -950,6 +1491,9 @@ class PlanGenerationContext(BaseModel):
         ]
         if len(tier_ids) != len(set(tier_ids)):
             raise ValueError("planning rule tiers must have unique IDs")
+        obligation_ids = [obligation.id for obligation in self.obligations]
+        if len(obligation_ids) != len(set(obligation_ids)):
+            raise ValueError("obligations must have unique IDs")
         return self
 
     @property
@@ -966,6 +1510,11 @@ class PlanGenerationContext(BaseModel):
     def constraints(self) -> list[ConstraintEntry]:
         """Return independent constraint rules."""
         return self.constraint_rules
+
+    @property
+    def obligation_snapshot(self) -> list[DietaryObligation]:
+        """Return the immutable projected obligations for generation."""
+        return self.obligations
 
 
 class PlanRevisionContext(BaseModel):
@@ -1009,6 +1558,9 @@ class UserProfile(BaseModel):
     dietary_preferences: list[DietaryPreferenceEntry] = Field(
         default_factory=list, max_length=MAX_PLAN_REQUIREMENTS
     )
+    batch_rules: list[BatchRule] = Field(
+        default_factory=list, max_length=MAX_PLAN_REQUIREMENTS
+    )
     people_count: int = Field(default=1, ge=1, le=20)
     profile_revision: int = Field(default=0, ge=0)
 
@@ -1032,6 +1584,17 @@ class UserProfile(BaseModel):
                 seen.add(key)
                 deduplicated.append(constraint)
         return deduplicated
+
+    @field_validator("batch_rules")
+    @classmethod
+    def reject_duplicate_batch_rule_ids(
+        cls, value: list[BatchRule]
+    ) -> list[BatchRule]:
+        """Keep each confirmed batch rule identifier unique."""
+        identifiers = [rule.id for rule in value]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("batch_rules must have unique IDs")
+        return value
 
     @model_validator(mode="after")
     def validate_member_count(self) -> "UserProfile":
@@ -1142,17 +1705,11 @@ def canonicalize_profile_rule_ids(profile: UserProfile) -> UserProfile:
         constraints.append(canonical.model_dump(mode="json"))
     preferences: list[dict[str, Any]] = []
     for preference in validated.dietary_preferences:
-        if preference.rule is None:
-            identifier = application_owned_text_id(
-                preference.source_text, namespace="profile-preference"
-            )
-            rule_data = None
-        else:
-            rule = canonicalize_dietary_rule(
-                preference.rule, namespace="profile-preference"
-            )
-            identifier = rule.id
-            rule_data = rule.model_dump(mode="json")
+        rule = canonicalize_dietary_rule(
+            preference.rule, namespace="profile-preference"
+        )
+        identifier = rule.id
+        rule_data = rule.model_dump(mode="json")
         preferences.append(
             {
                 "id": identifier,
@@ -1160,9 +1717,36 @@ def canonicalize_profile_rule_ids(profile: UserProfile) -> UserProfile:
                 "rule": rule_data,
             }
         )
+    batch_rules = [
+        rule.model_copy(
+            update={
+                "id": _application_owned_id(
+                    "profile-batch",
+                    {
+                        "source_text": rule.source_text.casefold().strip(),
+                        "foods_any_of": sorted(
+                            " ".join(normalize_food(food))
+                            for food in rule.foods_any_of
+                        ),
+                        "preparation_meal_types": sorted(
+                            meal_type.value
+                            for meal_type in rule.preparation_meal_types
+                        ),
+                        "reuse_meal_types": sorted(
+                            meal_type.value
+                            for meal_type in rule.reuse_meal_types
+                        ),
+                        "total_yield": rule.total_yield,
+                    },
+                )
+            }
+        ).model_dump(mode="json")
+        for rule in validated.batch_rules
+    ]
     data = validated.model_dump(mode="json", warnings=False)
     data["dietary_constraints"] = constraints
     data["dietary_preferences"] = preferences
+    data["batch_rules"] = batch_rules
     return UserProfile.model_validate(data)
 
 
@@ -1177,6 +1761,9 @@ class ProfileUpdateEntities(BaseModel):
     )
     dietary_preferences: list[DietaryPreferenceEntry] | None = Field(
         default=None, max_length=MAX_PLAN_REQUIREMENTS
+    )
+    batch_rules: list[BatchRule] = Field(
+        default_factory=list, max_length=MAX_PLAN_REQUIREMENTS
     )
 
     @model_validator(mode="before")
@@ -1234,6 +1821,35 @@ class PlannedMeal(BaseModel):
     ingredients: list[Ingredient] = Field(default_factory=list)
     est_calories: int = Field(default=0, ge=0, le=10_000)
     outcome: MealOutcome = MealOutcome.UNREPORTED
+    batch_link: PlannedBatchLink | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_batch_fields(cls, value: Any) -> Any:
+        """Accept direct batch fields while storing one typed link."""
+        if not isinstance(value, dict):
+            return value
+        if "batch_link" in value or "batch_id" not in value:
+            return value
+        normalized = dict(value)
+        normalized["batch_link"] = {
+            "batch_id": value["batch_id"],
+            "role": value.get("batch_role", value.get("role")),
+            "source_date": value.get("source_date"),
+            "source_meal_type": value.get("source_meal_type"),
+            "portion": value.get("portion", 1),
+        }
+        return normalized
+
+    @property
+    def batch_id(self) -> str | None:
+        """Return the linked batch ID without exposing storage details."""
+        return self.batch_link.batch_id if self.batch_link else None
+
+    @property
+    def batch_role(self) -> BatchMealRole | None:
+        """Return the linked batch role when one exists."""
+        return self.batch_link.role if self.batch_link else None
 
 
 class PlanDay(BaseModel):
@@ -1307,6 +1923,33 @@ class MealLogEntry(BaseModel):
     meal_type: MealType
     description: MealDescription
     created_at: datetime
+    batch_link: SubmittedMealBatchLink | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_batch_fields(cls, value: Any) -> Any:
+        """Accept direct batch fields while storing one typed link."""
+        if not isinstance(value, dict):
+            return value
+        if "batch_link" in value or "batch_id" not in value:
+            return value
+        normalized = dict(value)
+        normalized["batch_link"] = {
+            "batch_id": value["batch_id"],
+            "role": value.get("batch_role", value.get("role")),
+            "portion": value.get("portion", 1),
+        }
+        return normalized
+
+    @property
+    def batch_id(self) -> str | None:
+        """Return the linked batch ID without exposing storage details."""
+        return self.batch_link.batch_id if self.batch_link else None
+
+    @property
+    def batch_role(self) -> BatchMealRole | None:
+        """Return the linked batch role when one exists."""
+        return self.batch_link.role if self.batch_link else None
 
     @property
     def date_key(self) -> str:

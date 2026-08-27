@@ -5,8 +5,10 @@ from datetime import date, timedelta
 from typing import Literal, Optional, Sequence
 
 from meal_planner.models.schemas import (
+    BatchLedgerEntry,
     ConstraintEntry,
     ConversationState,
+    DietaryObligation,
     DietaryPreferenceEntry,
     DietaryRule,
     FamilyMember,
@@ -92,6 +94,46 @@ def _render_constraint_rules(entries: Sequence[ConstraintEntry]) -> str:
     )
 
 
+def _render_obligations(entries: Sequence[DietaryObligation]) -> str:
+    """Render only application-owned, horizon-specific obligations."""
+    if not entries:
+        return "None."
+    lines: list[str] = []
+    for obligation in sorted(entries, key=lambda item: item.id):
+        scope = (
+            obligation.meal_type.value
+            if obligation.meal_type is not None
+            else "any meal"
+        )
+        dates = ", ".join(
+            target_date.isoformat()
+            for target_date in sorted(obligation.eligible_dates)
+        )
+        foods = " or ".join(obligation.foods_any_of)
+        lines.append(
+            f"- {obligation.id}: dates: {dates}; "
+            f"foods_any_of: {foods}; meal_type: {scope}; "
+            f"operator: {obligation.operator.value}; count: "
+            f"{obligation.count}; strength: {obligation.strength.value}; "
+            f"iso_week: {obligation.iso_week}"
+        )
+    return "\n".join(lines)
+
+
+def _render_available_batches(entries: Sequence[BatchLedgerEntry]) -> str:
+    """Render only the inventory facts needed for batch selection."""
+    if not entries:
+        return "None."
+    return "\n".join(
+        f"- {entry.batch_id}: food: {entry.food}; preparation_date: "
+        f"{entry.preparation_date.isoformat()}; preparation_meal_type: "
+        f"{entry.preparation_meal_type.value}; remaining portions: "
+        f"{entry.remaining_portions} portions remaining; eligible reuse meal "
+        "types: lunch, dinner"
+        for entry in sorted(entries, key=lambda item: item.batch_id)
+    )
+
+
 def _profile_text(profile: UserProfile | None) -> str:
     """Render the trusted household profile for planner prompts."""
     if profile is None:
@@ -108,9 +150,7 @@ def _profile_text(profile: UserProfile | None) -> str:
         f"People Count: {profile.people_count}\n"
         f"Family Members: {members}\n"
         f"Dietary constraints: "
-        f"{_render_constraint_entries(profile.dietary_constraints)}\n"
-        f"Dietary Preferences: "
-        f"{_render_preference_entries(profile.dietary_preferences)}"
+        f"{_render_constraint_entries(profile.dietary_constraints)}"
     )
 
 
@@ -275,6 +315,8 @@ def build_plan_prompt(
     effective_rules: Sequence[DietaryRule] | None = None,
     constraint_rules: Sequence[ConstraintEntry] | None = None,
     constraints: Sequence[ConstraintEntry] | None = None,
+    obligations: Sequence[DietaryObligation] | None = None,
+    available_batches: Sequence[BatchLedgerEntry] | None = None,
     repair_feedback: str | None = None,
 ) -> str:
     """Build a meal-plan generation prompt for the requested duration."""
@@ -289,7 +331,6 @@ def build_plan_prompt(
             )
             or f"1 person ({profile.name})"
         )
-        dietary_str = _render_preference_entries(profile.dietary_preferences)
         dietary_constraints_str = _render_constraint_entries(
             profile.dietary_constraints
         )
@@ -297,8 +338,7 @@ def build_plan_prompt(
             f"Family Name: {profile.name}\n"
             f"Total People Count: {profile.people_count}\n"
             f"Family Members & Calorie Targets: {members_str}\n"
-            f"Dietary constraints: {dietary_constraints_str}\n"
-            f"Dietary Preferences: {dietary_str}"
+            f"Dietary constraints: {dietary_constraints_str}"
         )
 
     history_text = "None."
@@ -328,23 +368,15 @@ def build_plan_prompt(
             f"Swapped: {', '.join(swapped_meals) or 'None'}"
         )
 
-    effective = list(effective_rules or requirements or [])
-    strict_rules = [
-        rule
-        for rule in effective
-        if not isinstance(rule, DietaryRule) or rule.strength.value == "strict"
-    ]
-    best_effort_rules = [
-        rule
-        for rule in effective
-        if isinstance(rule, DietaryRule)
-        and rule.strength.value == "best_effort"
-    ]
-    requirement_text = _render_rules(effective)
-    stored_text = _render_rules(stored_rules or [])
-    current_text = preference.strip() if preference else "None."
+    obligation_snapshot = list(obligations or [])
     selected_constraints = list(
-        constraint_rules if constraint_rules is not None else constraints or []
+        constraint_rules
+        if constraint_rules is not None
+        else constraints
+        if constraints is not None
+        else profile.dietary_constraints
+        if profile is not None
+        else []
     )
     repair_text = ""
     if repair_feedback:
@@ -370,20 +402,19 @@ def build_plan_prompt(
         "profile constraints below. Dietary constraints and safety "
         "requirements always take precedence over calorie, protein, "
         "fibre, and request-specific preferences.\n\n"
-        "=== STORED PREFERENCE WORDING (LOWER PRIORITY) ===\n"
-        f"{stored_text}\n\n"
-        "=== CURRENT PLAN PREFERENCE (HIGHER THAN STORED) ===\n"
-        f"{current_text}\n\n"
         "=== DIETARY CONSTRAINTS (HIGHEST PRIORITY) ===\n"
         f"{_render_constraint_rules(selected_constraints)}\n"
-        "Never weaken, replace, or reinterpret these constraints.\n\n"
-        "=== EFFECTIVE STRICT RULES ===\n"
-        f"{_render_rules(strict_rules)}\n"
-        "Every strict rule must be satisfied by the generated plan.\n\n"
-        "=== EFFECTIVE BEST-EFFORT RULES ===\n"
-        f"{_render_rules(best_effort_rules)}\n"
-        "Best-effort rules may be omitted when they conflict with a higher "
-        "priority rule.\n\n"
+        "Never weaken or replace these constraints.\n\n"
+        "=== HORIZON OBLIGATIONS (APPLICATION-OWNED) ===\n"
+        f"{_render_obligations(obligation_snapshot)}\n"
+        "Satisfy strict obligations on their exact listed dates and meal "
+        "types. Best-effort obligations are advisory. Do not create or "
+        "change obligations.\n\n"
+        "=== AVAILABLE BATCH PORTIONS (APPLICATION-OWNED) ===\n"
+        f"{_render_available_batches(list(available_batches or []))}\n"
+        "Reuse only a listed available batch, only after its preparation "
+        "date, and only for lunch or dinner. Never infer inventory state "
+        "from meal wording.\n\n"
         "=== PER-MEMBER NUTRITION TARGET GUIDANCE ===\n"
         "Use every supplied per-member calorie, protein, and fibre target "
         "to guide meal choices and portions. This is best-effort guidance; "
@@ -391,18 +422,24 @@ def build_plan_prompt(
         "validate, detect, or repair target compliance. Keep the returned "
         "plan JSON schema unchanged; do not add nutrient totals or "
         "per-member portions.\n\n"
-        "=== INTERPRETED PREFERENCE RULES (EXACT COMPLIANCE) ===\n"
-        f"{requirement_text}\n"
-        "Treat each structured rule as an application-owned obligation. "
-        "Do not omit, "
-        "weaken, or reinterpret any listed rule. Permanent profile "
-        "constraints remain higher priority.\n\n"
         "=== GENERATED PLAN CONTRACT ===\n"
         "Include exactly one breakfast, one lunch, and one dinner on each "
         f"of the {plan_days} days. Snack is optional, and do not add other "
         "meal "
         "types. Every present meal must include at least one non-empty "
         "ingredient item and positive est_calories.\n\n"
+        "Batch cooking contract: a preparation meal must be lunch or dinner "
+        "and has a batch_link with an application-owned batch_id, role "
+        "preparation, total_yield 2 or 3 total portions, and portion 1. "
+        "A linked leftover "
+        "must use the same "
+        "batch_id as its preparation or one listed above, role leftover, "
+        "the exact source_date and source_meal_type, and portion 2 or 3. "
+        "A preparation covers two or three total portions, so it may have "
+        "at most two linked leftovers. Every batch-linked meal must include "
+        "complete ingredients. batch IDs are application-owned; do not "
+        "invent or alter an available reservation ID. Never use a batch "
+        "link on an ordinary meal.\n\n"
         f"The days array must contain exactly {plan_days} consecutive entries "
         f"with day numbers: {day_sequence}.\n\n"
         f"{repair_text}"
@@ -424,7 +461,11 @@ def build_plan_prompt(
         '            {"item": "Ingredient", "amount": "Quantity"}\n'
         "          ],\n"
         '          "est_calories": 500,\n'
-        '          "outcome": "unreported"\n'
+        '          "outcome": "unreported",\n'
+        '          "batch_link": {"batch_id": "application-issued-id", '
+        '"role": "preparation|leftover", "source_date": "YYYY-MM-DD", '
+        '"source_meal_type": "lunch|dinner", "portion": 1, '
+        '"total_yield": 2}\n'
         "        }\n"
         "      ]\n"
         "    }\n"
@@ -483,6 +524,11 @@ def build_preference_interpretation_prompt(
         "Combine alternative foods that satisfy one rule together in "
         "foods_any_of; "
         "alternatives count as one union, not separate requirements.\n"
+        "For stored_preference and current_plan_preference modes, emit one "
+        "typed batch rule for wording that says one preparation covers two "
+        "or three later lunch or dinner meals. Batch rules belong in "
+        "batch_rules, never in requirements; use total_yield 2 or 3 and "
+        "explicit preparation_meal_types and reuse_meal_types.\n"
         "Use meal_type only when the user names breakfast, lunch, dinner, "
         "or snack. Omit the scope with null when the rule applies to any "
         "meal.\n"
@@ -511,6 +557,16 @@ def build_preference_interpretation_prompt(
         '      "operator": "at_least",\n'
         '      "count": 3,\n'
         '      "strength": "strict"\n'
+        "    }\n"
+        "  ],\n"
+        '  "batch_rules": [\n'
+        "    {\n"
+        '      "id": "b1",\n'
+        '      "source_text": "cook once for two lunches or dinners",\n'
+        '      "foods_any_of": ["chicken"],\n'
+        '      "preparation_meal_types": ["dinner"],\n'
+        '      "reuse_meal_types": ["lunch", "dinner"],\n'
+        '      "total_yield": 2\n'
         "    }\n"
         "  ],\n"
         '  "exclusions": [],\n'
@@ -567,6 +623,7 @@ def build_plan_revision_prompt(
     *,
     expected_plan_days: int | None = None,
     week_start: str | None = None,
+    available_batches: Sequence[BatchLedgerEntry] | None = None,
 ) -> str:
     """Build a complete-plan replacement prompt for a draft revision."""
     plan_days = (
@@ -603,6 +660,21 @@ def build_plan_revision_prompt(
         f"{instructions}\n\n"
         "=== LATEST USER AMENDMENT (HIGHEST REQUEST PRIORITY) ===\n"
         f"{amendment}\n\n"
+        "=== AVAILABLE BATCH PORTIONS (APPLICATION-OWNED) ===\n"
+        f"{_render_available_batches(list(available_batches or []))}\n"
+        "Reuse only listed portions after preparation, for lunch or dinner; "
+        "preserve valid batch links and do not invent inventory state.\n\n"
+        "Batch cooking contract: a preparation meal must be lunch or dinner "
+        "and has a batch_link with an application-owned batch_id, role "
+        "preparation, total_yield 2 or 3 total portions, and portion 1. "
+        "A linked leftover must use the same batch_id as its preparation or "
+        "one listed above, role leftover, the exact source_date and "
+        "source_meal_type, and portion 2 or 3. A preparation covers two or "
+        "three total portions, so it may have at most two linked leftovers. "
+        "Every batch-linked meal must include complete ingredients. Batch IDs "
+        "are application-owned; preserve only listed inventory IDs and do not "
+        "invent inventory state. Never use a batch link on an ordinary meal. "
+        "\n\n"
         "Satisfy all compatible instructions and preserve sensible "
         "unaffected choices. Use every supplied per-member calorie, "
         "protein, and fibre target to guide meal choices and portions. "
@@ -631,7 +703,11 @@ def build_plan_revision_prompt(
         '          "ingredients": [{"item": "Ingredient", '
         '"amount": "Quantity"}],\n'
         '          "est_calories": 500,\n'
-        '          "outcome": "unreported"\n'
+        '          "outcome": "unreported",\n'
+        '          "batch_link": {"batch_id": "application-issued-id", '
+        '"role": "preparation|leftover", "source_date": "YYYY-MM-DD", '
+        '"source_meal_type": "lunch|dinner", "portion": 1, '
+        '"total_yield": 2}\n'
         "        }\n"
         "      ]\n"
         "    }\n"

@@ -12,10 +12,14 @@ from meal_planner.llm.prompts import (
     build_preference_interpretation_prompt,
 )
 from meal_planner.models.schemas import (
+    BatchLedgerEntry,
+    BatchLedgerState,
     ConstraintEntry,
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
+    DietaryObligation,
+    DietaryPreferenceEntry,
     DietaryRule,
     FamilyMember,
     Ingredient,
@@ -69,7 +73,18 @@ def test_build_conversational_prompt_with_context() -> None:
             FamilyMember(name="John", calorie_target=2100),
         ],
         dietary_constraints=["peanuts", "dairy-free"],
-        dietary_preferences=["low-carb"],
+        dietary_preferences=[
+            DietaryPreferenceEntry(
+                id="preference-low-carb",
+                source_text="low-carb",
+                rule=DietaryRule(
+                    id="rule-low-carb",
+                    source_text="low-carb",
+                    foods_any_of=["low-carb"],
+                    count=1,
+                ),
+            )
+        ],
         people_count=2,
     )
     meal = PlannedMeal(meal_type="lunch", name="Salad")
@@ -288,6 +303,50 @@ def test_build_plan_prompt_states_complete_generated_plan_contract() -> None:
     assert "positive est_calories" in prompt
 
 
+def test_build_plan_prompt_states_batch_generation_contract() -> None:
+    """Batch output names its role, yield, scope, and complete ingredients."""
+    prompt = build_plan_prompt()
+
+    assert "batch_link" in prompt
+    assert "preparation" in prompt and "leftover" in prompt
+    assert "batch IDs are application-owned" in prompt
+    assert "lunch or dinner" in prompt
+    assert "source_date" in prompt
+    assert "portion" in prompt
+    assert "total_yield" in prompt
+    assert "2 or 3 total portions" in prompt
+    assert "Never use a batch link on an ordinary meal" in prompt
+
+
+def test_build_plan_prompt_renders_available_batch_reservations() -> None:
+    """The model receives bounded available inventory without ownership data."""
+    entry = BatchLedgerEntry(
+        batch_id="batch-chicken",
+        source_plan_id="private-plan",
+        source_request_id="private-request",
+        source_revision=4,
+        preparation_date=date(2026, 8, 18),
+        preparation_meal_type="dinner",
+        food="chicken",
+        meal_name="Roast chicken",
+        total_portions=3,
+        remaining_portions=2,
+        state=BatchLedgerState.AVAILABLE,
+        week_end=date(2026, 8, 23),
+    )
+
+    prompt = build_plan_prompt(
+        week_start="2026-08-19", available_batches=[entry]
+    )
+
+    assert "AVAILABLE BATCH PORTIONS" in prompt
+    assert "batch-chicken" in prompt
+    assert "2026-08-18" in prompt
+    assert "2 portions" in prompt
+    assert "private-plan" not in prompt
+    assert "private-request" not in prompt
+
+
 def test_repair_plan_prompt_states_same_complete_generated_plan_contract() -> (
     None
 ):
@@ -312,7 +371,18 @@ def test_build_plan_prompt_with_context() -> None:
             FamilyMember(name="Charlie", calorie_target=2000),
         ],
         dietary_constraints=["shellfish"],
-        dietary_preferences=["keto"],
+        dietary_preferences=[
+            DietaryPreferenceEntry(
+                id="preference-keto",
+                source_text="keto",
+                rule=DietaryRule(
+                    id="rule-keto",
+                    source_text="keto",
+                    foods_any_of=["keto"],
+                    count=1,
+                ),
+            )
+        ],
         people_count=3,
     )
     history = [
@@ -463,17 +533,12 @@ def test_plan_prompt_separates_constraint_strict_and_best_effort_rules() -> (
     )
 
     assert "=== DIETARY CONSTRAINTS (HIGHEST PRIORITY) ===" in prompt
-    assert "=== EFFECTIVE STRICT RULES ===" in prompt
-    assert "=== EFFECTIVE BEST-EFFORT RULES ===" in prompt
-    assert prompt.index("HIGHEST PRIORITY") < prompt.index(
-        "EFFECTIVE STRICT RULES"
-    )
-    assert prompt.index("EFFECTIVE STRICT RULES") < prompt.index(
-        "EFFECTIVE BEST-EFFORT RULES"
-    )
+    assert "=== HORIZON OBLIGATIONS (APPLICATION-OWNED) ===" in prompt
+    assert "EFFECTIVE STRICT RULES" not in prompt
+    assert "EFFECTIVE BEST-EFFORT RULES" not in prompt
     assert "no peanuts" in prompt
-    assert "strict-1" in prompt
-    assert "best-1" in prompt
+    assert "strict-1" not in prompt
+    assert "best-1" not in prompt
     assert "Goals" not in prompt
 
 
@@ -500,15 +565,9 @@ def test_plan_prompt_renders_raw_preference_and_every_exact_rule() -> None:
     )
 
     assert "crepes or pancakes once at breakfast, eggs three times" in prompt
-    assert "r1" in prompt
-    assert "crepes or pancakes once at breakfast" in prompt
-    assert "foods_any_of: crepes, pancakes" in prompt
-    assert "meal_type: breakfast" in prompt
-    assert "exact_count: 1" in prompt
-    assert "r2" in prompt
-    assert "foods_any_of: eggs" in prompt
-    assert "meal_type: any meal" in prompt
-    assert "exact_count: 3" in prompt
+    assert "r1" not in prompt
+    assert "r2" not in prompt
+    assert "INTERPRETED PREFERENCE RULES" not in prompt
     assert "Dietary constraints: peanuts" in prompt
     assert "always take precedence" in prompt
 
@@ -532,6 +591,61 @@ def test_plan_prompt_renders_bounded_repair_feedback() -> None:
     assert "r1 matched 2 meals; expected exactly 3" in prompt
     assert "OUTPUT JSON SCHEMA" in prompt
     assert '"week_start_date"' in prompt
+
+
+def test_plan_prompt_renders_only_dated_obligations_and_constraints() -> None:
+    """Generation receives the horizon snapshot, never saved rule prose."""
+    obligation = DietaryObligation(
+        id="eggs-2026-W34-2026-08-19",
+        source_rule_id="eggs-rule",
+        iso_week="2026-W34",
+        horizon_start=date(2026, 8, 19),
+        horizon_end=date(2026, 8, 19),
+        eligible_dates=[date(2026, 8, 19)],
+        operator="at_least",
+        count=1,
+        foods_any_of=["egg"],
+        meal_type="breakfast",
+    )
+    profile = UserProfile(
+        name="Alice",
+        dietary_constraints=[
+            ConstraintEntry(
+                id="no-mushrooms",
+                source_text="Avoid mushrooms",
+                forbidden_terms=["mushroom"],
+            )
+        ],
+        dietary_preferences=[
+            DietaryPreferenceEntry(
+                id="legacy-private",
+                source_text="PRIVATE SAVED RULE TEXT",
+                rule=DietaryRule(
+                    id="legacy-private-rule",
+                    source_text="PRIVATE SAVED RULE TEXT",
+                    foods_any_of=["egg"],
+                    count=3,
+                ),
+            )
+        ],
+    )
+
+    prompt = build_plan_prompt(
+        profile=profile,
+        week_start="2026-08-17",
+        plan_days=3,
+        stored_rules=[profile.dietary_preferences[0].rule],
+        effective_rules=[profile.dietary_preferences[0].rule],
+        obligations=[obligation],
+        constraints=profile.dietary_constraints,
+    )
+
+    assert "2026-08-19" in prompt
+    assert "eggs-2026-W34-2026-08-19" in prompt
+    assert "Avoid mushrooms" in prompt
+    assert "PRIVATE SAVED RULE TEXT" not in prompt
+    assert "STORED PREFERENCE WORDING" not in prompt
+    assert "reinterpret" not in prompt.casefold()
 
 
 def test_plan_revision_prompt_does_not_receive_generation_rules() -> None:
@@ -563,6 +677,19 @@ def test_preference_interpretation_prompt_defines_measurable_contract() -> None:
     assert "Combine alternative foods" in prompt
     assert "Every meaningful clause" in prompt
     assert "unparsed_text" in prompt
+
+
+def test_preference_interpretation_prompt_defines_batch_contract() -> None:
+    """Profile interpretation includes a separate bounded batch contract."""
+    prompt = build_preference_interpretation_prompt(
+        "cook one dinner batch for two lunches"
+    )
+
+    assert '"batch_rules"' in prompt
+    assert "total_yield 2 or 3" in prompt
+    assert "preparation_meal_types" in prompt
+    assert "reuse_meal_types" in prompt
+    assert "Batch rules belong in batch_rules" in prompt
 
 
 @pytest.mark.parametrize(
@@ -804,6 +931,25 @@ def test_revision_prompt_guides_best_effort_adjustment_and_priority() -> None:
     assert "does not calculate, validate, detect, or repair" in prompt
     assert '"est_calories"' in prompt
     assert "protein_total" not in prompt
+
+
+def test_revision_prompt_requires_complete_batch_yield_contract() -> None:
+    """Revision batch links retain the initial generation contract."""
+    profile = UserProfile(name="Household")
+    plan = WeeklyPlan(
+        week_start="2026-08-10",
+        days=[PlanDay(day=value) for value in range(1, 8)],
+    )
+
+    prompt = build_plan_revision_prompt(profile, plan, "Keep the batch meals")
+
+    assert "total_yield 2 or 3 total portions" in prompt
+    assert '"total_yield": 2' in prompt
+    assert "role preparation" in prompt
+    assert "role leftover" in prompt
+    assert "portion 1" in prompt
+    assert "portion 2 or 3" in prompt
+    assert "at most two linked leftovers" in prompt
 
 
 def test_build_grocery_prompt() -> None:

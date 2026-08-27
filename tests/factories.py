@@ -4,6 +4,10 @@ from datetime import date
 from typing import Any
 
 from meal_planner.models.schemas import (
+    BatchLedgerEntry,
+    BatchLedgerState,
+    BatchMealRole,
+    BatchRule,
     ConstraintEntry,
     DietaryPreferenceEntry,
     DietaryRule,
@@ -13,11 +17,81 @@ from meal_planner.models.schemas import (
     MealOutcome,
     PlanDay,
     PlanDays,
+    PlannedBatchLink,
     PlannedMeal,
     PlanStatus,
+    SubmittedMealBatchLink,
     UserProfile,
     WeeklyPlan,
 )
+
+
+def make_batch_rule(
+    source_text: str = "cook once for two lunches",
+    *,
+    identifier: str = "batch-rule-1",
+    foods_any_of: list[str] | None = None,
+    total_yield: int = 2,
+) -> BatchRule:
+    """Return a valid confirmed batch-reuse rule."""
+    return BatchRule(
+        id=identifier,
+        source_text=source_text,
+        foods_any_of=foods_any_of or ["chicken"],
+        preparation_meal_types=["dinner"],
+        reuse_meal_types=["lunch", "dinner"],
+        total_yield=total_yield,
+    )
+
+
+def make_planned_batch_link(
+    batch_id: str = "batch-1", *, leftover: bool = False
+) -> PlannedBatchLink:
+    """Return valid preparation or leftover planned batch metadata."""
+    if not leftover:
+        return PlannedBatchLink(
+            batch_id=batch_id, role=BatchMealRole.PREPARATION
+        )
+    return PlannedBatchLink(
+        batch_id=batch_id,
+        role=BatchMealRole.LEFTOVER,
+        source_date=date(2026, 8, 19),
+        source_meal_type="dinner",
+        portion=2,
+    )
+
+
+def make_batch_ledger_entry(
+    batch_id: str = "batch-1",
+    *,
+    state: BatchLedgerState = BatchLedgerState.PROVISIONAL,
+) -> BatchLedgerEntry:
+    """Return a valid weekly batch-ledger entry."""
+    return BatchLedgerEntry(
+        batch_id=batch_id,
+        source_plan_id="plan-1",
+        source_request_id="request-1",
+        source_revision=1,
+        preparation_date=date(2026, 8, 19),
+        preparation_meal_type="dinner",
+        food="chicken",
+        meal_name="Roast chicken",
+        total_portions=2,
+        remaining_portions=1,
+        state=state,
+        week_end=date(2026, 8, 23),
+    )
+
+
+def make_submitted_batch_link(
+    batch_id: str = "batch-1", *, leftover: bool = True
+) -> SubmittedMealBatchLink:
+    """Return valid optional submitted-meal batch metadata."""
+    return SubmittedMealBatchLink(
+        batch_id=batch_id,
+        role=BatchMealRole.LEFTOVER if leftover else BatchMealRole.PREPARATION,
+        portion=2 if leftover else 1,
+    )
 
 
 def make_constraint(
