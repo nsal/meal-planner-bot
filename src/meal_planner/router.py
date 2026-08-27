@@ -8,7 +8,9 @@ from uuid import UUID
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
+    StrictInt,
     ValidationError,
     field_validator,
     model_validator,
@@ -26,6 +28,10 @@ from meal_planner.models.schemas import (
 from meal_planner.telegram.commands import BOT_COMMANDS
 
 MAX_CALLBACK_DATA_BYTES = 64
+# Profile lists contain at most 20 entries each.  Removal displays dietary
+# preferences and batch rules together, so 40 is the largest category index.
+MAX_PROFILE_REMOVAL_INDEX = 40
+MAX_PROFILE_REVISION = 2**63 - 1
 
 
 class RouteType(str, Enum):
@@ -75,25 +81,59 @@ class ProfileCallbackAction(str, Enum):
     CLOSE = "close"
     CONFIRM = "confirm"
     CANCEL = "cancel"
+    REMOVE_SELECTION = "remove"
 
 
 class ProfileCallback(BaseModel):
     """Validated callback payload for deterministic profile editing."""
 
+    model_config = ConfigDict(extra="forbid")
+
     action: ProfileCallbackAction
     category: ProfileEditCategory | None = None
     operation: ProfileEditOperation | None = None
     token: str | None = None
+    index: StrictInt | None = Field(
+        default=None, ge=1, le=MAX_PROFILE_REMOVAL_INDEX
+    )
+    profile_revision: StrictInt | None = Field(
+        default=None, ge=0, le=MAX_PROFILE_REVISION
+    )
 
     @model_validator(mode="after")
     def validate_payload_shape(self) -> "ProfileCallback":
         """Require exactly the fields allowed by each callback action."""
+        if self.action is ProfileCallbackAction.REMOVE_SELECTION:
+            if (
+                self.category is None
+                or self.operation is not None
+                or self.token is not None
+                or self.index is None
+                or self.profile_revision is None
+            ):
+                raise ValueError(
+                    "removal callbacks require category, index, and "
+                    "profile revision"
+                )
+            return self
         if self.action is ProfileCallbackAction.CATEGORY:
-            if self.category is None or self.operation is not None:
+            if (
+                self.category is None
+                or self.operation is not None
+                or self.token is not None
+                or self.index is not None
+                or self.profile_revision is not None
+            ):
                 raise ValueError("category callbacks require only a category")
             return self
         if self.action is ProfileCallbackAction.OPERATION:
-            if self.category is None or self.operation is None:
+            if (
+                self.category is None
+                or self.operation is None
+                or self.token is not None
+                or self.index is not None
+                or self.profile_revision is not None
+            ):
                 raise ValueError(
                     "operation callbacks require category and operation"
                 )
@@ -107,6 +147,8 @@ class ProfileCallback(BaseModel):
             if (
                 self.category is not None
                 or self.operation is not None
+                or self.index is not None
+                or self.profile_revision is not None
                 or self.token is None
                 or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", self.token)
             ):
@@ -116,6 +158,8 @@ class ProfileCallback(BaseModel):
             self.category is not None
             or self.operation is not None
             or self.token is not None
+            or self.index is not None
+            or self.profile_revision is not None
         ):
             raise ValueError("navigation callbacks cannot contain selections")
         return self
@@ -315,6 +359,20 @@ def parse_profile_callback(data: str) -> ProfileCallback | None:
             if len(parts) != 2:
                 return None
             return ProfileCallback(action=action)
+        if action is ProfileCallbackAction.REMOVE_SELECTION:
+            if len(parts) != 5:
+                return None
+            if any(
+                re.fullmatch(r"(?:0|[1-9][0-9]*)", part) is None
+                for part in parts[3:5]
+            ):
+                return None
+            return ProfileCallback(
+                action=action,
+                category=ProfileEditCategory(parts[2]),
+                index=int(parts[3]),
+                profile_revision=int(parts[4]),
+            )
         if action in {
             ProfileCallbackAction.CONFIRM,
             ProfileCallbackAction.CANCEL,

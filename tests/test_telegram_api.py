@@ -20,14 +20,22 @@ from meal_planner.models.schemas import (
     UserProfile,
 )
 from meal_planner.telegram.api import (
+    ProfilePresentationItem,
     TelegramAPI,
     TelegramAPIError,
     meal_continuation_keyboard,
     meal_review_keyboard,
+    profile_presentation_items,
     split_text,
 )
 from meal_planner.telegram.commands import TelegramCommand
-from tests.factories import make_batch_rule, make_plan, make_profile
+from tests.factories import (
+    make_batch_rule,
+    make_constraint,
+    make_plan,
+    make_preference,
+    make_profile,
+)
 
 
 def _response() -> BytesIO:
@@ -257,7 +265,7 @@ def test_profile_summary_renders_canonical_text_and_root_controls(
     TelegramAPI("token").send_profile(1, make_profile())
 
     payload = _last_payload(urlopen)
-    assert "Dietary constraints: None" in payload["text"]
+    assert "Dietary constraints:\nNone" in payload["text"]
     assert "Allergies:" not in payload["text"]
     assert payload["reply_markup"] == {
         "inline_keyboard": [
@@ -324,10 +332,228 @@ def test_profile_summary_renders_bounded_batch_rules_without_storage_id(
 
     payload = _last_payload(urlopen)
     assert (
-        "Batch rules: cook chicken once for two lunches "
+        "Batch rules:\n1. cook chicken once for two lunches "
         "(prepare dinner; reuse lunch, dinner; 2 meals)"
     ) in payload["text"]
     assert "storage-only-batch-id" not in payload["text"]
+
+
+def test_profile_presentation_items_keep_stored_order_and_type_labels() -> None:
+    """The removal projection combines preferences and batches
+    deterministically.
+    """
+    profile = make_profile().model_copy(
+        update={
+            "dietary_preferences": [
+                make_preference("first preference", identifier="pref-1"),
+                make_preference("second preference", identifier="pref-2"),
+            ],
+            "batch_rules": [
+                make_batch_rule("first batch", identifier="batch-1"),
+                make_batch_rule("second batch", identifier="batch-2"),
+            ],
+        }
+    )
+
+    items = profile_presentation_items(
+        profile, ProfileEditCategory.DIETARY_PREFERENCES
+    )
+
+    assert all(isinstance(item, ProfilePresentationItem) for item in items)
+    assert [item.label for item in items] == [
+        "Dietary preference: first preference",
+        "Dietary preference: second preference",
+        "Batch rule: first batch (prepare dinner; reuse lunch, dinner; "
+        "2 meals)",
+        "Batch rule: second batch (prepare dinner; reuse lunch, dinner; "
+        "2 meals)",
+    ]
+    assert all(item.value.id not in item.label for item in items)
+
+
+def test_profile_presentation_items_keep_family_order() -> None:
+    """Family removal entries follow the persisted member order."""
+    profile = make_profile()
+
+    items = profile_presentation_items(profile, ProfileEditCategory.FAMILY)
+
+    assert [item.label for item in items] == [
+        "Alex (2000 kcal/day, protein: not set, fibre: not set)",
+        "Sam (1800 kcal/day, protein: not set, fibre: not set)",
+    ]
+
+
+def test_profile_summary_numbers_rules_in_stored_order(
+    mocker: MockerFixture,
+) -> None:
+    """Profile rule sections use one numbered, dot-separated item per line."""
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+    profile = make_profile().model_copy(
+        update={
+            "dietary_constraints": [
+                make_constraint("first constraint", identifier="constraint-1"),
+                make_constraint("second constraint", identifier="constraint-2"),
+            ],
+            "dietary_preferences": [
+                make_preference("first preference", identifier="pref-1"),
+                make_preference("second preference", identifier="pref-2"),
+            ],
+            "batch_rules": [
+                make_batch_rule("first batch", identifier="batch-1"),
+                make_batch_rule("second batch", identifier="batch-2"),
+            ],
+        }
+    )
+
+    TelegramAPI("token").send_profile(1, profile)
+
+    text = _last_payload(urlopen)["text"]
+    assert (
+        "Dietary constraints:\n1. first constraint\n2. second constraint"
+        in text
+    )
+    assert (
+        "Dietary preferences:\n1. first preference\n2. second preference"
+        in text
+    )
+    assert "Batch rules:\n1. first batch" in text
+    assert "\n2. second batch" in text
+
+
+def test_profile_removal_operation_renders_wrapped_number_buttons(
+    mocker: MockerFixture,
+) -> None:
+    """Combined dietary removal buttons are numbered and revision-stamped."""
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+    profile = make_profile().model_copy(
+        update={
+            "profile_revision": 17,
+            "dietary_preferences": [
+                make_preference(f"preference {index}", identifier=f"p-{index}")
+                for index in range(1, 5)
+            ],
+            "batch_rules": [
+                make_batch_rule(f"batch {index}", identifier=f"b-{index}")
+                for index in range(1, 4)
+            ],
+        }
+    )
+
+    TelegramAPI("token").send_profile_operation(
+        1,
+        ProfileEditCategory.DIETARY_PREFERENCES,
+        ProfileEditOperation.REMOVE,
+        profile,
+    )
+
+    payload = _last_payload(urlopen)
+    assert "1. Dietary preference: preference 1" in payload["text"]
+    assert "4. Dietary preference: preference 4" in payload["text"]
+    assert "5. Batch rule: batch 1" in payload["text"]
+    assert "7. Batch rule: batch 3" in payload["text"]
+    buttons = payload["reply_markup"]["inline_keyboard"]
+    assert [[button["text"] for button in row] for row in buttons] == [
+        ["1", "2", "3", "4", "5"],
+        ["6", "7"],
+        ["Back"],
+        ["Done"],
+        ["Close"],
+    ]
+    callbacks = [
+        button["callback_data"] for row in buttons[:2] for button in row
+    ]
+    assert callbacks == [
+        f"profile:remove:dietary_preferences:{index}:17"
+        for index in range(1, 8)
+    ]
+    assert all(len(callback.encode("utf-8")) < 64 for callback in callbacks)
+
+
+def test_profile_removal_keeps_duplicate_labels_at_distinct_indices(
+    mocker: MockerFixture,
+) -> None:
+    """Duplicate display text still produces distinct numbered callbacks."""
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+    profile = make_profile().model_copy(
+        update={
+            "profile_revision": 3,
+            "dietary_preferences": [
+                make_preference("same wording", identifier="pref-1"),
+                make_preference("same wording", identifier="pref-2"),
+            ],
+        }
+    )
+
+    TelegramAPI("token").send_profile_operation(
+        1,
+        ProfileEditCategory.DIETARY_PREFERENCES,
+        ProfileEditOperation.REMOVE,
+        profile,
+    )
+
+    payload = _last_payload(urlopen)
+    assert "1. Dietary preference: same wording" in payload["text"]
+    assert "2. Dietary preference: same wording" in payload["text"]
+    buttons = payload["reply_markup"]["inline_keyboard"]
+    assert [button["callback_data"] for button in buttons[0]] == [
+        "profile:remove:dietary_preferences:1:3",
+        "profile:remove:dietary_preferences:2:3",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("category", "profile_update", "expected_text"),
+    [
+        (
+            ProfileEditCategory.FAMILY,
+            {"family_members": [], "people_count": 1},
+            "There are no family members to remove.",
+        ),
+        (
+            ProfileEditCategory.DIETARY_CONSTRAINTS,
+            {"dietary_constraints": []},
+            "There are no dietary constraints to remove.",
+        ),
+        (
+            ProfileEditCategory.DIETARY_PREFERENCES,
+            {"dietary_preferences": [], "batch_rules": []},
+            "There are no dietary preferences to remove.",
+        ),
+    ],
+)
+def test_empty_profile_removal_keeps_navigation(
+    mocker: MockerFixture,
+    category: ProfileEditCategory,
+    profile_update: dict[str, object],
+    expected_text: str,
+) -> None:
+    """Empty removal categories still provide all navigation controls."""
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+    profile = make_profile().model_copy(update=profile_update)
+
+    TelegramAPI("token").send_profile_operation(
+        1, category, ProfileEditOperation.REMOVE, profile
+    )
+
+    payload = _last_payload(urlopen)
+    assert payload["text"] == expected_text
+    assert payload["reply_markup"]["inline_keyboard"] == [
+        [{"text": "Back", "callback_data": "profile:back"}],
+        [{"text": "Done", "callback_data": "profile:done"}],
+        [{"text": "Close", "callback_data": "profile:close"}],
+    ]
 
 
 def test_profile_root_renders_all_categories_and_close(

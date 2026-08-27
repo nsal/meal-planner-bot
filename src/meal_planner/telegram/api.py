@@ -5,12 +5,16 @@ import logging
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
 from meal_planner.models.schemas import (
     BatchMealRole,
     BatchRule,
+    ConstraintEntry,
+    DietaryPreferenceEntry,
+    FamilyMember,
     GrocerySection,
     MealCallbackAction,
     MealOutcome,
@@ -30,6 +34,7 @@ from meal_planner.telegram.commands import (
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 4096
+PROFILE_NUMBER_BUTTONS_PER_ROW = 5
 
 
 class TelegramAPIError(RuntimeError):
@@ -37,6 +42,141 @@ class TelegramAPIError(RuntimeError):
 
 
 InlineKeyboard = dict[str, list[list[dict[str, str]]]]
+
+
+ProfilePresentationValue = (
+    FamilyMember | ConstraintEntry | DietaryPreferenceEntry | BatchRule
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ProfilePresentationItem:
+    """One user-visible profile item and its source domain object."""
+
+    label: str
+    value: ProfilePresentationValue
+
+
+def _batch_rule_label(rule: BatchRule) -> str:
+    """Render the user-facing semantics of a stored batch rule."""
+    preparation = ", ".join(item.value for item in rule.preparation_meal_types)
+    reuse = ", ".join(item.value for item in rule.reuse_meal_types)
+    return (
+        f"{rule.source_text} (prepare {preparation}; reuse {reuse}; "
+        f"{rule.total_yield} meals)"
+    )
+
+
+def _family_member_label(member: FamilyMember) -> str:
+    """Render one family member without storage-only fields."""
+    protein = _format_nutrient_target("protein", member.protein_target)
+    fibre = _format_nutrient_target("fibre", member.fibre_target)
+    return (
+        f"{member.name} ({member.calorie_target} kcal/day, {protein}, {fibre})"
+    )
+
+
+def profile_presentation_items(
+    profile: UserProfile,
+    category: ProfileEditCategory,
+    *,
+    include_type_labels: bool = True,
+) -> list[ProfilePresentationItem]:
+    """Return the deterministic, category-relative profile projection.
+
+    Dietary preferences are followed by batch rules because both are removed
+    through the same profile preference operation.  The source object is
+    retained for the handler while its persisted identifier is omitted from
+    the presentation label and callback contract.
+    """
+    if category is ProfileEditCategory.FAMILY:
+        return [
+            ProfilePresentationItem(
+                label=_family_member_label(member),
+                value=member,
+            )
+            for member in profile.family_members
+        ]
+    if category is ProfileEditCategory.DIETARY_CONSTRAINTS:
+        return [
+            ProfilePresentationItem(
+                label=constraint.source_text,
+                value=constraint,
+            )
+            for constraint in profile.dietary_constraints
+        ]
+
+    preference_items = [
+        ProfilePresentationItem(
+            label=(
+                f"Dietary preference: {preference.source_text}"
+                if include_type_labels
+                else preference.source_text
+            ),
+            value=preference,
+        )
+        for preference in profile.dietary_preferences
+    ]
+    batch_items = [
+        ProfilePresentationItem(
+            label=(
+                f"Batch rule: {_batch_rule_label(rule)}"
+                if include_type_labels
+                else _batch_rule_label(rule)
+            ),
+            value=rule,
+        )
+        for rule in profile.batch_rules
+    ]
+    return preference_items + batch_items
+
+
+def _numbered_lines(items: Sequence[ProfilePresentationItem]) -> str:
+    """Render presentation items as stable one-based numbered lines."""
+    if not items:
+        return "None"
+    return "\n".join(
+        f"{index}. {item.label}" for index, item in enumerate(items, start=1)
+    )
+
+
+def _profile_navigation_keyboard() -> InlineKeyboard:
+    """Return navigation controls shared by profile input screens."""
+    return {
+        "inline_keyboard": [
+            [{"text": "Back", "callback_data": "profile:back"}],
+            [{"text": "Done", "callback_data": "profile:done"}],
+            [{"text": "Close", "callback_data": "profile:close"}],
+        ]
+    }
+
+
+def _profile_removal_keyboard(
+    category: ProfileEditCategory,
+    profile_revision: int,
+    item_count: int,
+) -> InlineKeyboard:
+    """Build wrapped number-only removal buttons and navigation controls."""
+    number_rows: list[list[dict[str, str]]] = []
+    row: list[dict[str, str]] = []
+    for index in range(1, item_count + 1):
+        callback_data = (
+            f"profile:remove:{category.value}:{index}:{profile_revision}"
+        )
+        if len(callback_data.encode("utf-8")) > 64:
+            raise ValueError(
+                "profile removal callback exceeds Telegram's limit"
+            )
+        row.append({"text": str(index), "callback_data": callback_data})
+        if len(row) == PROFILE_NUMBER_BUTTONS_PER_ROW:
+            number_rows.append(row)
+            row = []
+    if row:
+        number_rows.append(row)
+    return {
+        "inline_keyboard": number_rows
+        + _profile_navigation_keyboard()["inline_keyboard"]
+    }
 
 
 def _format_nutrient_target(label: str, target: int | None) -> str:
@@ -256,38 +396,33 @@ class TelegramAPI:
         self, chat_id: int | str, profile: UserProfile
     ) -> list[dict[str, Any]]:
         """Render a saved profile with controls for deterministic editing."""
-        constraints = (
-            ", ".join(item.source_text for item in profile.dietary_constraints)
-            or "None"
-        )
-        preferences = (
-            ", ".join(item.source_text for item in profile.dietary_preferences)
-            or "None"
-        )
-        batch_rule_lines: list[str] = []
-        for rule in profile.batch_rules:
-            preparation = ", ".join(
-                item.value for item in rule.preparation_meal_types
+        constraints = _numbered_lines(
+            profile_presentation_items(
+                profile, ProfileEditCategory.DIETARY_CONSTRAINTS
             )
-            reuse = ", ".join(item.value for item in rule.reuse_meal_types)
-            batch_rule_lines.append(
-                f"{rule.source_text} (prepare {preparation}; "
-                f"reuse {reuse}; {rule.total_yield} meals)"
-            )
-        batch_rules = "; ".join(batch_rule_lines) or "None"
+        )
+        preference_items = profile_presentation_items(
+            profile,
+            ProfileEditCategory.DIETARY_PREFERENCES,
+            include_type_labels=False,
+        )
+        preferences = _numbered_lines(
+            preference_items[: len(profile.dietary_preferences)]
+        )
+        batch_rules = _numbered_lines(
+            preference_items[len(profile.dietary_preferences) :]
+        )
+        family_items = profile_presentation_items(
+            profile, ProfileEditCategory.FAMILY
+        )
         lines = [
             f"Family name: {profile.name}",
             f"People count: {profile.people_count}",
             "Family members:",
-            *(
-                f"- {member.name} ({member.calorie_target} kcal/day, "
-                f"{_format_nutrient_target('protein', member.protein_target)}, "
-                f"{_format_nutrient_target('fibre', member.fibre_target)})"
-                for member in profile.family_members
-            ),
-            f"Dietary constraints: {constraints}",
-            f"Dietary preferences: {preferences}",
-            f"Batch rules: {batch_rules}",
+            *(f"- {item.label}" for item in family_items),
+            f"Dietary constraints:\n{constraints}",
+            f"Dietary preferences:\n{preferences}",
+            f"Batch rules:\n{batch_rules}",
         ]
         keyboard = {
             "inline_keyboard": [
@@ -390,10 +525,39 @@ class TelegramAPI:
         chat_id: int | str,
         category: ProfileEditCategory,
         operation: ProfileEditOperation,
+        profile: UserProfile | None = None,
     ) -> list[dict[str, Any]]:
         """Render one guided input prompt and its navigation controls."""
         if not operation.is_valid_for(category):
             raise ValueError("operation is invalid for its category")
+        if operation is ProfileEditOperation.REMOVE and profile is not None:
+            items = profile_presentation_items(profile, category)
+            if not items:
+                item_name = {
+                    ProfileEditCategory.FAMILY: "family members",
+                    ProfileEditCategory.DIETARY_CONSTRAINTS: (
+                        "dietary constraints"
+                    ),
+                    ProfileEditCategory.DIETARY_PREFERENCES: (
+                        "dietary preferences"
+                    ),
+                }[category]
+                return self.send_message(
+                    chat_id,
+                    f"There are no {item_name} to remove.",
+                    reply_markup=_profile_navigation_keyboard(),
+                )
+            lines = [
+                f"Select a {category.value.replace('_', ' ')} to remove:",
+                _numbered_lines(items),
+            ]
+            return self.send_message(
+                chat_id,
+                "\n".join(lines),
+                reply_markup=_profile_removal_keyboard(
+                    category, profile.profile_revision, len(items)
+                ),
+            )
         prompts = {
             (
                 ProfileEditCategory.FAMILY,
@@ -431,13 +595,7 @@ class TelegramAPI:
             f"Send one non-empty {item_name} to "
             f"{'add' if operation is ProfileEditOperation.ADD else 'remove'}.",
         )
-        keyboard = {
-            "inline_keyboard": [
-                [{"text": "Back", "callback_data": "profile:back"}],
-                [{"text": "Done", "callback_data": "profile:done"}],
-                [{"text": "Close", "callback_data": "profile:close"}],
-            ]
-        }
+        keyboard = _profile_navigation_keyboard()
         return self.send_message(chat_id, prompt, reply_markup=keyboard)
 
     def send_profile_rule_review(

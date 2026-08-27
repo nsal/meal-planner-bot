@@ -25,10 +25,12 @@ from meal_planner.models.schemas import (
     PlannedBatchLink,
     PlanStatus,
     ProfileEditCategory,
+    ProfileEditOperation,
     ProfileUpdateEntities,
     UserProfile,
     WeeklyBatchLedger,
     WeeklyPlan,
+    _normalize_saved_profile,
     canonicalize_profile_rule_ids,
 )
 
@@ -105,13 +107,20 @@ class DynamoRepository:
             get_kwargs["ConsistentRead"] = True
         response = self.table.get_item(**get_kwargs)
         item = response.get("Item")
-        return (
-            canonicalize_profile_rule_ids(
-                UserProfile.model_validate(self._data(item))
-            )
-            if item
-            else None
+        if not item:
+            return None
+
+        data, discarded_count = _normalize_saved_profile(self._data(item))
+        profile = canonicalize_profile_rule_ids(
+            UserProfile.model_validate(data, context={"saved_profile": True})
         )
+        if discarded_count:
+            logger.warning(
+                "Loaded profile with discarded legacy preferences "
+                "reason_code=legacy_preference count=%d",
+                discarded_count,
+            )
+        return profile
 
     @staticmethod
     def _canonical_profile(profile: UserProfile) -> UserProfile:
@@ -314,6 +323,105 @@ class DynamoRepository:
                 return False
             raise
         return True
+
+    def remove_profile_item_and_transition_state(
+        self,
+        user_id: str,
+        profile: UserProfile,
+        next_state: ConversationState,
+        observed_state: ConversationState,
+        *,
+        expected_profile_revision: int,
+    ) -> UserProfile | None:
+        """Atomically apply a numbered removal and retain removal mode."""
+        if (
+            observed_state.profile_operation is not ProfileEditOperation.REMOVE
+            or observed_state.profile_category is None
+            or next_state.step
+            is not ConversationWorkflowStep.AWAITING_PROFILE_INPUT
+            or next_state.profile_category
+            is not observed_state.profile_category
+            or next_state.profile_operation is not ProfileEditOperation.REMOVE
+            or next_state.revision != observed_state.revision + 1
+            or profile.profile_revision != expected_profile_revision
+        ):
+            return None
+        committed_profile = profile.model_copy(
+            update={
+                "profile_revision": profile.profile_revision + 1,
+            }
+        )
+        profile_item = {
+            "PK": f"USER#{user_id}",
+            "SK": "PROFILE",
+            **committed_profile.model_dump(mode="json"),
+        }
+        state_item = {
+            **self._conversation_key(user_id),
+            **next_state.model_dump(mode="json"),
+        }
+        profile_condition = (
+            "attribute_exists(PK) AND "
+            "(attribute_not_exists(#profile_revision) OR "
+            "#profile_revision = :observed_profile_revision)"
+        )
+        state_condition = (
+            "#revision = :observed_revision AND "
+            "#created_at = :observed_created_at AND "
+            "#workflow_kind = :observed_workflow_kind AND "
+            "#step = :observed_step AND "
+            "#profile_category = :observed_profile_category AND "
+            "#profile_operation = :observed_profile_operation"
+        )
+        profile_names = {"#profile_revision": "profile_revision"}
+        state_names = {
+            "#revision": "revision",
+            "#created_at": "created_at",
+            "#workflow_kind": "workflow_kind",
+            "#step": "step",
+            "#profile_category": "profile_category",
+            "#profile_operation": "profile_operation",
+        }
+        observed_data = observed_state.model_dump(mode="json")
+        profile_values = {
+            ":observed_profile_revision": expected_profile_revision,
+        }
+        state_values = {
+            ":observed_revision": observed_data["revision"],
+            ":observed_created_at": observed_data["created_at"],
+            ":observed_workflow_kind": observed_data["workflow_kind"],
+            ":observed_step": observed_data["step"],
+            ":observed_profile_category": observed_data["profile_category"],
+            ":observed_profile_operation": observed_data["profile_operation"],
+        }
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": profile_item,
+                            "ConditionExpression": profile_condition,
+                            "ExpressionAttributeNames": profile_names,
+                            "ExpressionAttributeValues": profile_values,
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": state_item,
+                            "ConditionExpression": state_condition,
+                            "ExpressionAttributeNames": state_names,
+                            "ExpressionAttributeValues": state_values,
+                        }
+                    },
+                ]
+            )
+        except ClientError as exc:
+            if self._is_transaction_conditional_failure(exc):
+                return None
+            raise
+        return committed_profile
 
     def get_profile_draft(
         self, user_id: str

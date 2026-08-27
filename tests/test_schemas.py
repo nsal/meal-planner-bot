@@ -286,8 +286,101 @@ def test_weekly_batch_ledger_is_bounded() -> None:
         )
 
 
-def test_raw_saved_preference_strings_and_missing_rules_are_rejected() -> None:
-    """Only confirmed typed dietary rules can enter the canonical profile."""
+@pytest.mark.parametrize(
+    "legacy_entry",
+    [
+        "eggs",
+        {"id": "raw", "source_text": "eggs"},
+        {"id": "raw", "source_text": "eggs", "rule": None},
+    ],
+)
+def test_saved_complete_profile_discards_legacy_preference_entries(
+    legacy_entry: object,
+) -> None:
+    """Saved reads discard only known unstructured preference entries."""
+    profile_data = make_profile().model_dump(mode="json")
+    profile_data["dietary_preferences"] = [legacy_entry]
+
+    profile = UserProfile.model_validate(
+        profile_data, context={"saved_profile": True}
+    )
+
+    assert profile.dietary_preferences == []
+
+
+def test_saved_profile_keeps_valid_preferences_and_constraints() -> None:
+    """Saved compatibility filtering preserves valid profile content."""
+    profile_data = make_profile().model_dump(mode="json")
+    profile_data["dietary_constraints"] = ["peanuts", "shellfish"]
+    profile_data["dietary_preferences"] = [
+        {
+            "id": "valid",
+            "source_text": "eggs",
+            "rule": {
+                "id": "valid-rule",
+                "source_text": "eggs",
+                "foods_any_of": ["eggs"],
+                "count": 1,
+            },
+        },
+        "legacy prose",
+        {"id": "missing", "source_text": "missing rule"},
+        {"id": "null", "source_text": "null rule", "rule": None},
+    ]
+
+    profile = UserProfile.model_validate(
+        profile_data, context={"saved_profile": True}
+    )
+
+    assert [entry.source_text for entry in profile.dietary_preferences] == [
+        "eggs"
+    ]
+    assert [entry.source_text for entry in profile.dietary_constraints] == [
+        "peanuts",
+        "shellfish",
+    ]
+
+
+def test_saved_profile_does_not_discard_invalid_non_null_rules() -> None:
+    """Compatibility filtering must not hide structurally invalid rules."""
+    profile_data = make_profile().model_dump(mode="json")
+    profile_data["dietary_preferences"] = [
+        {
+            "id": "invalid",
+            "source_text": "eggs",
+            "rule": {
+                "id": "invalid-rule",
+                "source_text": "eggs",
+                "foods_any_of": [],
+                "count": 1,
+            },
+        }
+    ]
+
+    with pytest.raises(ValidationError):
+        UserProfile.model_validate(
+            profile_data, context={"saved_profile": True}
+        )
+
+
+def test_profile_update_rejects_unstructured_preference_shapes() -> None:
+    """Profile updates cannot accept raw, missing, or null rules."""
+    with pytest.raises(ValidationError):
+        ProfileUpdateEntities.model_validate(
+            {"dietary_preferences": ["peanuts"]}
+        )
+    for entry in [
+        {"id": "missing", "source_text": "peanuts"},
+        {"id": "null", "source_text": "peanuts", "rule": None},
+    ]:
+        with pytest.raises(ValidationError):
+            ProfileUpdateEntities.model_validate(
+                {"dietary_preferences": [entry]}
+            )
+
+
+def test_profile_construction_rejects_unstructured_preference_shapes() -> None:
+    """New profile construction remains strict outside saved reads."""
     with pytest.raises(ValidationError):
         UserProfile(name="Alex", dietary_preferences=["eggs"])
     with pytest.raises(ValidationError):

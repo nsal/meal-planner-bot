@@ -34,13 +34,21 @@ the locked `uv` environment.
   an older unfinished workflow when it opens the profile editor.
 - `/profile` lets you view and amend the saved household profile. Tap `Amend profile`, choose
   `Family`, `Dietary constraints`, or `Dietary preferences`, then
-  choose an operation. Each operation accepts one guided message: use
-  `John 1500` to add a family member or change a member's calories, the exact
-  member name to remove someone, or one item such as `dairy` or `eat more
-  vegetables` to add or remove a constraint or preference. After a
-  successful change the category menu returns so you can make another
-  amendment. Use `Back` to navigate, `Done` to finish and save the session,
-  `Close` to leave it, or `/cancel` to clear the active edit.
+  choose an operation. Add and change operations accept one guided message:
+  use `John 1500` to add a family member or change a member's calories, or
+  one item such as `dairy` or `eat more vegetables` to add a constraint or
+  preference. Remove operations show the current category as a one-based
+  numbered list with number-only buttons. The dietary-preference removal list
+  contains dietary preferences followed by batch rules, with a visible type
+  label for each item. Every removal button is tied to the displayed profile
+  revision; if another amendment makes it stale, nothing is changed and the
+  bot says that the profile removal is stale and asks you to reopen `/profile`
+  for current buttons. Empty categories report that there is nothing to
+  remove. After a successful removal, the refreshed numbered list remains
+  active so you can remove another item; after a successful add or change, the
+  category menu returns so you can make another amendment. Use `Back` to
+  navigate, `Done` to finish and save the session, `Close` to leave it, or
+  `/cancel` to clear the active edit.
 - The canonical profile has two dietary fields: `dietary_constraints` and
   `dietary_preferences`. A new dietary rule is interpreted and shown for
   confirmation; review the interpreted meaning before saving. Priority is
@@ -287,11 +295,13 @@ APP_SECRETS_SECRET_NAME=meal-planner/app-secrets
 SYNC_SECRETS=false
 ```
 
-### One-time development dietary reset
+### One-time development dietary-preference repair
 
-After deploying the compatible code, an operator may clear the dietary
-preferences and constraints for one exact development user. The command
-requires the table name, AWS profile, region, and user ID explicitly:
+After deploying the profile-compatibility code, an operator may repair
+malformed legacy dietary preferences for one exact development user. Deploy
+first so normal profile reads tolerate the legacy shape before running the
+repair. The command requires the table name, AWS profile, region, and user ID
+explicitly:
 
 ```bash
 uv run python scripts/reset_profile_dietary_fields.py \
@@ -301,12 +311,21 @@ uv run python scripts/reset_profile_dietary_fields.py \
   --user-id 123456789
 ```
 
-It conditionally updates only `dietary_preferences`,
-`dietary_constraints`, and `profile_revision` on that user's `PROFILE` item.
-It does not scan the table or alter family details, nutrition targets, plans,
-conversation state, or meal history. Repeating a successful reset is a safe
-no-op. This is a one-time development operation: do not add it to routine
-deployment orchestration or rerun it after the profile has been recreated.
+The repair reads only `USER#123456789` / `PROFILE` with a consistent read,
+drops raw preference strings and mappings with a missing or null `rule`, then
+validates the cleaned complete profile. It conditionally updates only
+`dietary_preferences` and `profile_revision`; dietary constraints, valid
+preferences, family and nutrition fields, unknown profile attributes, and all
+other items in the user's partition are preserved. It never scans the table.
+The command reports retained and removed counts without printing profile
+contents. A successful run advances the profile revision; repeating it is an
+idempotent no-op. Conditional conflicts and AWS failures never intentionally
+overwrite a newer profile, so the command can be safely rerun after the
+conflict or transient failure is resolved; if a successful response was lost,
+the next run also reports the no-op. This is a one-time development operation:
+do not add it to routine deployment orchestration or rerun it after the
+profile has been recreated, and never replace the explicit user ID with a
+wildcard or broad selector.
 
 The routine workflow prints numbered stage headings as it checks prerequisites,
 authenticates and confirms the AWS identity, checks that the configured JSON
@@ -484,8 +503,15 @@ The Telegram command menu and `/help` show the same command reference:
 - `/profile` shows the persisted family name and individual member details,
   with button-led amendment navigation for family members, dietary
   constraints, and dietary preferences. Family add and calorie changes
-  use one message such as `John 1500`; list changes use one item such as
-  `dairy` or `eat more vegetables`.
+  use one message such as `John 1500`. Choosing Remove displays a numbered
+  list and number-only buttons for the selected category; dietary preference
+  removal numbers dietary preferences first and batch rules second. Removal
+  buttons carry the profile revision, so an old button is rejected with a
+  no-change stale-selection message after another amendment; reopen
+  `/profile` to get current buttons. A successful removal refreshes and keeps
+  the active numbered list; successful add and change operations return to the
+  category menu. Add and change operations remain text-based, while Back,
+  Done, Close, and `/cancel` retain their normal navigation behavior.
 - Natural-language no-value answers such as `none`, `nothing`, `no allergies`,
   and `no restrictions` are stored as empty categories. They count as answers,
   while omitted fields remain missing until supplied.

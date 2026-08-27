@@ -46,6 +46,7 @@ from meal_planner.models.schemas import (
 )
 from meal_planner.router import RouteResult, RouteType
 from tests.factories import (
+    make_batch_rule,
     make_constraint,
     make_legacy_profile_item,
     make_plan,
@@ -127,20 +128,52 @@ def test_canonical_profile_round_trip_discards_goals_on_read_and_write(
     assert "goals" not in item
 
 
-def test_malformed_legacy_profile_entries_are_rejected(
+def test_legacy_profile_preferences_are_discarded_on_read(
     repo: DynamoRepository,
 ) -> None:
-    """Raw legacy entries remain visible as deterministic canonical entries."""
+    """Saved reads discard malformed preferences while retaining constraints."""
+    legacy = make_legacy_profile_item()
+    legacy["family_members"] = [{"name": "Alex", "calorie_target": 2000}]
     repo.table.put_item(
         Item={
             "PK": "USER#user",
             "SK": "PROFILE",
-            **make_legacy_profile_item(),
+            **legacy,
         }
     )
 
-    with pytest.raises(ValidationError):
-        repo.get_profile("user")
+    profile = repo.get_profile("user")
+
+    assert profile is not None
+    assert profile.dietary_preferences == []
+    assert [entry.source_text for entry in profile.dietary_constraints] == [
+        "Peanuts"
+    ]
+
+
+def test_compatible_profile_read_logs_bounded_non_content_diagnostic(
+    repo: DynamoRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Discard diagnostics contain only a category and bounded count."""
+    profile = make_profile().model_dump(mode="json")
+    profile["dietary_preferences"] = [
+        "secret preference text",
+        {"id": "missing", "source_text": "secret missing"},
+        {"id": "null", "source_text": "secret null", "rule": None},
+    ]
+    repo.table.put_item(
+        Item={"PK": "USER#secret-user", "SK": "PROFILE", **profile}
+    )
+
+    with caplog.at_level(logging.WARNING, logger="meal_planner.db.dynamo"):
+        loaded = repo.get_profile("secret-user")
+
+    assert loaded is not None
+    assert "secret" not in caplog.text
+    assert caplog.records[-1].message == (
+        "Loaded profile with discarded legacy preferences "
+        "reason_code=legacy_preference count=3"
+    )
 
 
 def test_profile_transaction_rejects_conflicting_preference_atomically(
@@ -475,6 +508,158 @@ def test_profile_amendment_transaction_commits_matching_profile_and_state(
         updated.model_copy(update={"profile_revision": 1})
     )
     assert repo.get_conversation_state("user") == next_state
+
+
+def test_numbered_profile_removal_transaction_retains_remove_mode(
+    repo: DynamoRepository,
+) -> None:
+    """A numbered removal advances both guarded revisions atomically."""
+    original = make_profile().model_copy(
+        update={"dietary_constraints": [make_constraint()]}
+    )
+    observed = _profile_edit_state(operation=ProfileEditOperation.REMOVE)
+    next_state = observed.model_copy(update={"revision": observed.revision + 1})
+    repo.save_profile("user", original, expected_revision=None)
+    assert repo.save_conversation_state("user", observed)
+
+    updated = original.model_copy(update={"dietary_constraints": []})
+    committed = repo.remove_profile_item_and_transition_state(
+        "user",
+        updated,
+        next_state,
+        observed,
+        expected_profile_revision=original.profile_revision,
+    )
+
+    saved_profile = repo.get_profile("user", consistent_read=True)
+    assert saved_profile is not None
+    assert committed == saved_profile
+    assert saved_profile.dietary_constraints == []
+    assert saved_profile.profile_revision == original.profile_revision + 1
+    saved_state = repo.get_conversation_state("user", consistent_read=True)
+    assert saved_state == next_state
+    assert saved_state.step is ConversationWorkflowStep.AWAITING_PROFILE_INPUT
+    assert saved_state.profile_operation is ProfileEditOperation.REMOVE
+
+
+def test_numbered_profile_removal_transaction_rejects_stale_profile_revision(
+    repo: DynamoRepository,
+) -> None:
+    """A stale numbered profile snapshot cannot mutate either document."""
+    original = make_profile()
+    observed = _profile_edit_state(operation=ProfileEditOperation.REMOVE)
+    next_state = observed.model_copy(update={"revision": observed.revision + 1})
+    repo.save_profile("user", original, expected_revision=None)
+    assert repo.save_conversation_state("user", observed)
+    updated = original.model_copy(update={"family_members": []})
+
+    assert not repo.remove_profile_item_and_transition_state(
+        "user",
+        updated,
+        next_state,
+        observed,
+        expected_profile_revision=1,
+    )
+    assert repo.get_profile("user", consistent_read=True) == (
+        canonicalize_profile_rule_ids(original)
+    )
+    assert repo.get_conversation_state("user", consistent_read=True) == observed
+
+
+def test_numbered_constraint_removal_preserves_unrelated_profile_data(
+    repo: DynamoRepository,
+) -> None:
+    """Removing one constraint does not rewrite unrelated profile fields."""
+    profile = make_profile(with_nutrient_targets=True).model_copy(
+        update={
+            "dietary_constraints": [
+                make_constraint("peanuts", identifier="constraint-peanuts"),
+                make_constraint("shellfish", identifier="constraint-shellfish"),
+            ],
+            "dietary_preferences": [
+                make_preference(
+                    "same preference",
+                    identifier="preference-eggs",
+                    rule=DietaryRule(
+                        id="preference-eggs",
+                        source_text="same preference",
+                        foods_any_of=["eggs"],
+                        meal_type="breakfast",
+                        operator=RuleOperator.AT_LEAST,
+                        count=1,
+                    ),
+                ),
+                make_preference(
+                    "same preference",
+                    identifier="preference-oats",
+                    rule=DietaryRule(
+                        id="preference-oats",
+                        source_text="same preference",
+                        foods_any_of=["oats"],
+                        meal_type="breakfast",
+                        operator=RuleOperator.AT_LEAST,
+                        count=1,
+                    ),
+                ),
+                make_preference(
+                    "shellfish for breakfast",
+                    identifier="preference-shellfish",
+                    rule=DietaryRule(
+                        id="preference-shellfish",
+                        source_text="shellfish for breakfast",
+                        foods_any_of=["shellfish"],
+                        meal_type="breakfast",
+                        operator=RuleOperator.AT_LEAST,
+                        count=1,
+                    ),
+                ),
+            ],
+            "batch_rules": [
+                make_batch_rule("first batch", identifier="batch-first"),
+                make_batch_rule("second batch", identifier="batch-second"),
+            ],
+        }
+    )
+    repo.table.put_item(
+        Item={
+            "PK": "USER#user",
+            "SK": "PROFILE",
+            **profile.model_dump(mode="json"),
+        }
+    )
+    observed_profile = repo.get_profile("user", consistent_read=True)
+    assert observed_profile is not None
+    observed = _profile_edit_state(operation=ProfileEditOperation.REMOVE)
+    next_state = observed.model_copy(update={"revision": observed.revision + 1})
+    repo.save_conversation_state("user", observed)
+
+    updated = observed_profile.model_copy(
+        update={"dietary_constraints": observed_profile.dietary_constraints[1:]}
+    )
+    expected = updated.model_copy(
+        update={"profile_revision": observed_profile.profile_revision + 1}
+    )
+
+    committed = repo.remove_profile_item_and_transition_state(
+        "user",
+        updated,
+        next_state,
+        observed,
+        expected_profile_revision=observed_profile.profile_revision,
+    )
+
+    assert committed == expected
+    assert repo.get_profile("user", consistent_read=True) == expected
+    assert (
+        repo.get_conversation_state("user", consistent_read=True) == next_state
+    )
+    assert expected.dietary_constraints == [
+        observed_profile.dietary_constraints[1]
+    ]
+    assert expected.dietary_preferences == observed_profile.dietary_preferences
+    assert expected.batch_rules == observed_profile.batch_rules
+    assert expected.family_members == observed_profile.family_members
+    assert expected.people_count == observed_profile.people_count
 
 
 @pytest.mark.parametrize("conflict", ["deleted", "changed_operation"])

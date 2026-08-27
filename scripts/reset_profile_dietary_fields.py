@@ -1,11 +1,11 @@
-"""Run the one-time, exact-user development dietary profile reset."""
+"""Repair malformed dietary preferences for one exact development user."""
 
 from __future__ import annotations
 
 import argparse
 import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -24,62 +24,92 @@ _EXPLICIT_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/#-]{0,127}$")
 _BROAD_TARGETS = frozenset({"*", "all", "any", "everyone", "users"})
 
 
-class ResetError(RuntimeError):
-    """Base class for safe reset failures."""
+class RepairError(RuntimeError):
+    """Base class for safe repair failures."""
 
 
-class ResetConfigurationError(ResetError):
+class RepairConfigurationError(RepairError):
     """The command target is absent, malformed, or too broad."""
 
 
-class ProfileNotFoundError(ResetError):
+class ProfileNotFoundError(RepairError):
     """The exact requested profile does not exist."""
 
 
-class MalformedProfileError(ResetError):
-    """The exact requested profile is not canonical and safe to update."""
+class MalformedProfileError(RepairError):
+    """The exact requested profile is not safe to repair."""
 
 
-class ResetConflictError(ResetError):
+class RepairConflictError(RepairError):
     """The profile changed between the read and conditional update."""
 
 
 @dataclass(frozen=True)
-class ResetResult:
-    """Result of one reset attempt."""
+class RepairResult:
+    """Result of one malformed-preference repair attempt."""
 
     changed: bool
     profile_revision: int
+    retained_count: int
+    removed_count: int
+
+
+# Keep old imports working for callers that only use the module as a library.
+ResetError = RepairError
+ResetConfigurationError = RepairConfigurationError
+ResetConflictError = RepairConflictError
+ResetResult = RepairResult
 
 
 def _validate_target(value: Any, *, label: str) -> str:
     """Validate one explicit target without accepting wildcard selectors."""
     if not isinstance(value, str):
-        raise ResetConfigurationError("Invalid explicit reset target.")
+        raise RepairConfigurationError("Invalid explicit repair target.")
     if (
         value != value.strip()
         or not value
         or value.casefold() in _BROAD_TARGETS
     ):
-        raise ResetConfigurationError("Invalid explicit reset target.")
+        raise RepairConfigurationError("Invalid explicit repair target.")
     pattern = _TABLE_NAME if label == "table" else _EXPLICIT_IDENTIFIER
     if pattern.fullmatch(value) is None:
-        raise ResetConfigurationError("Invalid explicit reset target.")
+        raise RepairConfigurationError("Invalid explicit repair target.")
     return value
+
+
+def _classify_preferences(
+    preferences: Any,
+) -> tuple[list[Any], int]:
+    """Return valid entries and the count of known legacy shapes."""
+    if not isinstance(preferences, list):
+        raise MalformedProfileError("Stored profile is malformed.")
+
+    retained: list[Any] = []
+    removed_count = 0
+    for entry in preferences:
+        if isinstance(entry, str) or (
+            isinstance(entry, Mapping)
+            and ("rule" not in entry or entry.get("rule") is None)
+        ):
+            removed_count += 1
+            continue
+        retained.append(entry)
+    return retained, removed_count
 
 
 def _validate_profile_item(
     item: Any, *, expected_pk: str
-) -> tuple[UserProfile, dict[str, Any]]:
-    """Validate a complete canonical profile without rewriting its item."""
+) -> tuple[UserProfile, list[Any], int]:
+    """Classify and validate one complete profile without broad repair."""
     if not isinstance(item, dict):
         raise MalformedProfileError("Stored profile is malformed.")
     if item.get("PK") != expected_pk or item.get("SK") != "PROFILE":
         raise MalformedProfileError("Stored profile is malformed.")
     if not isinstance(item.get("dietary_constraints"), list):
         raise MalformedProfileError("Stored profile is malformed.")
-    if not isinstance(item.get("dietary_preferences"), list):
-        raise MalformedProfileError("Stored profile is malformed.")
+    preferences, removed_count = _classify_preferences(
+        item.get("dietary_preferences")
+    )
     revision = item.get("profile_revision")
     if isinstance(revision, bool) or not isinstance(revision, (int, Decimal)):
         raise MalformedProfileError("Stored profile is malformed.")
@@ -89,23 +119,28 @@ def _validate_profile_item(
     ):
         raise MalformedProfileError("Stored profile is malformed.")
 
-    profile_data = {
+    profile_data: dict[str, Any] = {
         key: value for key, value in item.items() if key not in {"PK", "SK"}
     }
+    profile_data["dietary_preferences"] = preferences
     try:
         profile = UserProfile.model_validate(profile_data)
     except ValidationError as exc:
         raise MalformedProfileError("Stored profile is malformed.") from exc
-    return profile, item
+    if not profile.is_complete:
+        raise MalformedProfileError("Stored profile is incomplete.")
+    return profile, preferences, removed_count
 
 
-def reset_profile_dietary_fields(table: Any, user_id: str) -> ResetResult:
-    """Clear dietary fields for one profile with a revision guard.
+def repair_profile_dietary_preferences(
+    table: Any, user_id: str
+) -> RepairResult:
+    """Remove known malformed preferences with a revision guard.
 
-    The read validates the canonical profile and determines whether the
-    operation is already complete. The write names only the two dietary fields
-    and the profile revision, so all other profile and partition items remain
-    untouched.
+    The read classifies each preference independently, validates the cleaned
+    complete profile, and determines whether the operation is already complete.
+    The write names only dietary preferences and the profile revision, so
+    constraints and all other profile and partition items remain untouched.
     """
     user_id = _validate_target(user_id, label="user")
     expected_pk = f"USER#{user_id}"
@@ -113,26 +148,31 @@ def reset_profile_dietary_fields(table: Any, user_id: str) -> ResetResult:
     try:
         response = table.get_item(Key=key, ConsistentRead=True)
     except (BotoCoreError, ClientError) as exc:
-        raise ResetError("AWS request failed.") from exc
+        raise RepairError("AWS request failed.") from exc
 
     item = response.get("Item") if isinstance(response, dict) else None
     if item is None:
         raise ProfileNotFoundError("Profile was not found.")
-    profile, _ = _validate_profile_item(item, expected_pk=expected_pk)
-    if not profile.dietary_constraints and not profile.dietary_preferences:
-        return ResetResult(
-            changed=False, profile_revision=profile.profile_revision
+    profile, preferences, removed_count = _validate_profile_item(
+        item, expected_pk=expected_pk
+    )
+    retained_count = len(preferences)
+    if removed_count == 0:
+        return RepairResult(
+            changed=False,
+            profile_revision=profile.profile_revision,
+            retained_count=retained_count,
+            removed_count=0,
         )
 
     names = {
         "#pk": "PK",
         "#sk": "SK",
-        "#constraints": "dietary_constraints",
         "#preferences": "dietary_preferences",
         "#revision": "profile_revision",
     }
     values = {
-        ":empty": [],
+        ":preferences": preferences,
         ":zero": 0,
         ":expected_revision": profile.profile_revision,
         ":next_revision": profile.profile_revision + 1,
@@ -141,15 +181,13 @@ def reset_profile_dietary_fields(table: Any, user_id: str) -> ResetResult:
         table.update_item(
             Key=key,
             UpdateExpression=(
-                "SET #constraints = :empty, #preferences = :empty, "
-                "#revision = :next_revision"
+                "SET #preferences = :preferences, #revision = :next_revision"
             ),
             ConditionExpression=(
                 "attribute_exists(#pk) AND attribute_exists(#sk) AND "
                 "attribute_exists(#revision) AND "
                 "#revision = :expected_revision AND "
-                "(size(#constraints) > :zero OR "
-                "size(#preferences) > :zero)"
+                "size(#preferences) > :zero"
             ),
             ExpressionAttributeNames=names,
             ExpressionAttributeValues=values,
@@ -157,23 +195,32 @@ def reset_profile_dietary_fields(table: Any, user_id: str) -> ResetResult:
     except ClientError as exc:
         error_code = exc.response.get("Error", {}).get("Code")
         if error_code == "ConditionalCheckFailedException":
-            raise ResetConflictError(
-                "Profile changed concurrently; no reset was applied."
+            raise RepairConflictError(
+                "Profile changed concurrently; no repair was applied."
             ) from exc
-        raise ResetError("AWS request failed.") from exc
+        raise RepairError("AWS request failed.") from exc
     except BotoCoreError as exc:
-        raise ResetError("AWS request failed.") from exc
+        raise RepairError("AWS request failed.") from exc
 
-    return ResetResult(
-        changed=True, profile_revision=profile.profile_revision + 1
+    return RepairResult(
+        changed=True,
+        profile_revision=profile.profile_revision + 1,
+        retained_count=retained_count,
+        removed_count=removed_count,
     )
 
 
+def reset_profile_dietary_fields(table: Any, user_id: str) -> RepairResult:
+    """Keep the former library entry point as a narrowed repair alias."""
+    return repair_profile_dietary_preferences(table, user_id)
+
+
 def _parser() -> argparse.ArgumentParser:
-    """Build the explicit reset command parser."""
+    """Build the explicit repair command parser."""
     parser = argparse.ArgumentParser(
         description=(
-            "One-time development reset for one user's dietary profile fields."
+            "One-time development repair for one user's malformed "
+            "dietary preferences."
         )
     )
     parser.add_argument("--table", required=True)
@@ -184,7 +231,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the reset and return a safe process status."""
+    """Run the repair and return a safe process status."""
     args = _parser().parse_args(argv)
     try:
         table_name = _validate_target(args.table, label="table")
@@ -196,9 +243,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             region_name=region,
         )
         table = session.resource("dynamodb").Table(table_name)
-        result = reset_profile_dietary_fields(table, user_id)
-    except ResetConfigurationError:
-        print("Invalid explicit reset target.", file=sys.stderr)
+        result = repair_profile_dietary_preferences(table, user_id)
+    except RepairConfigurationError:
+        print("Invalid explicit repair target.", file=sys.stderr)
         return 2
     except ProfileNotFoundError:
         print("Profile was not found.", file=sys.stderr)
@@ -206,13 +253,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except MalformedProfileError:
         print("Stored profile is malformed.", file=sys.stderr)
         return 1
-    except ResetConflictError:
+    except RepairConflictError:
         print(
-            "Profile changed concurrently; no reset was applied.",
+            "Profile changed concurrently; no repair was applied.",
             file=sys.stderr,
         )
         return 1
-    except ResetError:
+    except RepairError:
         print("AWS request failed.", file=sys.stderr)
         return 1
     except BotoCoreError, ClientError:
@@ -221,11 +268,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if result.changed:
         print(
-            "Dietary fields reset; profile revision advanced to "
+            "Repaired dietary preferences: removed "
+            f"{result.removed_count}, retained {result.retained_count}; "
+            "profile revision advanced to "
             f"{result.profile_revision}."
         )
     else:
-        print("Dietary fields already empty; no changes were made.")
+        print(
+            "Dietary preferences already canonical: removed 0, retained "
+            f"{result.retained_count}; no changes were made."
+        )
     return 0
 
 

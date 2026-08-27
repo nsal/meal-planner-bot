@@ -3,6 +3,7 @@
 import hashlib
 import json
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from enum import Enum
 from typing import Annotated, Any
 
@@ -217,14 +218,6 @@ def _normalize_profile_entries(
                     expansion = expand_constraint_terms([raw_source_text])
                     item["forbidden_terms"] = list(expansion.terms)
                     item["uninterpretable"] = not expansion.is_safe
-            elif "rule" not in item and "foods_any_of" in item:
-                rule = dict(item)
-                rule["id"] = item["id"]
-                item = {
-                    "id": item["id"],
-                    "source_text": item.get("source_text", "legacy"),
-                    "rule": rule,
-                }
             normalized_entries.append(item)
             continue
         normalized_entries.append(entry)
@@ -249,6 +242,45 @@ def _normalize_profile_models(value: Any, *, preserve_unanswered: bool) -> Any:
         "dietary_preferences",
         preserve_unanswered=preserve_unanswered,
     )
+
+
+def _normalize_saved_profile(value: Any) -> tuple[Any, int]:
+    """Discard known legacy preferences from a complete saved profile."""
+    if not isinstance(value, dict):
+        return value, 0
+
+    family_members = value.get("family_members")
+    people_count = value.get("people_count", 1)
+    if (
+        not isinstance(family_members, list)
+        or isinstance(people_count, bool)
+        or not isinstance(people_count, (int, Decimal))
+        or people_count < 1
+        or len(family_members) != people_count
+    ):
+        return value, 0
+
+    preferences = value.get("dietary_preferences")
+    if not isinstance(preferences, list):
+        return value, 0
+
+    retained: list[Any] = []
+    discarded = 0
+    for preference in preferences:
+        is_legacy = isinstance(preference, str) or (
+            isinstance(preference, dict)
+            and ("rule" not in preference or preference.get("rule") is None)
+        )
+        if is_legacy:
+            discarded += 1
+        else:
+            retained.append(preference)
+
+    if discarded == 0:
+        return value, 0
+    normalized = dict(value)
+    normalized["dietary_preferences"] = retained
+    return normalized, discarded
 
 
 class ConversationIntent(str, Enum):
@@ -1566,8 +1598,15 @@ class UserProfile(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def normalize_legacy_constraints(cls, value: Any) -> Any:
+    def normalize_legacy_constraints(
+        cls, value: Any, info: ValidationInfo
+    ) -> Any:
         """Map legacy persisted constraint fields to the canonical field."""
+        if (
+            isinstance(info.context, dict)
+            and info.context.get("saved_profile") is True
+        ):
+            value, _ = _normalize_saved_profile(value)
         return _normalize_profile_models(value, preserve_unanswered=False)
 
     @field_validator("dietary_constraints")

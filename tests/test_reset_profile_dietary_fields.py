@@ -43,23 +43,28 @@ def dynamodb_table() -> Generator[Any, None, None]:
         yield table
 
 
-def _profile_item(*, dietary_fields_empty: bool = False) -> dict[str, Any]:
+def _profile_item(
+    *,
+    dietary_constraints: list[dict[str, Any]] | None = None,
+    dietary_preferences: list[Any] | None = None,
+) -> dict[str, Any]:
     """Return a raw profile with family and nutrition data to preserve."""
-    profile = make_profile(with_nutrient_targets=True).model_copy(
-        update={
-            "dietary_constraints": (
-                [] if dietary_fields_empty else [make_constraint()]
-            ),
-            "dietary_preferences": (
-                [] if dietary_fields_empty else [make_preference()]
-            ),
-            "profile_revision": 4,
-        }
+    profile = make_profile(with_nutrient_targets=True).model_dump(mode="json")
+    profile["dietary_constraints"] = (
+        dietary_constraints
+        if dietary_constraints is not None
+        else [make_constraint().model_dump(mode="json")]
     )
+    profile["dietary_preferences"] = (
+        dietary_preferences
+        if dietary_preferences is not None
+        else [make_preference().model_dump(mode="json")]
+    )
+    profile["profile_revision"] = 4
     return {
         "PK": f"USER#{USER_ID}",
         "SK": "PROFILE",
-        **profile.model_dump(mode="json"),
+        **profile,
         "operator_note": "preserve this attribute",
     }
 
@@ -107,23 +112,37 @@ def _items_for_user(table: Any) -> dict[tuple[str, str], dict[str, Any]]:
     return {(item["PK"], item["SK"]): item for item in response["Items"]}
 
 
-def test_reset_clears_only_dietary_fields_and_advances_revision(
+def test_repair_removes_legacy_preferences_and_advances_revision(
     dynamodb_table: Any,
 ) -> None:
-    """Reset exactly one profile while retaining every other user item."""
-    profile = _profile_item()
+    """Repair only known malformed preferences in one exact profile."""
+    profile = _profile_item(
+        dietary_constraints=[],
+        dietary_preferences=[
+            "old preference",
+            {"id": "missing", "source_text": "missing rule"},
+            {"id": "null", "source_text": "null rule", "rule": None},
+        ],
+    )
     related = _seed_related_items(dynamodb_table)
     dynamodb_table.put_item(Item=profile)
     before = _items_for_user(dynamodb_table)
 
-    result = reset.reset_profile_dietary_fields(dynamodb_table, USER_ID)
+    result = reset.repair_profile_dietary_preferences(dynamodb_table, USER_ID)
 
-    assert result == reset.ResetResult(changed=True, profile_revision=5)
+    assert result == reset.RepairResult(
+        changed=True,
+        profile_revision=5,
+        retained_count=0,
+        removed_count=3,
+    )
     after = _items_for_user(dynamodb_table)
     assert set(after) == set(before)
     updated_profile = after[(f"USER#{USER_ID}", "PROFILE")]
     assert updated_profile["dietary_preferences"] == []
-    assert updated_profile["dietary_constraints"] == []
+    assert (
+        updated_profile["dietary_constraints"] == profile["dietary_constraints"]
+    )
     assert updated_profile["profile_revision"] == 5
     for key, item in before.items():
         if key == (f"USER#{USER_ID}", "PROFILE"):
@@ -153,54 +172,106 @@ def test_reset_clears_only_dietary_fields_and_advances_revision(
     assert all(after[key] == item for key, item in related.items())
 
 
-def test_reset_rejects_missing_or_malformed_profiles(
+def test_repair_preserves_valid_preferences_and_all_unrelated_profile_data(
     dynamodb_table: Any,
 ) -> None:
-    """Never create or repair a missing or malformed canonical profile."""
+    """Mixed repair retains valid rules and all unrelated partition data."""
+    valid = make_preference().model_dump(mode="json")
+    profile = _profile_item(
+        dietary_constraints=[make_constraint().model_dump(mode="json")],
+        dietary_preferences=[
+            valid,
+            "legacy preference",
+            {"id": "missing", "source_text": "missing rule"},
+        ],
+    )
+    profile["operator_note"] = "preserve this attribute"
+    related = _seed_related_items(dynamodb_table)
+    dynamodb_table.put_item(Item=profile)
+
+    result = reset.repair_profile_dietary_preferences(dynamodb_table, USER_ID)
+
+    assert result.retained_count == 1
+    assert result.removed_count == 2
+    after = _items_for_user(dynamodb_table)
+    updated = after[(f"USER#{USER_ID}", "PROFILE")]
+    assert updated["dietary_preferences"] == [valid]
+    assert updated["dietary_constraints"] == profile["dietary_constraints"]
+    assert updated["operator_note"] == profile["operator_note"]
+    for key, item in related.items():
+        assert after[key] == item
+
+
+def test_repair_rejects_missing_or_unrecoverable_profiles(
+    dynamodb_table: Any,
+) -> None:
+    """Never create or repair a missing or unrecoverably malformed profile."""
     with pytest.raises(reset.ProfileNotFoundError):
-        reset.reset_profile_dietary_fields(dynamodb_table, USER_ID)
+        reset.repair_profile_dietary_preferences(dynamodb_table, USER_ID)
 
     malformed = _profile_item()
     malformed.pop("name")
     dynamodb_table.put_item(Item=malformed)
     with pytest.raises(reset.MalformedProfileError):
-        reset.reset_profile_dietary_fields(dynamodb_table, USER_ID)
+        reset.repair_profile_dietary_preferences(dynamodb_table, USER_ID)
 
-    raw_preference = _profile_item()
-    raw_preference["dietary_preferences"] = ["eggs for breakfast"]
-    dynamodb_table.put_item(Item=raw_preference)
+    invalid_rule = _profile_item(
+        dietary_preferences=[
+            {
+                "id": "invalid",
+                "source_text": "eggs",
+                "rule": {
+                    "id": "invalid-rule",
+                    "source_text": "eggs",
+                    "foods_any_of": [],
+                    "count": 1,
+                },
+            }
+        ]
+    )
+    dynamodb_table.put_item(Item=invalid_rule)
     with pytest.raises(reset.MalformedProfileError):
-        reset.reset_profile_dietary_fields(dynamodb_table, USER_ID)
+        reset.repair_profile_dietary_preferences(dynamodb_table, USER_ID)
 
 
-def test_reset_is_idempotent_and_does_not_advance_twice(
+def test_repair_is_idempotent_and_does_not_advance_twice(
     dynamodb_table: Any,
 ) -> None:
-    """A repeated reset is a safe no-op after the first successful update."""
-    dynamodb_table.put_item(Item=_profile_item())
+    """A repeated repair is a safe no-op after the first update."""
+    dynamodb_table.put_item(
+        Item=_profile_item(dietary_preferences=["legacy preference"])
+    )
 
-    first = reset.reset_profile_dietary_fields(dynamodb_table, USER_ID)
-    second = reset.reset_profile_dietary_fields(dynamodb_table, USER_ID)
+    first = reset.repair_profile_dietary_preferences(dynamodb_table, USER_ID)
+    second = reset.repair_profile_dietary_preferences(dynamodb_table, USER_ID)
 
-    assert first == reset.ResetResult(changed=True, profile_revision=5)
-    assert second == reset.ResetResult(changed=False, profile_revision=5)
+    assert first == reset.RepairResult(
+        changed=True, profile_revision=5, retained_count=0, removed_count=1
+    )
+    assert second == reset.RepairResult(
+        changed=False, profile_revision=5, retained_count=0, removed_count=0
+    )
     item = dynamodb_table.get_item(
         Key={"PK": f"USER#{USER_ID}", "SK": "PROFILE"}
     )["Item"]
     assert item["profile_revision"] == 5
     assert item["dietary_preferences"] == []
-    assert item["dietary_constraints"] == []
+    assert item["dietary_constraints"] == [
+        make_constraint().model_dump(mode="json")
+    ]
 
 
-def test_reset_uses_one_exact_key_without_scan_or_recursive_target(
+def test_repair_uses_one_exact_key_without_scan_or_recursive_target(
     mocker: Any,
 ) -> None:
     """The implementation must use only one keyed read and one keyed write."""
     table = mocker.MagicMock()
-    table.get_item.return_value = {"Item": _profile_item()}
+    table.get_item.return_value = {
+        "Item": _profile_item(dietary_preferences=["legacy preference"])
+    }
     table.update_item.return_value = {}
 
-    reset.reset_profile_dietary_fields(table, USER_ID)
+    reset.repair_profile_dietary_preferences(table, USER_ID)
 
     table.get_item.assert_called_once_with(
         Key={"PK": f"USER#{USER_ID}", "SK": "PROFILE"},
@@ -216,12 +287,14 @@ def test_reset_uses_one_exact_key_without_scan_or_recursive_target(
     assert "ConditionExpression" in table.update_item.call_args.kwargs
 
 
-def test_reset_rejects_conditional_race_without_leaking_aws_details(
+def test_repair_rejects_conditional_race_without_leaking_aws_details(
     mocker: Any,
 ) -> None:
     """A concurrent profile change must not be overwritten or exposed."""
     table = mocker.MagicMock()
-    table.get_item.return_value = {"Item": _profile_item()}
+    table.get_item.return_value = {
+        "Item": _profile_item(dietary_preferences=["legacy preference"])
+    }
     table.update_item.side_effect = ClientError(
         {
             "Error": {
@@ -233,7 +306,7 @@ def test_reset_rejects_conditional_race_without_leaking_aws_details(
     )
 
     with pytest.raises(reset.ResetConflictError) as raised:
-        reset.reset_profile_dietary_fields(table, USER_ID)
+        reset.repair_profile_dietary_preferences(table, USER_ID)
 
     assert "secret profile payload" not in str(raised.value)
     assert "ConditionalCheckFailedException" not in str(raised.value)
@@ -300,7 +373,42 @@ def test_cli_redacts_aws_errors(
     assert "AWS request failed" in output
 
 
-def test_reset_validates_the_stored_profile_with_the_canonical_model(
+def test_cli_reports_retained_and_removed_counts(
+    mocker: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI reports bounded counts without printing profile content."""
+    session = mocker.patch.object(reset.boto3, "Session")
+    table = session.return_value.resource.return_value.Table.return_value
+    table.get_item.return_value = {
+        "Item": _profile_item(
+            dietary_preferences=[
+                make_preference().model_dump(mode="json"),
+                "legacy preference",
+            ]
+        )
+    }
+
+    result = reset.main(
+        [
+            "--table",
+            TABLE_NAME,
+            "--profile",
+            "meal-planner",
+            "--region",
+            "us-east-1",
+            "--user-id",
+            USER_ID,
+        ]
+    )
+
+    assert result == 0
+    assert capsys.readouterr().out == (
+        "Repaired dietary preferences: removed 1, retained 1; "
+        "profile revision advanced to 5.\n"
+    )
+
+
+def test_repair_validates_the_stored_profile_with_the_canonical_model(
     dynamodb_table: Any,
 ) -> None:
     """The reset boundary rejects values the persisted profile cannot parse."""
@@ -311,7 +419,7 @@ def test_reset_validates_the_stored_profile_with_the_canonical_model(
     dynamodb_table.put_item(Item=item)
 
     with pytest.raises(reset.MalformedProfileError):
-        reset.reset_profile_dietary_fields(dynamodb_table, USER_ID)
+        reset.repair_profile_dietary_preferences(dynamodb_table, USER_ID)
 
     # Keep the import in the test module intentional: this asserts the fixture
     # remains a real canonical profile before the malformed mutation above.
