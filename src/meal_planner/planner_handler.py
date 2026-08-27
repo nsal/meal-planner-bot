@@ -6,12 +6,13 @@ import os
 import re
 import signal
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import FrameType
 from typing import Any, Optional
+from uuid import uuid4
 
 import boto3  # type: ignore[import-untyped]
 from botocore.config import Config  # type: ignore[import-untyped]
@@ -47,13 +48,19 @@ from meal_planner.llm.prompts import (
     build_plan_revision_prompt,
 )
 from meal_planner.models.schemas import (
+    BatchLedgerEntry,
+    BatchLedgerState,
+    BatchMealRole,
+    BatchRule,
     ConstraintEntry,
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
+    DietaryObligation,
     DietaryRule,
     GroceryStatus,
     MealOutcome,
+    MealType,
     PlanDays,
     PlanGenerationContext,
     PlanRevisionContext,
@@ -64,9 +71,11 @@ from meal_planner.models.schemas import (
 )
 from meal_planner.preferences import (
     PlanValidationResult,
+    ValidationIssue,
     format_best_effort_summary,
     format_satisfaction_summary,
     format_unmet_preference_clauses,
+    validate_batch_links,
     validate_generated_plan,
 )
 from meal_planner.telegram.api import TelegramAPI
@@ -78,6 +87,7 @@ FINALIZE_GROCERY = "finalize_grocery"
 REVISE_PLAN = "revise_plan"
 _MODEL_LABEL_MAX_LENGTH = 64
 _MODEL_LABEL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:+-]*")
+_BATCH_ID_ALLOCATION_ATTEMPTS = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +154,221 @@ class PlannerHandler:
         self.repair_read_timeout_seconds = repair_read_timeout_seconds
         self.max_attempts = max_attempts
 
+    @staticmethod
+    def _batch_entries_for_plan(
+        plan: WeeklyPlan,
+        *,
+        request_id: str | None,
+        repair_id: str | None = None,
+        available_batch_ids: set[str] | None = None,
+        require_explicit_yield: bool = False,
+    ) -> list[BatchLedgerEntry]:
+        """Create provisional source entries from application-owned links."""
+        linked_meals: list[tuple[date, Any]] = []
+        for plan_day in plan.days:
+            meal_date = plan.week_start + timedelta(days=plan_day.day - 1)
+            for meal in plan_day.meals:
+                if meal.batch_link is not None:
+                    linked_meals.append((meal_date, meal))
+        preparations = {
+            meal.batch_link.batch_id: (meal_date, meal)
+            for meal_date, meal in linked_meals
+            if meal.batch_link is not None
+            and meal.batch_link.role is BatchMealRole.PREPARATION
+        }
+        plan_id = f"plan-{plan.week_start.isoformat()}"
+        owner_id = request_id or repair_id or plan_id
+        entries: list[BatchLedgerEntry] = []
+        for batch_id, (meal_date, meal) in sorted(preparations.items()):
+            if available_batch_ids and batch_id in available_batch_ids:
+                continue
+            assert meal.batch_link is not None
+            if require_explicit_yield and meal.batch_link.total_yield is None:
+                raise ValueError("revision preparation yield is missing")
+            portions = [
+                linked_meal.batch_link.portion
+                for _, linked_meal in linked_meals
+                if linked_meal.batch_link is not None
+                and linked_meal.batch_link.batch_id == batch_id
+            ]
+            total_portions = min(
+                3,
+                max(
+                    2,
+                    meal.batch_link.total_yield or max(portions, default=1),
+                ),
+            )
+            food = meal.ingredients[0].item if meal.ingredients else meal.name
+            week_end = meal_date + timedelta(days=6 - meal_date.weekday())
+            entries.append(
+                BatchLedgerEntry(
+                    batch_id=batch_id,
+                    source_plan_id=plan_id,
+                    source_request_id=owner_id,
+                    source_revision=plan.revision,
+                    preparation_date=meal_date,
+                    preparation_meal_type=meal.meal_type,
+                    food=food,
+                    meal_name=meal.name,
+                    total_portions=total_portions,
+                    remaining_portions=total_portions - 1,
+                    state=BatchLedgerState.PROVISIONAL,
+                    week_end=week_end,
+                )
+            )
+        return entries
+
+    @staticmethod
+    def _allocate_batch_id(occupied_ids: set[str]) -> str:
+        """Allocate an opaque application-owned ID outside known IDs."""
+        for _ in range(_BATCH_ID_ALLOCATION_ATTEMPTS):
+            batch_id = f"batch-{uuid4().hex}"
+            if batch_id not in occupied_ids:
+                return batch_id
+        raise ValueError("could not allocate an application-owned batch ID")
+
+    @staticmethod
+    def _canonicalize_batch_ids(
+        plan: WeeklyPlan,
+        *,
+        available_batches: list[BatchLedgerEntry] | None,
+        preserved_batch_ids: set[str] | None = None,
+    ) -> WeeklyPlan:
+        """Replace provider IDs for new preparations before plan validation."""
+        inventory = list(available_batches or [])
+        preserved_ids = set(preserved_batch_ids or ())
+        available_ids = {
+            entry.batch_id
+            for entry in inventory
+            if entry.state is BatchLedgerState.AVAILABLE
+            and entry.remaining_portions > 0
+        }
+        occupied_ids = {entry.batch_id for entry in inventory}
+        occupied_ids.update(
+            meal.batch_link.batch_id
+            for plan_day in plan.days
+            for meal in plan_day.meals
+            if meal.batch_link is not None
+        )
+
+        preparation_counts: dict[str, int] = {}
+        for plan_day in plan.days:
+            for meal in plan_day.meals:
+                link = meal.batch_link
+                if link is not None and link.role is BatchMealRole.PREPARATION:
+                    preparation_counts[link.batch_id] = (
+                        preparation_counts.get(link.batch_id, 0) + 1
+                    )
+        if any(count != 1 for count in preparation_counts.values()):
+            raise ValueError("duplicate provider preparation token")
+        if available_ids.intersection(preparation_counts):
+            raise ValueError(
+                "provider preparation token collides with inventory"
+            )
+
+        replacements: dict[str, str] = {}
+        for provider_id in sorted(
+            set(preparation_counts).difference(preserved_ids)
+        ):
+            application_id = PlannerHandler._allocate_batch_id(occupied_ids)
+            replacements[provider_id] = application_id
+            occupied_ids.add(application_id)
+
+        canonical = plan.model_copy(deep=True)
+        for plan_day in canonical.days:
+            for meal in plan_day.meals:
+                link = meal.batch_link
+                if link is None:
+                    continue
+                replacement_id = replacements.get(link.batch_id)
+                if replacement_id is not None:
+                    meal.batch_link = link.model_copy(
+                        update={"batch_id": replacement_id}
+                    )
+        return canonical
+
+    @staticmethod
+    def _revision_preparation_yields(
+        plan: WeeklyPlan,
+    ) -> dict[str, int]:
+        """Return explicit yields for application-owned plan sources."""
+        return {
+            meal.batch_link.batch_id: meal.batch_link.total_yield
+            for plan_day in plan.days
+            for meal in plan_day.meals
+            if meal.batch_link is not None
+            and meal.batch_link.role is BatchMealRole.PREPARATION
+            and meal.batch_link.total_yield is not None
+        }
+
+    @staticmethod
+    def _preserve_revision_yields(
+        revised: WeeklyPlan, current: WeeklyPlan
+    ) -> WeeklyPlan:
+        """Preserve yields for retained sources and reject new omissions."""
+        current_yields = PlannerHandler._revision_preparation_yields(current)
+        normalized = revised.model_copy(deep=True)
+        for plan_day in normalized.days:
+            for meal in plan_day.meals:
+                link = meal.batch_link
+                if link is None or link.role is not BatchMealRole.PREPARATION:
+                    continue
+                previous_yield = current_yields.get(link.batch_id)
+                if link.total_yield is not None:
+                    if (
+                        previous_yield is not None
+                        and link.total_yield != previous_yield
+                    ):
+                        raise ValueError("revision preparation yield changed")
+                    continue
+                if previous_yield is None:
+                    raise ValueError("revision preparation yield is missing")
+                meal.batch_link = link.model_copy(
+                    update={"total_yield": previous_yield}
+                )
+        return normalized
+
+    def _validate_available_batch_links(
+        self,
+        user_id: str,
+        plan: WeeklyPlan,
+        available_batches: list[BatchLedgerEntry] | None = None,
+    ) -> list[BatchLedgerEntry]:
+        """Load available stock without deciding compliance itself."""
+        if available_batches is not None:
+            return available_batches
+        available_entries: dict[str, BatchLedgerEntry] = {}
+        for plan_day in plan.days:
+            meal_date = plan.week_start + timedelta(days=plan_day.day - 1)
+            for meal in plan_day.meals:
+                link = meal.batch_link
+                if link is None or link.role is not BatchMealRole.LEFTOVER:
+                    continue
+                for entry in self.repo.get_available_batch_portions(
+                    user_id, meal_date, meal_type=meal.meal_type
+                ):
+                    if entry.batch_id == link.batch_id:
+                        available_entries[entry.batch_id] = entry
+        return list(available_entries.values())
+
+    def _load_available_batches_for_horizon(
+        self, user_id: str, week_start: date, plan_days: int
+    ) -> list[BatchLedgerEntry]:
+        """Load each crossed ISO-week inventory snapshot once."""
+        entries: dict[str, BatchLedgerEntry] = {}
+        seen_weeks: set[tuple[int, int]] = set()
+        for offset in range(plan_days):
+            target_date = week_start + timedelta(days=offset)
+            iso_week = target_date.isocalendar()[:2]
+            if iso_week in seen_weeks:
+                continue
+            seen_weeks.add(iso_week)
+            for entry in self.repo.get_available_batch_portions(
+                user_id, target_date, meal_type=MealType.LUNCH
+            ):
+                entries[entry.batch_id] = entry
+        return list(entries.values())
+
     def generate_plan(
         self,
         user_id: str,
@@ -154,9 +379,12 @@ class PlannerHandler:
         preference: str | None = None,
         requirements: list[PreferenceRequirement] | None = None,
         stored_rules: list[DietaryRule] | None = None,
+        batch_rules: list[BatchRule] | None = None,
         current_rules: list[DietaryRule] | None = None,
         effective_rules: list[DietaryRule] | None = None,
         constraint_rules: list[ConstraintEntry] | None = None,
+        obligations: list[DietaryObligation] | None = None,
+        available_batches: list[BatchLedgerEntry] | None = None,
         attempt: int = 1,
         repair_feedback: str | None = None,
         request_id: str | None = None,
@@ -167,14 +395,18 @@ class PlannerHandler:
         started_at = time.monotonic()
         model = self._model_name(self.llm_client)
         try:
+            target_week = week_start or date.today()
             generation_context = PlanGenerationContext(
                 preference=preference,
                 plan_days=plan_days,
+                week_start=target_week,
                 requirements=requirements or [],
                 stored_rules=stored_rules or [],
+                batch_rules=batch_rules or [],
                 current_rules=current_rules or [],
                 effective_rules=effective_rules or [],
                 constraint_rules=constraint_rules or [],
+                obligations=obligations or [],
                 attempt=attempt,
                 repair_feedback=repair_feedback,
                 request_id=request_id,
@@ -206,7 +438,6 @@ class PlannerHandler:
                     "Please edit that constraint before generating a plan.",
                 )
                 return
-            target_week = week_start or date.today()
             current_plan = self.repo.get_plan(
                 user_id, target_week, consistent_read=True
             )
@@ -223,6 +454,10 @@ class PlannerHandler:
                     "unchanged.",
                 )
                 return
+            if available_batches is None:
+                available_batches = self._load_available_batches_for_horizon(
+                    user_id, target_week, int(generation_context.plan_days)
+                )
             client = self.llm_client or LLMClient()
             prompt = build_plan_prompt(
                 profile=profile,
@@ -236,14 +471,36 @@ class PlannerHandler:
                 current_rules=generation_context.current_rules,
                 effective_rules=generation_context.effective_rules,
                 constraint_rules=generation_context.constraint_rules,
+                obligations=generation_context.obligations,
+                available_batches=available_batches,
                 repair_feedback=generation_context.repair_feedback,
             )
+            if generation_context.batch_rules:
+                batch_lines_list: list[str] = []
+                for rule in generation_context.batch_rules:
+                    preparation = ", ".join(
+                        item.value for item in rule.preparation_meal_types
+                    )
+                    reuse = ", ".join(
+                        item.value for item in rule.reuse_meal_types
+                    )
+                    batch_lines_list.append(
+                        f"- {rule.source_text}; prepare: {preparation}; "
+                        f"reuse: {reuse}; total yield: {rule.total_yield}"
+                    )
+                batch_lines = "\n".join(batch_lines_list)
+                prompt += (
+                    "\n=== CONFIRMED BATCH RULES (APPLICATION-OWNED) ===\n"
+                    f"{batch_lines}\n"
+                    "Honor these typed preparation and reuse rules.\n"
+                )
             generation = self._generate_once(
                 client,
                 prompt,
                 target_week,
                 plan_days=int(generation_context.plan_days),
                 attempt=generation_context.attempt,
+                available_batches=available_batches,
             )
             if generation.plan is None:
                 if generation.feedback and generation_context.attempt == 1:
@@ -253,6 +510,7 @@ class PlannerHandler:
                         target_week,
                         generation_context,
                         generation.feedback,
+                        available_batches=available_batches,
                     )
                     if repair_status is True or repair_status is None:
                         return
@@ -283,7 +541,14 @@ class PlannerHandler:
                 plan,
                 generation_context.requirements,
                 rules=generation_context.effective_rules,
+                batch_rules=generation_context.batch_rules,
                 constraints=generation_context.constraint_rules,
+                obligations=(
+                    generation_context.obligations
+                    if obligations is not None
+                    else None
+                ),
+                available_batches=available_batches,
             )
             if not validation.is_valid:
                 if generation_context.attempt == 1:
@@ -293,6 +558,7 @@ class PlannerHandler:
                         target_week,
                         generation_context,
                         self._validation_feedback(validation),
+                        available_batches=available_batches,
                     )
                     if repair_status is True or repair_status is None:
                         return
@@ -309,6 +575,17 @@ class PlannerHandler:
                     requirements=generation_context.requirements,
                 )
                 return
+            has_batch_links = any(
+                meal.batch_link is not None
+                for plan_day in plan.days
+                for meal in plan_day.meals
+            )
+            if has_batch_links:
+                available_batch_entries = self._validate_available_batch_links(
+                    user_id, plan, available_batches
+                )
+            else:
+                available_batch_entries = []
             plan.status = PlanStatus.DRAFT
             plan.revision = (
                 0 if current_plan is None else current_plan.revision + 1
@@ -326,6 +603,18 @@ class PlannerHandler:
             expected_revision = (
                 None if current_plan is None else current_plan.revision
             )
+            batch_entries = (
+                self._batch_entries_for_plan(
+                    plan,
+                    request_id=request_id,
+                    repair_id=generation_context.repair_id,
+                    available_batch_ids={
+                        entry.batch_id for entry in available_batch_entries
+                    },
+                )
+                if has_batch_links
+                else None
+            )
             tracked_request = (
                 request_id is not None and state_revision is not None
             )
@@ -333,27 +622,55 @@ class PlannerHandler:
             if tracked_request:
                 assert request_id is not None
                 assert state_revision is not None
-                published = (
-                    self.repo.save_generated_draft_and_clear_conversation_state(
+                publish_tracked = (
+                    self.repo.save_generated_draft_and_clear_conversation_state
+                )
+                if batch_entries is None:
+                    published = publish_tracked(
                         user_id,
                         plan,
                         expected_revision=expected_revision,
                         request_id=request_id,
                         expected_state_revision=state_revision,
                     )
-                )
-            else:
-                if generation_context.repair_id is None:
-                    published = self.repo.save_generated_draft(
-                        user_id, plan, expected_revision=expected_revision
-                    )
                 else:
-                    repair_outcome = self.repo.save_repaired_draft_once(
+                    published = publish_tracked(
                         user_id,
                         plan,
                         expected_revision=expected_revision,
-                        repair_id=generation_context.repair_id,
+                        request_id=request_id,
+                        expected_state_revision=state_revision,
+                        batch_entries=batch_entries,
                     )
+            else:
+                if generation_context.repair_id is None:
+                    if batch_entries is None:
+                        published = self.repo.save_generated_draft(
+                            user_id, plan, expected_revision=expected_revision
+                        )
+                    else:
+                        published = self.repo.save_generated_draft(
+                            user_id,
+                            plan,
+                            expected_revision=expected_revision,
+                            batch_entries=batch_entries,
+                        )
+                else:
+                    if batch_entries is None:
+                        repair_outcome = self.repo.save_repaired_draft_once(
+                            user_id,
+                            plan,
+                            expected_revision=expected_revision,
+                            repair_id=generation_context.repair_id,
+                        )
+                    else:
+                        repair_outcome = self.repo.save_repaired_draft_once(
+                            user_id,
+                            plan,
+                            expected_revision=expected_revision,
+                            repair_id=generation_context.repair_id,
+                            batch_entries=batch_entries,
+                        )
                     published = (
                         repair_outcome is RepairPublicationOutcome.PUBLISHED
                     )
@@ -423,13 +740,20 @@ class PlannerHandler:
         *,
         plan_days: int = 7,
         attempt: int = 1,
+        available_batches: list[BatchLedgerEntry] | None = None,
+        preserved_batch_ids: set[str] | None = None,
+        repair_feedback: str | None = None,
     ) -> _GenerationAttempt:
         """Make exactly one provider call for this Planner invocation."""
         started_at = time.monotonic()
         try:
-            raw = self._strict_json_call(
-                client, prompt, "Generate weekly meal plan"
-            )
+            user_message = "Generate weekly meal plan"
+            if repair_feedback:
+                user_message += (
+                    "\nRepair the previous response using these validation "
+                    f"errors: {repair_feedback}"
+                )
+            raw = self._strict_json_call(client, prompt, user_message)
         except LLMFailure as exc:
             self._log_llm_failure(
                 client,
@@ -452,14 +776,33 @@ class PlannerHandler:
                 failure_category=self._llm_failure_category(exc),
             )
 
-        plan, feedback = parse_plan_response_with_metadata(raw)
+        plan, feedback = parse_plan_response_with_metadata(
+            raw, available_batches=available_batches
+        )
         if plan and plan.week_start == target_week:
-            if len(plan.days) == plan_days:
-                return _GenerationAttempt(plan=plan)
-            feedback = PlanResponseFeedback(
-                category="structural",
-                issues=(SafeValidationIssue("wrong_day_count", "days"),),
-            )
+            if len(plan.days) != plan_days:
+                feedback = PlanResponseFeedback(
+                    category="structural",
+                    issues=(SafeValidationIssue("wrong_day_count", "days"),),
+                )
+            else:
+                try:
+                    plan = self._canonicalize_batch_ids(
+                        plan,
+                        available_batches=available_batches,
+                        preserved_batch_ids=preserved_batch_ids,
+                    )
+                except ValueError:
+                    feedback = PlanResponseFeedback(
+                        category="compliance",
+                        issues=(
+                            SafeValidationIssue(
+                                "batch_identity_conflict", "batch_link"
+                            ),
+                        ),
+                    )
+                else:
+                    return _GenerationAttempt(plan=plan)
         elif plan is not None:
             feedback = PlanResponseFeedback(
                 category="structural",
@@ -487,11 +830,55 @@ class PlannerHandler:
         chat_id: int | str,
         plan_days: int,
         failure_mode: str = "initial",
+        available_batches: list[BatchLedgerEntry] | None = None,
+        preserved_batch_ids: set[str] | None = None,
+        candidate_validator: Callable[
+            [WeeklyPlan], tuple[WeeklyPlan, PlanValidationResult]
+        ]
+        | None = None,
     ) -> WeeklyPlan | None:
-        """Keep revisions to one provider call per Planner invocation."""
+        """Allow one bounded repair for a deterministic candidate failure."""
         generation = self._generate_once(
-            client, prompt, target_week, plan_days=plan_days
+            client,
+            prompt,
+            target_week,
+            plan_days=plan_days,
+            available_batches=available_batches,
+            preserved_batch_ids=preserved_batch_ids,
         )
+        if generation.plan is not None and candidate_validator is not None:
+            validated_candidate, validation = candidate_validator(
+                generation.plan
+            )
+            if not validation.is_valid:
+                repair_feedback = self._validation_feedback(validation)
+                repaired = self._generate_once(
+                    client,
+                    prompt,
+                    target_week,
+                    plan_days=plan_days,
+                    attempt=2,
+                    available_batches=available_batches,
+                    preserved_batch_ids=preserved_batch_ids,
+                    repair_feedback=repair_feedback,
+                )
+                if repaired.plan is not None:
+                    (
+                        repaired_candidate,
+                        repaired_validation,
+                    ) = candidate_validator(repaired.plan)
+                    if repaired_validation.is_valid:
+                        return repaired_candidate
+                reason = repaired.failure_reason or self._invalid_plan_message(
+                    attempt=2
+                )
+                self._notify_failure(
+                    chat_id,
+                    self._generation_failure_message(failure_mode, reason),
+                    attempt=2,
+                )
+                return None
+            return validated_candidate
         if generation.plan is not None:
             return generation.plan
         reason = generation.failure_reason or self._invalid_plan_message()
@@ -505,13 +892,20 @@ class PlannerHandler:
     @staticmethod
     def _validation_feedback(validation: PlanValidationResult) -> str:
         """Return bounded, coded feedback suitable for repair transport."""
-        feedback = "; ".join(
-            "code={} location={}".format(
+        parts: list[str] = []
+        for issue in validation.issues:
+            part = "code={} location={}".format(
                 issue.code,
                 PlannerHandler._validation_location(issue),
             )
-            for issue in validation.issues
-        )
+            if issue.obligation_id is not None:
+                part += f" obligation={issue.obligation_id}"
+            if issue.obligation_date is not None:
+                part += f" date={issue.obligation_date.isoformat()}"
+            if issue.batch_role is not None:
+                part += f" role={issue.batch_role.value}"
+            parts.append(part)
+        feedback = "; ".join(parts)
         return (feedback or "code=validation_required location=$")[:800]
 
     @staticmethod
@@ -526,6 +920,8 @@ class PlannerHandler:
             return "constraints"
         if issue.rule_id is not None:
             return "rules"
+        if issue.batch_id is not None:
+            return "batch_link"
         if issue.requirement_id is not None:
             return "requirements"
         return "plan"
@@ -536,7 +932,8 @@ class PlannerHandler:
         if validation.safety_issues:
             return "safety"
         if any(
-            issue.code.startswith("requirement_") for issue in validation.issues
+            issue.code.startswith(("requirement_", "obligation_"))
+            for issue in validation.issues
         ):
             return "compliance"
         if any(
@@ -611,6 +1008,7 @@ class PlannerHandler:
         target_week: date,
         context: PlanGenerationContext,
         feedback: str,
+        available_batches: list[BatchLedgerEntry] | None = None,
     ) -> bool | None:
         """Queue one fresh attempt, or no-op when the request is stale."""
         if context.attempt != 1:
@@ -654,11 +1052,12 @@ class PlannerHandler:
                 category="repair_dispatch",
             )
             return False
+        snapshot_week = context.week_start or target_week
         payload = {
             "action": GENERATE_PLAN,
             "user_id": user_id,
             "chat_id": chat_id,
-            "week_start": target_week.isoformat(),
+            "week_start": snapshot_week.isoformat(),
             "plan_days": context.plan_days,
             "preference": context.preference,
             "requirements": [
@@ -667,6 +1066,9 @@ class PlannerHandler:
             ],
             "stored_rules": [
                 rule.model_dump(mode="json") for rule in context.stored_rules
+            ],
+            "batch_rules": [
+                rule.model_dump(mode="json") for rule in context.batch_rules
             ],
             "current_rules": [
                 rule.model_dump(mode="json") for rule in context.current_rules
@@ -677,6 +1079,14 @@ class PlannerHandler:
             "constraint_rules": [
                 rule.model_dump(mode="json")
                 for rule in context.constraint_rules
+            ],
+            "obligations": [
+                obligation.model_dump(mode="json")
+                for obligation in context.obligations
+            ],
+            "available_batches": [
+                entry.model_dump(mode="json")
+                for entry in (available_batches or [])
             ],
             "attempt": 2,
             "repair_feedback": feedback[:800],
@@ -1069,6 +1479,9 @@ class PlannerHandler:
                     "missing. Use /plan to create a new draft.",
                 )
                 return
+            batch_rules = tuple(
+                rule.model_copy(deep=True) for rule in profile.batch_rules
+            )
             if not plan:
                 self._resolve_revision_conflict(
                     user_id,
@@ -1100,26 +1513,135 @@ class PlannerHandler:
                 )
                 return
             expected_plan_days = len(plan.days)
+            available_batches = self._load_available_batches_for_horizon(
+                user_id, context.week_start, expected_plan_days
+            )
+            plan = plan.model_copy(deep=True)
+            available_batches = [
+                entry.model_copy(deep=True) for entry in available_batches
+            ]
+            preserved_batch_ids = set(self._revision_preparation_yields(plan))
             client = self.llm_client or LLMClient()
+            revision_prompt = build_plan_revision_prompt(
+                profile,
+                plan,
+                context.amendment,
+                expected_plan_days=expected_plan_days,
+                week_start=context.week_start.isoformat(),
+                available_batches=available_batches,
+            )
+            if batch_rules:
+                batch_lines = "\n".join(
+                    "- {}; prepare: {}; reuse: {}; total yield: {}".format(
+                        rule.source_text,
+                        ", ".join(
+                            item.value for item in rule.preparation_meal_types
+                        ),
+                        ", ".join(item.value for item in rule.reuse_meal_types),
+                        rule.total_yield,
+                    )
+                    for rule in batch_rules
+                )
+                revision_prompt += (
+                    "\n=== CONFIRMED BATCH RULES (APPLICATION-OWNED) ===\n"
+                    f"{batch_lines}\n"
+                    "Honor these typed preparation and reuse rules.\n"
+                )
+
+            def validate_revision_candidate(
+                candidate: WeeklyPlan,
+            ) -> tuple[WeeklyPlan, PlanValidationResult]:
+                """Normalize retained yields before rule validation."""
+                try:
+                    normalized = self._preserve_revision_yields(candidate, plan)
+                except ValueError:
+                    return (
+                        candidate,
+                        PlanValidationResult(
+                            valid=False,
+                            requirements=(),
+                            issues=(
+                                ValidationIssue(
+                                    code="batch_rule_wrong_yield",
+                                    message=(
+                                        "A preparation yield did not satisfy "
+                                        "the revision batch contract."
+                                    ),
+                                    batch_role=BatchMealRole.PREPARATION,
+                                ),
+                            ),
+                        ),
+                    )
+                return (
+                    normalized,
+                    validate_generated_plan(
+                        normalized,
+                        batch_rules=batch_rules,
+                        available_batches=available_batches,
+                    ),
+                )
+
             revised = self._generate_with_bounded_repair(
                 client,
-                build_plan_revision_prompt(
-                    profile,
-                    plan,
-                    context.amendment,
-                    expected_plan_days=expected_plan_days,
-                    week_start=context.week_start.isoformat(),
-                ),
+                revision_prompt,
                 context.week_start,
                 chat_id,
                 plan_days=expected_plan_days,
                 failure_mode="revision",
+                available_batches=available_batches,
+                preserved_batch_ids=preserved_batch_ids,
+                candidate_validator=(validate_revision_candidate)
+                if batch_rules
+                else None,
             )
             if revised is None:
                 self._retain_retry_state(
                     user_id,
                     request_id=context.request_id,
                     state_revision=context.state_revision,
+                    attempt=1,
+                )
+                return
+            try:
+                revised = self._preserve_revision_yields(revised, plan)
+            except ValueError:
+                self._retain_retry_state(
+                    user_id,
+                    request_id=context.request_id,
+                    state_revision=context.state_revision,
+                    attempt=1,
+                )
+                self._notify_failure(
+                    chat_id,
+                    "I couldn't revise the draft because its batch links "
+                    "were invalid. Your original draft is unchanged; "
+                    "reply retry or use /cancel.",
+                    attempt=1,
+                )
+                return
+            batch_validation = (
+                validate_generated_plan(
+                    revised,
+                    batch_rules=batch_rules,
+                    available_batches=available_batches,
+                )
+                if batch_rules
+                else validate_batch_links(
+                    revised, available_batches=available_batches
+                )
+            )
+            if not batch_validation.is_valid:
+                self._retain_retry_state(
+                    user_id,
+                    request_id=context.request_id,
+                    state_revision=context.state_revision,
+                    attempt=1,
+                )
+                self._notify_failure(
+                    chat_id,
+                    "I couldn't revise the draft because its batch links "
+                    "were invalid. Your original draft is unchanged; "
+                    "reply retry or use /cancel.",
                     attempt=1,
                 )
                 return
@@ -1135,13 +1657,43 @@ class PlannerHandler:
             for plan_day in revised.days:
                 for meal in plan_day.meals:
                     meal.outcome = MealOutcome.UNREPORTED
-            published = self.repo.replace_draft_and_clear_revision_state(
-                user_id,
-                revised,
-                expected_plan_revision=context.expected_plan_revision,
-                request_id=context.request_id,
-                expected_state_revision=context.state_revision,
+            has_batch_links = any(
+                meal.batch_link is not None
+                for plan_day in revised.days
+                for meal in plan_day.meals
+            ) or any(
+                meal.batch_link is not None
+                for plan_day in plan.days
+                for meal in plan_day.meals
             )
+            if has_batch_links:
+                available_batch_ids = self._validate_available_batch_links(
+                    user_id, revised
+                )
+                batch_entries = self._batch_entries_for_plan(
+                    revised,
+                    request_id=context.request_id,
+                    available_batch_ids={
+                        entry.batch_id for entry in available_batch_ids
+                    },
+                    require_explicit_yield=True,
+                )
+                published = self.repo.replace_draft_and_clear_revision_state(
+                    user_id,
+                    revised,
+                    expected_plan_revision=context.expected_plan_revision,
+                    request_id=context.request_id,
+                    expected_state_revision=context.state_revision,
+                    batch_entries=batch_entries,
+                )
+            else:
+                published = self.repo.replace_draft_and_clear_revision_state(
+                    user_id,
+                    revised,
+                    expected_plan_revision=context.expected_plan_revision,
+                    request_id=context.request_id,
+                    expected_state_revision=context.state_revision,
+                )
             if not published:
                 self._resolve_revision_conflict(
                     user_id,
@@ -1287,9 +1839,11 @@ class PlannerHandler:
                         "preference": event.get("preference"),
                         "requirements": event.get("requirements", []),
                         "stored_rules": event.get("stored_rules", []),
+                        "batch_rules": event.get("batch_rules", []),
                         "current_rules": event.get("current_rules", []),
                         "effective_rules": event.get("effective_rules", []),
                         "constraint_rules": event.get("constraint_rules", []),
+                        "obligations": event.get("obligations", []),
                         "plan_days": event.get("plan_days", 7),
                         "attempt": event.get("attempt", 1),
                         "repair_feedback": event.get("repair_feedback"),
@@ -1298,8 +1852,26 @@ class PlannerHandler:
                         "repair_id": event.get("repair_id"),
                     }
                 )
+                has_available_snapshot = "available_batches" in event
+                raw_available_batches = event.get("available_batches", [])
+                if (
+                    not isinstance(raw_available_batches, list)
+                    or len(raw_available_batches) > 20
+                ):
+                    return False
+                available_batches = [
+                    BatchLedgerEntry.model_validate(item)
+                    for item in raw_available_batches
+                ]
             except TypeError, ValueError, ValidationError:
                 return False
+            optional_generation_args: dict[str, Any] = {}
+            if has_available_snapshot:
+                optional_generation_args["available_batches"] = (
+                    available_batches
+                )
+            if context.batch_rules:
+                optional_generation_args["batch_rules"] = context.batch_rules
             self.generate_plan(
                 user_id,
                 chat_id,
@@ -1311,11 +1883,13 @@ class PlannerHandler:
                 current_rules=context.current_rules,
                 effective_rules=context.effective_rules,
                 constraint_rules=context.constraint_rules,
+                obligations=context.obligations,
                 attempt=context.attempt,
                 repair_feedback=context.repair_feedback,
                 request_id=context.request_id,
                 state_revision=context.state_revision,
                 repair_id=context.repair_id,
+                **optional_generation_args,
             )
             return True
         if action == FINALIZE_GROCERY:

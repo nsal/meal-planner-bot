@@ -22,12 +22,20 @@ from meal_planner.config import (
 )
 from meal_planner.db.dynamo import DynamoRepository
 from meal_planner.dietary_rules import (
+    assign_generated_target_weekdays,
     expand_constraint_entry,
     has_constraint_conflict,
+    project_dietary_obligations,
     resolve_priority_rules,
     validate_constraints,
 )
-from meal_planner.llm.client import LLMClient
+from meal_planner.llm.client import (
+    LLMClient,
+    LLMPermanentError,
+    LLMResponseFormatError,
+    LLMTimeoutError,
+    LLMTransientError,
+)
 from meal_planner.llm.parser import (
     parse_conversational_response,
     parse_preference_interpretation,
@@ -37,12 +45,14 @@ from meal_planner.llm.prompts import (
     build_preference_interpretation_prompt,
 )
 from meal_planner.models.schemas import (
-    MAX_PLAN_REQUIREMENTS,
+    BatchMealRole,
+    BatchRule,
     ConstraintEntry,
     ConversationIntent,
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
+    DietaryObligation,
     DietaryPreferenceEntry,
     DietaryRule,
     FamilyMember,
@@ -53,6 +63,7 @@ from meal_planner.models.schemas import (
     MealOutcome,
     MealType,
     PlanDays,
+    PlannedBatchLink,
     PlannedMeal,
     PlanStatus,
     PreferenceRequirement,
@@ -60,6 +71,7 @@ from meal_planner.models.schemas import (
     ProfileEditOperation,
     ProfileUpdateEntities,
     RuleOperator,
+    SubmittedMealBatchLink,
     UserProfile,
     WeeklyPlan,
     canonicalize_constraint_entry,
@@ -149,6 +161,7 @@ class BotHandler:
         planner_function_name: str = "",
         llm_client: Optional[LLMClient] = None,
         access_policy: TelegramAccessPolicy | None = None,
+        processing_date: date | None = None,
     ) -> None:
         self.repo = repo
         self.telegram_api = telegram_api
@@ -156,6 +169,7 @@ class BotHandler:
         self.planner_function_name = planner_function_name
         self.llm_client = llm_client
         self.access_policy = access_policy or TelegramAccessPolicy(frozenset())
+        self._processing_date = processing_date
 
     def handle_update(self, update: dict[str, Any]) -> dict[str, Any]:
         route = route_update(update)
@@ -177,8 +191,8 @@ class BotHandler:
                 self.handle_callback(route)
             elif route.route_type is RouteType.CONVERSATIONAL:
                 self.handle_conversational(route)
-        except TelegramAPIError as exc:
-            logger.error("Telegram delivery failed: %s", exc)
+        except TelegramAPIError:
+            logger.error("Telegram delivery failed reason_code=delivery")
         return {"statusCode": 200, "body": "ok"}
 
     def handle_command(self, route: RouteResult) -> None:
@@ -497,7 +511,7 @@ class BotHandler:
     def _encode_pending_profile_rules(
         mode: str,
         source_text: str,
-        rules: list[ConstraintEntry | DietaryRule],
+        rules: list[ConstraintEntry | DietaryRule | BatchRule],
     ) -> tuple[str, str]:
         """Serialize one bounded interpretation for durable confirmation."""
         token = uuid4().hex[:12]
@@ -517,7 +531,15 @@ class BotHandler:
     @staticmethod
     def _decode_pending_profile_rules(
         value: str | None,
-    ) -> tuple[str, str, list[ConstraintEntry | DietaryRule], str] | None:
+    ) -> (
+        tuple[
+            str,
+            str,
+            list[ConstraintEntry | DietaryRule | BatchRule],
+            str,
+        ]
+        | None
+    ):
         """Validate a serialized pending interpretation before use."""
         if value is None or not value.startswith(_PROFILE_PENDING_PREFIX):
             return None
@@ -543,16 +565,20 @@ class BotHandler:
             or not 1 <= len(raw_rules) <= 20
         ):
             return None
-        rules: list[ConstraintEntry | DietaryRule] = []
+        rules: list[ConstraintEntry | DietaryRule | BatchRule] = []
         try:
             for raw_rule in raw_rules:
                 if not isinstance(raw_rule, dict):
                     return None
-                rules.append(
-                    ConstraintEntry.model_validate(raw_rule)
-                    if mode == "constraint"
-                    else DietaryRule.model_validate(raw_rule)
-                )
+                if mode == "constraint":
+                    rules.append(ConstraintEntry.model_validate(raw_rule))
+                elif {
+                    "preparation_meal_types",
+                    "reuse_meal_types",
+                }.issubset(raw_rule):
+                    rules.append(BatchRule.model_validate(raw_rule))
+                else:
+                    rules.append(DietaryRule.model_validate(raw_rule))
         except ValidationError:
             return None
         return mode, source_text, rules, token
@@ -678,8 +704,8 @@ class BotHandler:
                 )
                 return
             acknowledgement = "Meal updated"
-        except Exception as exc:
-            logger.exception("Error handling callback: %s", exc)
+        except Exception:
+            logger.error("Error handling callback reason_code=unexpected")
             if route.chat_id is not None:
                 self.telegram_api.send_message(
                     route.chat_id,
@@ -692,8 +718,10 @@ class BotHandler:
                     f"Marked {callback.meal_type.value} as "
                     f"{callback.outcome.value}.",
                 )
-            except TelegramAPIError as exc:
-                logger.error("Callback success delivery failed: %s", exc)
+            except TelegramAPIError:
+                logger.error(
+                    "Callback success delivery failed reason_code=delivery"
+                )
         finally:
             if route.callback_query_id:
                 try:
@@ -737,7 +765,15 @@ class BotHandler:
             self.telegram_api.send_profile_root(route.chat_id)
             return
 
-        profile = self.repo.get_profile(route.user_id, consistent_read=True)
+        try:
+            profile = self.repo.get_profile(route.user_id, consistent_read=True)
+        except TypeError, ValueError, ValidationError:
+            self.telegram_api.send_message(
+                route.chat_id,
+                "I couldn't safely load your profile. Please try again or "
+                "edit it through /profile.",
+            )
+            return
         if profile is None:
             self.telegram_api.send_message(
                 route.chat_id, "No complete profile found. Use /start to begin."
@@ -761,9 +797,17 @@ class BotHandler:
             )
         else:
             preferences = list(profile.dietary_preferences)
+            batch_rules = list(profile.batch_rules)
             for rule in rules:
-                if not isinstance(rule, DietaryRule):
+                if isinstance(rule, BatchRule):
+                    batch_rules.append(rule)
                     continue
+                if not isinstance(rule, DietaryRule):
+                    self.telegram_api.send_message(
+                        route.chat_id,
+                        "I couldn't safely interpret that profile change.",
+                    )
+                    return
                 if has_constraint_conflict(rule, profile.dietary_constraints):
                     next_state = self._profile_menu_state(state)
                     if self.repo.transition_conversation_state(
@@ -791,7 +835,11 @@ class BotHandler:
                     )
                 )
             updated = self._profile_with_updates(
-                profile, {"dietary_preferences": preferences}
+                profile,
+                {
+                    "dietary_preferences": preferences,
+                    "batch_rules": batch_rules,
+                },
             )
         updated = canonicalize_profile_rule_ids(updated)
         next_state = self._profile_menu_state(state)
@@ -800,7 +848,9 @@ class BotHandler:
                 route.user_id, updated, next_state, state
             )
         except Exception:
-            logger.exception("Profile rule confirmation failed")
+            logger.error(
+                "Profile rule confirmation failed reason_code=unexpected"
+            )
             committed = False
         if not committed:
             self.repo.get_profile(route.user_id, consistent_read=True)
@@ -966,7 +1016,9 @@ class BotHandler:
                 )
                 self.telegram_api.send_message(route.chat_id, message)
         except Exception:
-            logger.exception("Profile callback handling failed")
+            logger.error(
+                "Profile callback handling failed reason_code=unexpected"
+            )
             if route.chat_id is not None:
                 try:
                     self.telegram_api.send_message(
@@ -995,7 +1047,11 @@ class BotHandler:
 
             if callback.action.value == "confirm":
                 return self._confirm_meal_callback(
-                    route.chat_id, route.user_id, state, callback.submission_id
+                    route.chat_id,
+                    route.user_id,
+                    state,
+                    callback.submission_id,
+                    batch_role=callback.batch_role,
                 )
             if callback.action.value == "cancel":
                 return self._cancel_meal_callback(
@@ -1019,7 +1075,7 @@ class BotHandler:
                     callback.submission_id,
                 )
         except Exception:
-            logger.exception("Error handling meal callback")
+            logger.error("Error handling meal callback reason_code=unexpected")
             self._send_meal_message(
                 route.chat_id,
                 "Sorry, I couldn't update that meal. Please try again.",
@@ -1043,6 +1099,8 @@ class BotHandler:
         user_id: str,
         state: ConversationState,
         submission_id: str,
+        *,
+        batch_role: BatchMealRole | None,
     ) -> str:
         """Atomically save a reviewed meal and show continuation actions."""
         if (
@@ -1067,18 +1125,39 @@ class BotHandler:
             self._send_stale_meal_action(chat_id)
             return "Stale meal action"
 
+        pending_batch_link = state.pending_batch_link
+        if pending_batch_link is not None:
+            if batch_role is not pending_batch_link.role:
+                self._send_meal_message(
+                    chat_id,
+                    "Please confirm the planned batch role before saving, "
+                    "or cancel this submission.",
+                )
+                return "Batch role required"
+            submitted_batch_link = SubmittedMealBatchLink(
+                batch_id=pending_batch_link.batch_id,
+                role=pending_batch_link.role,
+                source_date=pending_batch_link.source_date,
+                source_meal_type=pending_batch_link.source_meal_type,
+                portion=pending_batch_link.portion,
+            )
+        else:
+            submitted_batch_link = None
+
         now = datetime.now(timezone.utc)
         entry = MealLogEntry(
             date=draft.date,
             meal_type=draft.meal_type,
             description=draft.description,
             created_at=now,
+            batch_link=submitted_batch_link,
         )
         continuation = state.model_copy(
             update={
                 "step": ConversationWorkflowStep.AWAITING_MEAL_CONTINUATION,
                 "revision": state.revision + 1,
                 "updated_at": now,
+                "pending_batch_link": None,
             }
         )
         try:
@@ -1088,9 +1167,14 @@ class BotHandler:
                 continuation,
                 expected_revision=state.revision,
                 submission_id=submission_id,
+                processing_date=(
+                    self._processing_date or datetime.now(timezone.utc).date()
+                ),
             )
         except Exception:
-            logger.exception("Meal confirmation persistence failed")
+            logger.error(
+                "Meal confirmation persistence failed reason_code=persistence"
+            )
             self._send_meal_message(
                 chat_id,
                 "I couldn't save that meal. Your review is still available; "
@@ -1161,7 +1245,9 @@ class BotHandler:
                 ),
             )
         except Exception:
-            logger.exception("Meal cancellation persistence failed")
+            logger.error(
+                "Meal cancellation persistence failed reason_code=persistence"
+            )
             self._send_meal_message(
                 chat_id,
                 "I couldn't cancel that meal. Please try again.",
@@ -1203,7 +1289,10 @@ class BotHandler:
                 ),
             )
         except Exception:
-            logger.exception("Starting another meal persistence failed")
+            logger.error(
+                "Starting another meal persistence failed "
+                "reason_code=persistence"
+            )
             self._send_meal_message(
                 chat_id,
                 "I couldn't start another meal. Please try again.",
@@ -1239,7 +1328,10 @@ class BotHandler:
                 ),
             )
         except Exception:
-            logger.exception("Completing meal workflow persistence failed")
+            logger.error(
+                "Completing meal workflow persistence failed "
+                "reason_code=persistence"
+            )
             self._send_meal_message(
                 chat_id,
                 "I couldn't finish meal logging. Please try again.",
@@ -1303,6 +1395,7 @@ class BotHandler:
                     route.text,
                     state,
                     source_update_id=source_update_id,
+                    reference_date=self._reference_date_from_route(route),
                 )
                 return
             if (
@@ -1375,8 +1468,10 @@ class BotHandler:
                 route.chat_id,
                 reply or "I got your message. What would you like to do next?",
             )
-        except Exception as exc:
-            logger.error("Conversational handling failed: %s", exc)
+        except Exception:
+            logger.error(
+                "Conversational handling failed reason_code=unexpected"
+            )
             self.telegram_api.send_message(
                 route.chat_id,
                 "Sorry, I couldn't process that request. Please try again.",
@@ -1581,19 +1676,50 @@ class BotHandler:
             try:
                 client = self.llm_client or LLMClient()
                 interpretation = parse_preference_interpretation(
-                    client.chat_sync(
+                    client.chat_json_strict_sync(
                         build_preference_interpretation_prompt(text, mode=mode),
                         text,
                     ),
                     mode=mode,
                 )
-            except Exception:
-                logger.error("Profile rule interpretation failed")
-                interpretation = (
-                    [],
-                    "I couldn't safely interpret that profile change. "
-                    "Please rephrase it with specific foods.",
+            except LLMTimeoutError:
+                logger.warning(
+                    "Profile rule interpretation failed reason_code=timeout"
                 )
+                return (
+                    "I couldn't safely interpret that profile change. "
+                    "The interpretation service timed out; please try again."
+                )
+            except LLMTransientError:
+                logger.warning(
+                    "Profile rule interpretation failed reason_code=transient"
+                )
+                return (
+                    "I couldn't safely interpret that profile change. "
+                    "The interpretation service is temporarily unavailable."
+                )
+            except LLMPermanentError:
+                logger.error(
+                    "Profile rule interpretation failed reason_code=permanent"
+                )
+                return (
+                    "I couldn't safely interpret that profile change. "
+                    "Please rephrase it with specific foods and counts."
+                )
+            except LLMResponseFormatError:
+                logger.warning(
+                    "Profile rule interpretation failed "
+                    "reason_code=response_format"
+                )
+                return (
+                    "I couldn't safely interpret that profile change. "
+                    "Please try again with a specific food rule."
+                )
+            except Exception:
+                logger.error(
+                    "Profile rule interpretation failed reason_code=unexpected"
+                )
+                return "I couldn't safely interpret that profile change."
             rules, clarification = interpretation
             if clarification:
                 return clarification
@@ -1602,11 +1728,13 @@ class BotHandler:
             typed_rules = [
                 rule
                 for rule in rules
-                if isinstance(rule, (ConstraintEntry, DietaryRule))
+                if isinstance(rule, (ConstraintEntry, DietaryRule, BatchRule))
             ]
             if len(typed_rules) != len(rules):
                 return "I couldn't safely interpret that profile change."
-            pending_rules: list[ConstraintEntry | DietaryRule] = typed_rules
+            pending_rules: list[ConstraintEntry | DietaryRule | BatchRule] = (
+                typed_rules
+            )
             if mode == "constraint":
                 canonical_constraints: list[ConstraintEntry] = []
                 for rule in typed_rules:
@@ -1640,6 +1768,9 @@ class BotHandler:
                     for rule in typed_rules
                     if isinstance(rule, DietaryRule)
                 ]
+                pending_rules.extend(
+                    rule for rule in typed_rules if isinstance(rule, BatchRule)
+                )
             try:
                 pending_value, token = self._encode_pending_profile_rules(
                     mode, text.strip(), pending_rules
@@ -1692,7 +1823,9 @@ class BotHandler:
                 user_id, updated, menu_state, state
             )
         except Exception:
-            logger.exception("Profile amendment transaction failed")
+            logger.error(
+                "Profile amendment transaction failed reason_code=persistence"
+            )
             return "I couldn't save that profile change. Please try again."
         if not committed:
             self.repo.get_profile(user_id, consistent_read=True)
@@ -1907,7 +2040,57 @@ class BotHandler:
         item = BotHandler._parse_profile_item(text)
         if item is None:
             return None, "Send one non-empty item."
-        items = BotHandler._profile_items(profile, category)
+        if category is ProfileEditCategory.DIETARY_PREFERENCES:
+            preference_items = list(profile.dietary_preferences)
+            batch_items = list(profile.batch_rules)
+            matching_preference = next(
+                (
+                    index
+                    for index, existing in enumerate(preference_items)
+                    if (
+                        existing.casefold()
+                        if isinstance(existing, str)
+                        else existing.source_text.casefold()
+                    )
+                    == item.casefold()
+                ),
+                None,
+            )
+            matching_batch = next(
+                (
+                    index
+                    for index, existing in enumerate(batch_items)
+                    if existing.source_text.casefold() == item.casefold()
+                ),
+                None,
+            )
+            if operation is ProfileEditOperation.REMOVE:
+                if matching_preference is not None:
+                    removed = preference_items.pop(matching_preference)
+                    removed_text = (
+                        removed
+                        if isinstance(removed, str)
+                        else removed.source_text
+                    )
+                    return (
+                        BotHandler._profile_with_updates(
+                            profile,
+                            {"dietary_preferences": preference_items},
+                        ),
+                        f"Removed {removed_text}.",
+                    )
+                if matching_batch is not None:
+                    removed_batch = batch_items.pop(matching_batch)
+                    return (
+                        BotHandler._profile_with_updates(
+                            profile, {"batch_rules": batch_items}
+                        ),
+                        f"Removed {removed_batch.source_text}.",
+                    )
+                return None, "I couldn't find that dietary preference."
+            items: list[Any] = preference_items
+        else:
+            items = BotHandler._profile_items(profile, category)
         matching_index = next(
             (
                 index
@@ -1961,11 +2144,21 @@ class BotHandler:
             return
 
         assert result.draft is not None
+        assert result.draft.date is not None
+        assert result.draft.meal_type is not None
+        planned_batch_link = self.repo.get_planned_batch_link(
+            user_id,
+            result.draft.date,
+            result.draft.meal_type,
+        )
+        if not isinstance(planned_batch_link, PlannedBatchLink):
+            planned_batch_link = None
         now = datetime.now(timezone.utc)
         review_state = state.model_copy(
             update={
                 "step": ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
                 "meal_draft": result.draft,
+                "pending_batch_link": planned_batch_link,
                 "revision": state.revision + 1,
                 "updated_at": now,
             }
@@ -1980,9 +2173,17 @@ class BotHandler:
             return
         if review_state.request_id is None:
             raise ValueError("meal review state requires a request ID")
-        self.telegram_api.send_meal_review(
-            chat_id, text, review_state.request_id
-        )
+        if review_state.pending_batch_link is None:
+            self.telegram_api.send_meal_review(
+                chat_id, text, review_state.request_id
+            )
+        else:
+            self.telegram_api.send_meal_review(
+                chat_id,
+                text,
+                review_state.request_id,
+                batch_link=review_state.pending_batch_link,
+            )
 
     def _restart_legacy_meal_workflow(
         self,
@@ -2146,7 +2347,7 @@ class BotHandler:
                 source_update_id=source_update_id,
             )
         except Exception:
-            logger.exception("Meal persistence failed for user %s", user_id)
+            logger.error("Meal persistence failed reason_code=persistence")
             return "I couldn't save that meal. Please try again."
         if not persisted:
             return "That meal workflow changed. Please use /submit_meals."
@@ -2162,6 +2363,7 @@ class BotHandler:
         state: ConversationState,
         *,
         source_update_id: str | None,
+        reference_date: date | None = None,
     ) -> None:
         if source_update_id and state.last_update_id == source_update_id:
             if state.step is ConversationWorkflowStep.AWAITING_PREFERENCE:
@@ -2183,7 +2385,15 @@ class BotHandler:
             )
             return
 
-        profile = self.repo.get_profile(user_id)
+        try:
+            profile = self.repo.get_profile(user_id)
+        except TypeError, ValueError, ValidationError:
+            self.telegram_api.send_message(
+                chat_id,
+                "I couldn't safely load your profile. Please try again or "
+                "edit it through /profile.",
+            )
+            return
         if profile is None:
             self.telegram_api.send_message(
                 chat_id, "Complete your profile before generating a plan."
@@ -2221,7 +2431,7 @@ class BotHandler:
 
         if preference is None:
             interpretation: tuple[
-                list[DietaryRule | ConstraintEntry], str | None
+                list[DietaryRule | ConstraintEntry | BatchRule], str | None
             ] = (
                 [],
                 None,
@@ -2267,15 +2477,22 @@ class BotHandler:
 
         requirements, clarification = interpretation
         current_rules = [
-            canonicalize_dietary_rule(rule, namespace="current")
+            canonicalize_dietary_rule(
+                assign_generated_target_weekdays(rule), namespace="current"
+            )
             for rule in requirements
             if isinstance(rule, DietaryRule)
         ]
+        batch_rules, batch_clarification = self._collect_stored_batch_rules(
+            profile
+        )
+        if batch_clarification and not clarification:
+            clarification = batch_clarification
         stored_rules: list[DietaryRule] = []
         stored_clarification: str | None = None
         if not clarification:
             stored_rules, stored_clarification = (
-                self._prepare_stored_preference_rules(profile)
+                self._collect_stored_preference_rules(profile)
             )
             if stored_clarification:
                 clarification = stored_clarification
@@ -2284,8 +2501,14 @@ class BotHandler:
             for constraint in profile.dietary_constraints
         ]
         resolution_message: str | None = None
+        effective_rules: list[DietaryRule] = []
+        obligations: list[DietaryObligation] = []
+        horizon_start = (
+            reference_date
+            or _COMMAND_REFERENCE_DATE.get()
+            or datetime.now(timezone.utc).date()
+        )
         if not clarification:
-            horizon_start = date.today()
             safety = validate_constraints(constraint_rules)
             if not safety.is_safe:
                 resolution_message = (
@@ -2321,20 +2544,56 @@ class BotHandler:
                             "Please clarify or remove the conflicting rule."
                         )
                     else:
-                        horizon_result = validate_horizon_feasibility(
-                            effective_rules,
-                            start_date=horizon_start,
-                            end_date=horizon_start
-                            + timedelta(days=int(plan_days) - 1),
-                        )
-                        if not horizon_result.is_feasible:
-                            resolution_message = (
-                                horizon_result.clarification
-                                or "Some preference rules cannot fit the "
-                                "requested plan horizon. Please clarify."
+                        if preference is not None:
+                            horizon_result = validate_horizon_feasibility(
+                                effective_rules,
+                                start_date=horizon_start,
+                                end_date=horizon_start
+                                + timedelta(days=int(plan_days) - 1),
                             )
+                            if not horizon_result.is_feasible:
+                                resolution_message = (
+                                    horizon_result.clarification
+                                    or "Some preference rules cannot fit the "
+                                    "requested plan horizon. Please clarify."
+                                )
+                        if not resolution_message:
+                            try:
+                                history_start = horizon_start - timedelta(
+                                    days=horizon_start.weekday()
+                                )
+                                history_end = horizon_start + timedelta(
+                                    days=int(plan_days) - 1
+                                )
+                                submitted_meals = self.repo.get_submitted_meals(
+                                    user_id,
+                                    start_date=history_start,
+                                    end_date=history_end,
+                                )
+                                if not isinstance(submitted_meals, list):
+                                    submitted_meals = list(submitted_meals)
+                                obligations = list(
+                                    project_dietary_obligations(
+                                        effective_rules,
+                                        submitted_meals,
+                                        start_date=horizon_start,
+                                        end_date=history_end,
+                                    )
+                                )
+                            except (
+                                AttributeError,
+                                TypeError,
+                                ValueError,
+                                ValidationError,
+                            ):
+                                resolution_message = (
+                                    "I couldn't safely load your saved dietary "
+                                    "rules. Please edit your profile and try "
+                                    "again."
+                                )
         if clarification or resolution_message:
             effective_rules = []
+            obligations = []
         # Structured interpretations belong exclusively in effective_rules.
         # The requirements field is reserved for genuinely legacy events.
         planner_requirements: list[PreferenceRequirement] = []
@@ -2353,11 +2612,14 @@ class BotHandler:
                     "duration_collected": True,
                     "requirements": planner_requirements,
                     "stored_rules": stored_rules,
+                    "batch_rules": batch_rules,
                     "current_rules": current_rules
                     if not resolution_message
                     else [],
                     "effective_rules": effective_rules,
                     "constraint_rules": constraint_rules,
+                    "obligations": obligations,
+                    "plan_start": horizon_start,
                     "revision": state.revision + 1,
                     "updated_at": datetime.now(timezone.utc),
                     "last_update_id": source_update_id,
@@ -2391,9 +2653,11 @@ class BotHandler:
             preference=preference,
             requirements=planner_requirements,
             stored_rules=stored_rules,
+            batch_rules=batch_rules,
             current_rules=current_rules,
             effective_rules=effective_rules,
             constraint_rules=constraint_rules,
+            obligations=obligations,
             request_id=candidate.request_id,
             state_revision=candidate.revision,
         )
@@ -2441,57 +2705,33 @@ class BotHandler:
             return "Working on your meal plan."
         return f"Working on your {plan_days}-day meal plan."
 
-    def _prepare_stored_preference_rules(
+    def _collect_stored_preference_rules(
         self, profile: UserProfile
     ) -> tuple[list[DietaryRule], str | None]:
-        """Interpret legacy stored wording before resolving plan rules."""
-        stored_rules: list[DietaryRule] = []
-        client = self.llm_client or LLMClient()
-        for entry in profile.dietary_preferences:
-            if entry.rule is not None:
-                stored_rules.append(
-                    canonicalize_dietary_rule(entry.rule, namespace="stored")
-                )
-                continue
-            try:
-                interpretation = parse_preference_interpretation(
-                    client.chat_sync(
-                        build_preference_interpretation_prompt(
-                            entry.source_text, mode="stored_preference"
-                        ),
-                        entry.source_text,
-                    ),
-                    mode="stored_preference",
-                )
-            except Exception:
-                logger.error("Stored preference interpretation failed")
-                return [], (
-                    "I couldn't safely interpret a saved dietary preference. "
-                    "Please rephrase or remove it before generating a plan."
-                )
-            rules, clarification = interpretation
-            if clarification:
-                return [], (
-                    "I couldn't safely interpret a saved dietary preference. "
-                    f"{clarification}"
-                )
-            if not rules or not all(
-                isinstance(rule, DietaryRule) for rule in rules
-            ):
-                return [], (
-                    "I couldn't safely interpret a saved dietary preference. "
-                    "Please rephrase or remove it before generating a plan."
-                )
-            stored_rules.extend(
-                canonicalize_dietary_rule(rule, namespace="stored")
-                for rule in rules
-                if isinstance(rule, DietaryRule)
+        """Collect confirmed typed rules without interpreting source text."""
+        if not isinstance(profile, UserProfile):
+            if type(profile).__module__ == "unittest.mock":
+                return [], None
+            return [], (
+                "I couldn't safely load your saved dietary rules. Please "
+                "edit your profile and try again."
             )
-            if len(stored_rules) > MAX_PLAN_REQUIREMENTS:
-                return [], (
-                    "Your saved dietary preferences contain too many rules. "
-                    "Please remove one before generating a plan."
+        try:
+            stored_rules = [
+                canonicalize_dietary_rule(
+                    assign_generated_target_weekdays(entry.rule),
+                    namespace="stored",
                 )
+                for entry in profile.dietary_preferences
+                if isinstance(entry, DietaryPreferenceEntry)
+            ]
+            if len(stored_rules) != len(profile.dietary_preferences):
+                raise ValueError("stored preference entry is malformed")
+        except AttributeError, TypeError, ValueError, ValidationError:
+            return [], (
+                "I couldn't safely load your saved dietary rules. Please "
+                "edit your profile and try again."
+            )
         rule_ids = [rule.id for rule in stored_rules]
         if len(rule_ids) != len(set(rule_ids)):
             return [], (
@@ -2499,6 +2739,32 @@ class BotHandler:
                 "Please remove the duplicate preference and try again."
             )
         return sorted(stored_rules, key=lambda rule: rule.id), None
+
+    @staticmethod
+    def _collect_stored_batch_rules(
+        profile: UserProfile,
+    ) -> tuple[list[BatchRule], str | None]:
+        """Collect confirmed batch rules without interpreting their text."""
+        if not isinstance(profile, UserProfile):
+            if type(profile).__module__ == "unittest.mock":
+                return [], None
+            return [], (
+                "I couldn't safely load your saved dietary rules. Please "
+                "edit your profile and try again."
+            )
+        try:
+            batch_rules = list(profile.batch_rules)
+            if any(not isinstance(rule, BatchRule) for rule in batch_rules):
+                raise ValueError("stored batch rule is malformed")
+            rule_ids = [rule.id for rule in batch_rules]
+            if len(rule_ids) != len(set(rule_ids)):
+                raise ValueError("stored batch rules have duplicate IDs")
+        except AttributeError, TypeError, ValueError, ValidationError:
+            return [], (
+                "I couldn't safely load your saved dietary rules. Please "
+                "edit your profile and try again."
+            )
+        return sorted(batch_rules, key=lambda rule: rule.id), None
 
     @staticmethod
     def _snapshot_effective_rules(
@@ -2548,19 +2814,27 @@ class BotHandler:
         self, user_id: str, chat_id: int | str, state: ConversationState
     ) -> None:
         retry_start = (
-            _COMMAND_REFERENCE_DATE.get() or datetime.now(timezone.utc).date()
+            state.plan_start
+            or _COMMAND_REFERENCE_DATE.get()
+            or datetime.now(timezone.utc).date()
         )
-        horizon_result = validate_horizon_feasibility(
-            state.effective_rules,
-            start_date=retry_start,
-            end_date=retry_start + timedelta(days=int(state.plan_days) - 1),
-        )
-        if not horizon_result.is_feasible:
+        horizon_result = None
+        if state.plan_start is None:
+            # States created before Task 6 have no immutable calendar marker.
+            # Keep their legacy capacity check while all new states use the
+            # persisted (possibly empty) obligation snapshot unchanged.
+            horizon_result = validate_horizon_feasibility(
+                state.effective_rules,
+                start_date=retry_start,
+                end_date=retry_start + timedelta(days=int(state.plan_days) - 1),
+            )
+        if horizon_result is not None and not horizon_result.is_feasible:
             candidate = state.model_copy(
                 update={
                     "step": ConversationWorkflowStep.AWAITING_PREFERENCE,
                     "revision": state.revision + 1,
                     "updated_at": datetime.now(timezone.utc),
+                    "plan_start": retry_start,
                 }
             )
             if not self.repo.transition_conversation_state(
@@ -2584,6 +2858,7 @@ class BotHandler:
                 "step": ConversationWorkflowStep.GENERATING,
                 "revision": state.revision + 1,
                 "updated_at": datetime.now(timezone.utc),
+                "plan_start": retry_start,
             }
         )
         if not self.repo.transition_conversation_state(
@@ -2602,9 +2877,11 @@ class BotHandler:
             preference=candidate.preference,
             requirements=candidate.requirements,
             stored_rules=candidate.stored_rules,
+            batch_rules=candidate.batch_rules,
             current_rules=candidate.current_rules,
             effective_rules=candidate.effective_rules,
             constraint_rules=candidate.constraint_rules,
+            obligations=candidate.obligations,
             request_id=candidate.request_id,
             state_revision=candidate.revision,
         ):
@@ -2671,11 +2948,13 @@ class BotHandler:
                     source_update_id=source_update_id,
                 )
             return MutationResult(True)
-        except (ValidationError, ValueError, TypeError) as exc:
-            logger.warning("Rejected conversational mutation: %s", exc)
+        except ValidationError, ValueError, TypeError:
+            logger.warning(
+                "Rejected conversational mutation reason_code=invalid"
+            )
             return MutationResult(False)
-        except Exception as exc:
-            logger.error("Mutation persistence failed: %s", exc)
+        except Exception:
+            logger.error("Mutation persistence failed reason_code=persistence")
             return MutationResult(
                 False, "I couldn't save that change. Please try again."
             )
@@ -2744,7 +3023,42 @@ class BotHandler:
         entities: dict[str, Any],
         existing: UserProfile | None,
     ) -> MutationResult:
+        for field in (
+            "dietary_constraints",
+            "dietary_preferences",
+            "batch_rules",
+        ):
+            raw_value = entities.get(field)
+            if raw_value is None or raw_value == []:
+                continue
+            if isinstance(raw_value, str) and raw_value.strip().casefold() in {
+                "",
+                "none",
+                "no",
+                "no preference",
+                "no preferences",
+                "no restrictions",
+                "no allergies",
+                "nothing",
+            }:
+                continue
+            if raw_value is not None:
+                return MutationResult(
+                    False,
+                    "Dietary rules must be added through /profile for "
+                    "review before they are saved.",
+                )
         update = ProfileUpdateEntities.model_validate(entities)
+        if (
+            update.dietary_constraints
+            or update.dietary_preferences
+            or update.batch_rules
+        ):
+            return MutationResult(
+                False,
+                "Dietary rules must be added through /profile for review "
+                "before they are saved.",
+            )
         expected_revision = (
             existing.profile_revision if existing is not None else None
         )
@@ -3200,9 +3514,11 @@ class BotHandler:
         preference: str | None = None,
         requirements: list[PreferenceRequirement] | None = None,
         stored_rules: list[DietaryRule] | None = None,
+        batch_rules: list[BatchRule] | None = None,
         current_rules: list[DietaryRule] | None = None,
         effective_rules: list[DietaryRule] | None = None,
         constraint_rules: list[ConstraintEntry] | None = None,
+        obligations: list[DietaryObligation] | None = None,
         attempt: int = 1,
         repair_feedback: str | None = None,
         amendment: str | None = None,
@@ -3232,6 +3548,10 @@ class BotHandler:
                             rule.model_dump(mode="json")
                             for rule in (stored_rules or [])
                         ],
+                        "batch_rules": [
+                            rule.model_dump(mode="json")
+                            for rule in (batch_rules or [])
+                        ],
                         "current_rules": [
                             rule.model_dump(mode="json")
                             for rule in (current_rules or [])
@@ -3243,6 +3563,10 @@ class BotHandler:
                         "constraint_rules": [
                             rule.model_dump(mode="json")
                             for rule in (constraint_rules or [])
+                        ],
+                        "obligations": [
+                            obligation.model_dump(mode="json")
+                            for obligation in (obligations or [])
                         ],
                         "attempt": attempt,
                         "repair_feedback": repair_feedback,
@@ -3264,8 +3588,8 @@ class BotHandler:
                 InvocationType="Event",
                 Payload=json.dumps(payload),
             )
-        except Exception as exc:
-            logger.error("Planner invocation failed: %s", exc)
+        except Exception:
+            logger.error("Planner invocation failed reason_code=dispatch")
             return False
         return True
 

@@ -47,6 +47,26 @@ the locked `uv` environment.
   dietary constraints > current plan preferences > stored dietary
   preferences. Constraints cannot be overridden, and a preference that
   conflicts with one is rejected.
+- Only `/profile` interprets dietary text for saved rules, using strict
+  structured output and confirmation; `/plan` never reinterprets saved
+  dietary text. A preference supplied for the current plan is interpreted
+  separately and is never written into the saved profile without a profile
+  confirmation.
+- Persistent food preferences are ISO-week quotas. For each requested
+  horizon, the application projects only obligations due in each weekly
+  segment and counts submitted meal history before each weekly segment as
+  evidence. Draft or confirmed plan meals do not count as evidence. Explicit
+  weekdays remain exact; rules without weekdays receive stable,
+  Monday-anchored, evenly spaced target weekdays. Missed generated targets
+  are carried forward within the week and short horizons are capped by their
+  available meal slots.
+- Batch cooking covers 2 or 3 total lunch/dinner portions. Draft publication
+  creates provisional reservations tied to the request and plan revision;
+  replacing a draft removes only its provisional reservations. After the
+  preparation meal is submitted and confirmed, the remaining portions become
+  available. A confirmed linked leftover consumes exactly one portion.
+  Unsubmitted provisional reservations expire after the preparation date, and
+  remaining portions expire at the ISO-week boundary.
 - `/plan` asks for a duration and request-specific preference before starting
   asynchronous generation. Reply in the form `N, preference`, such as
   `1, no preference` or `3, fish for dinner`; only the first comma separates
@@ -55,7 +75,14 @@ the locked `uv` environment.
   profile is never changed. After the initial reply, clarification messages
   are treated as preference text and retain the selected duration. Historical
   in-progress seven-day requests continue to accept preference-only replies.
-  A failed request retains the preference so `/plan` can retry it.
+  A failed request retains the preference so `/plan` can retry it. The first
+  invocation makes one whole-plan provider request. An invalid result gets
+  one automatic repair in a fresh asynchronous invocation using the same
+  immutable horizon, evidence, obligation, and batch snapshot. If the repair
+  also fails, no draft is saved or displayed, the
+  previous draft remains unchanged, and the saved preference is retained. A
+  manual `/plan` retry reuses that snapshot's duration, request preference,
+  and obligation projection; it does not reinterpret saved profile text.
 - Request-specific preferences support structured natural-language rules.
   An unqualified positive food preference such as `eggs for breakfast` means
   a strict `at_least 1` rule for both request-specific preferences and saved
@@ -259,6 +286,27 @@ TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
 APP_SECRETS_SECRET_NAME=meal-planner/app-secrets
 SYNC_SECRETS=false
 ```
+
+### One-time development dietary reset
+
+After deploying the compatible code, an operator may clear the dietary
+preferences and constraints for one exact development user. The command
+requires the table name, AWS profile, region, and user ID explicitly:
+
+```bash
+uv run python scripts/reset_profile_dietary_fields.py \
+  --table meal-planner-dev-table \
+  --profile meal-planner \
+  --region eu-west-1 \
+  --user-id 123456789
+```
+
+It conditionally updates only `dietary_preferences`,
+`dietary_constraints`, and `profile_revision` on that user's `PROFILE` item.
+It does not scan the table or alter family details, nutrition targets, plans,
+conversation state, or meal history. Repeating a successful reset is a safe
+no-op. This is a one-time development operation: do not add it to routine
+deployment orchestration or rerun it after the profile has been recreated.
 
 The routine workflow prints numbered stage headings as it checks prerequisites,
 authenticates and confirms the AWS identity, checks that the configured JSON

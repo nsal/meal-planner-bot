@@ -1,5 +1,7 @@
 """Tests for deterministic dietary constraint rules."""
 
+from datetime import date, datetime, timedelta, timezone
+
 import pytest
 
 from meal_planner.dietary_rules import (
@@ -7,19 +9,110 @@ from meal_planner.dietary_rules import (
     ConstraintExpansionResult,
     ConstraintSourceReference,
     PriorityClarification,
+    assign_generated_target_weekdays,
     expand_constraint_entry,
     expand_constraint_terms,
     find_constraint_conflicts,
     has_constraint_conflict,
+    project_dietary_obligations,
     resolve_priority_rules,
 )
 from meal_planner.models.schemas import (
     ConstraintEntry,
     DietaryRule,
+    MealLogEntry,
     MealType,
     RuleOperator,
     Weekday,
 )
+
+
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [
+        (1, [Weekday.MONDAY]),
+        (2, [Weekday.MONDAY, Weekday.THURSDAY]),
+        (3, [Weekday.MONDAY, Weekday.WEDNESDAY, Weekday.FRIDAY]),
+        (
+            4,
+            [
+                Weekday.MONDAY,
+                Weekday.TUESDAY,
+                Weekday.THURSDAY,
+                Weekday.SATURDAY,
+            ],
+        ),
+        (
+            5,
+            [
+                Weekday.MONDAY,
+                Weekday.TUESDAY,
+                Weekday.WEDNESDAY,
+                Weekday.FRIDAY,
+                Weekday.SATURDAY,
+            ],
+        ),
+        (
+            6,
+            [
+                Weekday.MONDAY,
+                Weekday.TUESDAY,
+                Weekday.WEDNESDAY,
+                Weekday.THURSDAY,
+                Weekday.FRIDAY,
+                Weekday.SATURDAY,
+            ],
+        ),
+        (7, list(Weekday)),
+    ],
+)
+def test_generated_weekdays_are_monday_anchored_and_evenly_spaced(
+    count: int, expected: list[Weekday]
+) -> None:
+    """Every supported weekly count receives a stable generated schedule."""
+    rule = DietaryRule(
+        id="rule",
+        source_text=f"eggs {count} times",
+        foods_any_of=["eggs"],
+        count=count,
+        operator=RuleOperator.EXACTLY,
+    )
+
+    scheduled = assign_generated_target_weekdays(rule)
+
+    assert scheduled.target_weekdays == expected
+    assert scheduled.weekdays == []
+
+
+def test_explicit_weekdays_are_preserved_by_generated_scheduler() -> None:
+    """Application-generated targets never move a user-selected weekday."""
+    rule = DietaryRule(
+        id="rule",
+        source_text="pancakes on Saturday",
+        foods_any_of=["pancakes"],
+        meal_type=MealType.BREAKFAST,
+        weekdays=[Weekday.SATURDAY],
+        count=1,
+    )
+
+    scheduled = assign_generated_target_weekdays(rule)
+
+    assert scheduled is rule
+    assert scheduled.weekdays == [Weekday.SATURDAY]
+    assert scheduled.target_weekdays == []
+
+
+def test_generated_scheduler_rejects_counts_beyond_weekly_targets() -> None:
+    """A generated schedule cannot silently collapse extra meal occurrences."""
+    rule = DietaryRule(
+        id="rule",
+        source_text="eggs eight times",
+        foods_any_of=["eggs"],
+        count=8,
+    )
+
+    with pytest.raises(ValueError, match="counts from 0 to 7"):
+        assign_generated_target_weekdays(rule)
 
 
 def test_expands_normalized_exact_and_dairy_alias_terms() -> None:
@@ -559,3 +652,263 @@ def test_resolution_is_stable_for_retries_and_rule_serialization() -> None:
         DietaryRule.model_validate(payload).model_dump(mode="json")
         for payload in first_payload
     ] == first_payload
+
+
+def _logged_meal(
+    day: date,
+    meal_type: MealType,
+    description: str,
+    hour: int = 12,
+) -> MealLogEntry:
+    return MealLogEntry(
+        date=day,
+        meal_type=meal_type,
+        description=description,
+        created_at=datetime(
+            day.year, day.month, day.day, hour, tzinfo=timezone.utc
+        ),
+    )
+
+
+@pytest.mark.parametrize("start_weekday", range(1, 8))
+@pytest.mark.parametrize("horizon_days", range(1, 8))
+def test_projection_covers_every_start_weekday_and_horizon(
+    start_weekday: int, horizon_days: int
+) -> None:
+    """Every bounded horizon produces only dates in its requested range."""
+    start = date(2026, 8, 3) + timedelta(days=start_weekday - 1)
+    end = start + timedelta(days=horizon_days - 1)
+    rule = DietaryRule(
+        id="eggs",
+        source_text="eggs weekly",
+        foods_any_of=["eggs"],
+        meal_type=MealType.BREAKFAST,
+        count=3,
+        operator=RuleOperator.EXACTLY,
+        target_weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY, Weekday.FRIDAY],
+    )
+
+    obligations = project_dietary_obligations(
+        [rule], submitted_meals=[], start_date=start, end_date=end
+    )
+
+    assert all(
+        obligation.horizon_start >= start
+        and obligation.horizon_end <= end
+        and all(start <= day <= end for day in obligation.eligible_dates)
+        for obligation in obligations
+    )
+    assert all(
+        obligation.iso_week
+        == f"{day.isocalendar().year:04d}-W{day.isocalendar().week:02d}"
+        for obligation in obligations
+        for day in obligation.eligible_dates
+    )
+
+
+def test_projection_counts_distinct_evidence_and_alternatives() -> None:
+    """Only one normalized meal per slot satisfies a weekly food quota."""
+    rule = DietaryRule(
+        id="fish",
+        source_text="fish weekly",
+        foods_any_of=["fish", "tofu"],
+        meal_type=MealType.DINNER,
+        count=2,
+        operator=RuleOperator.AT_LEAST,
+        target_weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY],
+    )
+    submitted = [
+        _logged_meal(date(2026, 8, 3), MealType.DINNER, "Tofu stir fry"),
+        _logged_meal(date(2026, 8, 3), MealType.DINNER, "Tofu stir fry", 13),
+    ]
+
+    obligations = project_dietary_obligations(
+        [rule],
+        submitted_meals=submitted,
+        start_date=date(2026, 8, 5),
+        end_date=date(2026, 8, 5),
+    )
+
+    assert len(obligations) == 1
+    assert obligations[0].count == 1
+    assert len(obligations[0].evidence_ids) == 1
+
+
+def test_projection_ignores_future_and_wrong_scope_submissions() -> None:
+    """Evidence is limited to prior dates and the rule's meal scope."""
+    rule = DietaryRule(
+        id="eggs",
+        source_text="eggs for breakfast",
+        foods_any_of=["eggs"],
+        meal_type=MealType.BREAKFAST,
+        count=2,
+        target_weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY],
+    )
+    submitted = [
+        _logged_meal(date(2026, 8, 3), MealType.LUNCH, "Eggs"),
+        _logged_meal(date(2026, 8, 4), MealType.BREAKFAST, "Eggs"),
+        _logged_meal(date(2026, 8, 6), MealType.BREAKFAST, "Eggs"),
+    ]
+
+    obligations = project_dietary_obligations(
+        [rule],
+        submitted_meals=submitted,
+        start_date=date(2026, 8, 5),
+        end_date=date(2026, 8, 5),
+    )
+
+    assert obligations[0].count == 1
+    assert len(obligations[0].evidence_ids) == 1
+
+
+def test_projection_supports_four_unscoped_meals_on_one_day() -> None:
+    """Unscoped rules retain the reviewed four-meal daily capacity."""
+    rule = DietaryRule(
+        id="beans",
+        source_text="beans four times",
+        foods_any_of=["beans"],
+        count=4,
+        operator=RuleOperator.EXACTLY,
+        weekdays=[Weekday.WEDNESDAY],
+        schedule_kind="explicit",
+    )
+    obligations = project_dietary_obligations(
+        [rule],
+        submitted_meals=[],
+        start_date=date(2026, 8, 5),
+        end_date=date(2026, 8, 5),
+    )
+
+    assert obligations[0].count == 4
+    assert obligations[0].eligible_dates == [date(2026, 8, 5)]
+
+
+@pytest.mark.parametrize(
+    ("operator", "submitted_count", "expected_count"),
+    [
+        (RuleOperator.EXACTLY, 0, 1),
+        (RuleOperator.EXACTLY, 1, 0),
+        (RuleOperator.EXACTLY, 2, 0),
+        (RuleOperator.AT_LEAST, 0, 1),
+        (RuleOperator.AT_LEAST, 1, 0),
+        (RuleOperator.AT_MOST, 0, 1),
+        (RuleOperator.AT_MOST, 1, 0),
+    ],
+)
+def test_projection_applies_count_operators_and_caps_short_horizons(
+    operator: RuleOperator, submitted_count: int, expected_count: int
+) -> None:
+    """Short horizons defer excess due work instead of becoming infeasible."""
+    rule = DietaryRule(
+        id="eggs",
+        source_text="eggs",
+        foods_any_of=["eggs"],
+        meal_type=MealType.BREAKFAST,
+        count=1,
+        operator=operator,
+        target_weekdays=[Weekday.MONDAY],
+    )
+    submitted = [
+        _logged_meal(
+            date(2026, 8, 3) + timedelta(days=index),
+            MealType.BREAKFAST,
+            "Eggs",
+        )
+        for index in range(submitted_count)
+    ]
+    obligations = project_dietary_obligations(
+        [rule],
+        submitted_meals=submitted,
+        start_date=date(2026, 8, 5),
+        end_date=date(2026, 8, 5),
+    )
+    assert sum(obligation.count for obligation in obligations) == expected_count
+
+
+def test_projection_preserves_explicit_days_and_carries_targets() -> None:
+    """Explicit Saturday stays Saturday; generated overdue slots catch up."""
+    explicit = DietaryRule(
+        id="pancake",
+        source_text="pancake Saturday",
+        foods_any_of=["pancake"],
+        meal_type=MealType.BREAKFAST,
+        weekdays=[Weekday.SATURDAY],
+        count=1,
+        schedule_kind="explicit",
+    )
+    generated = DietaryRule(
+        id="egg",
+        source_text="egg twice",
+        foods_any_of=["egg"],
+        meal_type=MealType.BREAKFAST,
+        count=2,
+        target_weekdays=[Weekday.MONDAY, Weekday.WEDNESDAY],
+    )
+
+    explicit_result = project_dietary_obligations(
+        [explicit],
+        submitted_meals=[],
+        start_date=date(2026, 8, 5),
+        end_date=date(2026, 8, 7),
+    )
+    generated_result = project_dietary_obligations(
+        [generated],
+        submitted_meals=[],
+        start_date=date(2026, 8, 5),
+        end_date=date(2026, 8, 7),
+    )
+
+    assert explicit_result == ()
+    assert generated_result[0].eligible_dates == [
+        date(2026, 8, 5),
+        date(2026, 8, 6),
+    ]
+
+
+def test_projection_crosses_iso_sunday_without_mixing_week_evidence() -> None:
+    """A Sunday-to-Monday horizon yields independent weekly obligations."""
+    rule = DietaryRule(
+        id="eggs",
+        source_text="eggs weekly",
+        foods_any_of=["eggs"],
+        meal_type=MealType.BREAKFAST,
+        count=1,
+        target_weekdays=[Weekday.MONDAY],
+    )
+    obligations = project_dietary_obligations(
+        [rule],
+        submitted_meals=[
+            _logged_meal(date(2026, 8, 3), MealType.BREAKFAST, "Eggs")
+        ],
+        start_date=date(2026, 8, 9),
+        end_date=date(2026, 8, 10),
+    )
+
+    assert [obligation.iso_week for obligation in obligations] == ["2026-W33"]
+    assert [obligation.count for obligation in obligations] == [1]
+
+
+def test_projection_rejects_invalid_horizon_and_contradictory_rules() -> None:
+    """Only malformed or contradictory rule input is an infeasibility error."""
+    rule = DietaryRule(
+        id="eggs",
+        source_text="eggs",
+        foods_any_of=["eggs"],
+        count=1,
+    )
+    with pytest.raises(ValueError, match="at most 7 days"):
+        project_dietary_obligations(
+            [rule],
+            submitted_meals=[],
+            start_date=date(2026, 8, 3),
+            end_date=date(2026, 8, 10),
+        )
+
+    contradictory = rule.model_copy(update={"id": "eggs-zero", "count": 0})
+    with pytest.raises(ValueError, match="contradictory"):
+        project_dietary_obligations(
+            [rule, contradictory],
+            submitted_meals=[],
+            start_date=date(2026, 8, 3),
+            end_date=date(2026, 8, 3),
+        )

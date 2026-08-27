@@ -13,20 +13,28 @@ from pydantic import ValidationError
 
 from meal_planner.dietary_rules import has_constraint_conflict
 from meal_planner.models.schemas import (
+    BatchLedgerEntry,
+    BatchLedgerState,
+    BatchMealRole,
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
     MealLogEntry,
     MealOutcome,
+    MealType,
+    PlannedBatchLink,
     PlanStatus,
     ProfileEditCategory,
     ProfileUpdateEntities,
     UserProfile,
+    WeeklyBatchLedger,
     WeeklyPlan,
     canonicalize_profile_rule_ids,
 )
 
 logger = logging.getLogger(__name__)
+_PLANNED_BATCH_PLAN_QUERY_LIMIT = 32
+_WEEKLY_BATCH_EXPIRY_MAX_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -45,6 +53,16 @@ class RepairPublicationOutcome(str, Enum):
     DUPLICATE = "duplicate"
 
 
+class TransactionConflictKind(str, Enum):
+    """Bounded classification for conditional transaction cancellations."""
+
+    STALE_WORK = "stale_work"
+    DUPLICATE_SUBMISSION = "duplicate_submission"
+    INVENTORY_CHANGED = "inventory_changed"
+    RETRYABLE = "retryable"
+    UNKNOWN = "unknown"
+
+
 class DynamoRepository:
     """Repository handling CRUD operations on a single DynamoDB table."""
 
@@ -56,6 +74,25 @@ class DynamoRepository:
         return {
             key: value for key, value in item.items() if key not in {"PK", "SK"}
         }
+
+    def _transact_write_with_retry(
+        self, transact_items: list[dict[str, Any]]
+    ) -> None:
+        """Retry one service-level transaction conflict with the same guards."""
+        for attempt in range(2):
+            try:
+                self.table.meta.client.transact_write_items(
+                    TransactItems=transact_items
+                )
+            except ClientError as exc:
+                if (
+                    attempt == 0
+                    and self._classify_transaction_conflict(exc)
+                    is TransactionConflictKind.RETRYABLE
+                ):
+                    continue
+                raise
+            return
 
     def get_profile(
         self, user_id: str, *, consistent_read: bool = False
@@ -689,15 +726,26 @@ class DynamoRepository:
                     }
                 }
             )
-        try:
-            self.table.meta.client.transact_write_items(
-                TransactItems=transact_items
-            )
-        except ClientError as exc:
-            if self._is_transaction_conditional_failure(exc):
-                return False
-            raise
-        return True
+        for transaction_attempt in range(2):
+            try:
+                self.table.meta.client.transact_write_items(
+                    TransactItems=transact_items
+                )
+            except ClientError as exc:
+                conflict = self._classify_transaction_conflict(exc)
+                if conflict is TransactionConflictKind.RETRYABLE:
+                    if transaction_attempt == 0:
+                        continue
+                    raise
+                if conflict in {
+                    TransactionConflictKind.STALE_WORK,
+                    TransactionConflictKind.DUPLICATE_SUBMISSION,
+                    TransactionConflictKind.INVENTORY_CHANGED,
+                }:
+                    return False
+                raise
+            return True
+        return False
 
     def confirm_meal_and_transition(
         self,
@@ -707,6 +755,8 @@ class DynamoRepository:
         *,
         expected_revision: int,
         submission_id: str,
+        expected_ledger_revision: int | None = None,
+        processing_date: date | None = None,
     ) -> bool:
         """Save one reviewed meal and advance its workflow atomically.
 
@@ -730,6 +780,15 @@ class DynamoRepository:
         ):
             return False
 
+        ledger_item = self._batch_submission_ledger_item(
+            user_id,
+            entry,
+            expected_ledger_revision=expected_ledger_revision,
+            processing_date=processing_date,
+        )
+        if entry.batch_link is not None and ledger_item is None:
+            return False
+
         meal_item = {
             "PK": f"USER#{user_id}",
             "SK": (f"MEAL#{entry.date_key}#SUBMISSION#{submission_id}"),
@@ -739,51 +798,197 @@ class DynamoRepository:
             **self._conversation_key(user_id),
             **state.model_dump(mode="json"),
         }
-        try:
-            self.table.meta.client.transact_write_items(
-                TransactItems=[
-                    {
-                        "Put": {
-                            "TableName": self.table.name,
-                            "Item": meal_item,
-                            "ConditionExpression": "attribute_not_exists(PK)",
-                        }
+        transact_items: list[dict[str, Any]] = [
+            {
+                "Put": {
+                    "TableName": self.table.name,
+                    "Item": meal_item,
+                    "ConditionExpression": "attribute_not_exists(PK)",
+                }
+            },
+            {
+                "Put": {
+                    "TableName": self.table.name,
+                    "Item": state_item,
+                    "ConditionExpression": (
+                        "#workflow_kind = :meal_log "
+                        "AND #step = :awaiting_confirmation "
+                        "AND #revision = :expected_revision "
+                        "AND #request_id = :request_id"
+                    ),
+                    "ExpressionAttributeNames": {
+                        "#workflow_kind": "workflow_kind",
+                        "#step": "step",
+                        "#revision": "revision",
+                        "#request_id": "request_id",
                     },
-                    {
-                        "Put": {
-                            "TableName": self.table.name,
-                            "Item": state_item,
-                            "ConditionExpression": (
-                                "#workflow_kind = :meal_log "
-                                "AND #step = :awaiting_confirmation "
-                                "AND #revision = :expected_revision "
-                                "AND #request_id = :request_id"
-                            ),
-                            "ExpressionAttributeNames": {
-                                "#workflow_kind": "workflow_kind",
-                                "#step": "step",
-                                "#revision": "revision",
-                                "#request_id": "request_id",
-                            },
-                            "ExpressionAttributeValues": {
-                                ":meal_log": (
-                                    ConversationWorkflowKind.MEAL_LOG.value
-                                ),
-                                ":awaiting_confirmation": (
-                                    ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION.value
-                                ),
-                                ":expected_revision": expected_revision,
-                                ":request_id": submission_id,
-                            },
-                        }
+                    "ExpressionAttributeValues": {
+                        ":meal_log": ConversationWorkflowKind.MEAL_LOG.value,
+                        ":awaiting_confirmation": (
+                            ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION.value
+                        ),
+                        ":expected_revision": expected_revision,
+                        ":request_id": submission_id,
                     },
-                ]
+                }
+            },
+            {
+                "Put": {
+                    "TableName": self.table.name,
+                    "Item": {
+                        "PK": f"USER#{user_id}",
+                        "SK": f"MEAL_UPDATE#{submission_id}",
+                    },
+                    "ConditionExpression": "attribute_not_exists(PK)",
+                }
+            },
+        ]
+        if ledger_item is not None:
+            transact_items.append(ledger_item)
+        for transaction_attempt in range(2):
+            try:
+                self.table.meta.client.transact_write_items(
+                    TransactItems=transact_items
+                )
+            except ClientError as exc:
+                conflict = self._classify_transaction_conflict(
+                    exc, operation="meal_confirmation"
+                )
+                if conflict is TransactionConflictKind.RETRYABLE:
+                    if transaction_attempt == 0:
+                        continue
+                    raise
+                if conflict in {
+                    TransactionConflictKind.STALE_WORK,
+                    TransactionConflictKind.DUPLICATE_SUBMISSION,
+                    TransactionConflictKind.INVENTORY_CHANGED,
+                }:
+                    return False
+                raise
+            return True
+        return False
+
+    def _batch_submission_ledger_item(
+        self,
+        user_id: str,
+        entry: MealLogEntry,
+        *,
+        expected_ledger_revision: int | None,
+        processing_date: date | None = None,
+    ) -> dict[str, Any] | None:
+        """Build a conditional ledger mutation for one confirmed meal."""
+        link = entry.batch_link
+        if link is None:
+            return None
+        source_date = link.source_date or entry.date
+        iso = source_date.isocalendar()
+        iso_week = f"{iso.year:04d}-W{iso.week:02d}"
+        response = self.table.get_item(
+            Key=self._batch_ledger_key(user_id, iso_week)
+        )
+        raw_item = response.get("Item")
+        if raw_item is None:
+            return None
+        ledger = WeeklyBatchLedger.model_validate(self._data(raw_item))
+        if (
+            expected_ledger_revision is not None
+            and ledger.revision != expected_ledger_revision
+        ):
+            return None
+        target = next(
+            (item for item in ledger.entries if item.batch_id == link.batch_id),
+            None,
+        )
+        if target is None:
+            return None
+
+        if link.role is BatchMealRole.PREPARATION:
+            effective_processing_date = processing_date or entry.date
+            if (
+                target.state is not BatchLedgerState.PROVISIONAL
+                or target.remaining_portions != target.total_portions - 1
+                or target.preparation_date != entry.date
+                or target.preparation_meal_type is not entry.meal_type
+                or link.portion != 1
+                or effective_processing_date != target.preparation_date
+                or effective_processing_date > target.week_end
+                or effective_processing_date.isocalendar()[:2]
+                != target.preparation_date.isocalendar()[:2]
+            ):
+                return None
+            remaining = target.total_portions - 1
+            next_state = (
+                BatchLedgerState.AVAILABLE
+                if remaining
+                else BatchLedgerState.EXHAUSTED
             )
-        except ClientError as exc:
-            if self._is_transaction_conditional_failure(exc):
-                return False
-            raise
-        return True
+        else:
+            if target.state is not BatchLedgerState.AVAILABLE:
+                return None
+            if target.remaining_portions <= 0:
+                return None
+            if link.source_date != target.preparation_date:
+                return None
+            if link.source_meal_type not in {
+                None,
+                target.preparation_meal_type,
+            }:
+                return None
+            if entry.date <= target.preparation_date:
+                return None
+            if (
+                entry.date.isocalendar()[:2]
+                != target.preparation_date.isocalendar()[:2]
+            ):
+                return None
+            next_portion = target.total_portions - target.remaining_portions + 1
+            if link.portion != next_portion:
+                return None
+            remaining = target.remaining_portions - 1
+            next_state = (
+                BatchLedgerState.AVAILABLE
+                if remaining
+                else BatchLedgerState.EXHAUSTED
+            )
+
+        updated = target.model_copy(
+            update={"remaining_portions": remaining, "state": next_state}
+        )
+        updated_entries = [
+            updated if item.batch_id == target.batch_id else item
+            for item in ledger.entries
+        ]
+        next_ledger = WeeklyBatchLedger(
+            iso_week=ledger.iso_week,
+            revision=ledger.revision + 1,
+            entries=updated_entries,
+        )
+        old_entries = [item.model_dump(mode="json") for item in ledger.entries]
+        names = {
+            "#pk": "PK",
+            "#revision": "revision",
+            "#entries": "entries",
+        }
+        values = {
+            ":revision": ledger.revision,
+            ":entries": old_entries,
+        }
+        condition = (
+            "attribute_exists(#pk) AND #revision = :revision "
+            "AND #entries = :entries"
+        )
+        return {
+            "Put": {
+                "TableName": self.table.name,
+                "Item": {
+                    **self._batch_ledger_key(user_id, iso_week),
+                    **next_ledger.model_dump(mode="json"),
+                },
+                "ConditionExpression": condition,
+                "ExpressionAttributeNames": names,
+                "ExpressionAttributeValues": values,
+            }
+        }
 
     def get_meal_history(
         self,
@@ -811,9 +1016,10 @@ class DynamoRepository:
                     entries.append(
                         MealLogEntry.model_validate(self._data(item))
                     )
-                except ValidationError as exc:
+                except ValidationError:
                     logger.warning(
-                        "Skipping malformed meal history item: %s", exc
+                        "Skipping malformed meal history item "
+                        "reason_code=malformed"
                     )
             last_key = response.get("LastEvaluatedKey")
             if not last_key:
@@ -821,6 +1027,76 @@ class DynamoRepository:
             query_kwargs["ExclusiveStartKey"] = last_key
         entries.sort(key=lambda entry: entry.created_at, reverse=True)
         return entries
+
+    def get_submitted_meals(
+        self,
+        user_id: str,
+        *,
+        start_date: date,
+        end_date: date,
+    ) -> list[MealLogEntry]:
+        """Read submitted meal evidence from one bounded date range.
+
+        Meal history uses a dedicated ``MEAL#`` sort-key namespace, so plan
+        records (draft or confirmed) cannot be returned by this query.  The
+        scheduler only needs one seven-day horizon plus a possible adjacent
+        ISO week, therefore larger reads are rejected at this boundary.
+        """
+        if end_date < start_date:
+            raise ValueError("end_date must not precede start_date")
+        if (end_date - start_date).days + 1 > 14:
+            raise ValueError("submitted meal ranges may cover at most 14 days")
+        key_condition = Key("PK").eq(f"USER#{user_id}") & Key("SK").between(
+            f"MEAL#{start_date.isoformat()}",
+            f"MEAL#{end_date.isoformat()}~",
+        )
+        query_kwargs: dict[str, Any] = {
+            "KeyConditionExpression": key_condition,
+            "ScanIndexForward": False,
+        }
+        entries: list[MealLogEntry] = []
+        while True:
+            response = self.table.query(**query_kwargs)
+            for item in response.get("Items", []):
+                try:
+                    entries.append(
+                        MealLogEntry.model_validate(self._data(item))
+                    )
+                except ValidationError:
+                    logger.warning(
+                        "Skipping malformed meal history item "
+                        "reason_code=malformed"
+                    )
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            query_kwargs["ExclusiveStartKey"] = last_key
+        entries.sort(
+            key=lambda entry: (entry.date, entry.created_at), reverse=True
+        )
+        return entries
+
+    def get_meal_history_between(
+        self,
+        user_id: str,
+        start_date: date,
+        end_date: date,
+    ) -> list[MealLogEntry]:
+        """Compatibility spelling for a bounded submitted-meal range read."""
+        return self.get_submitted_meals(
+            user_id, start_date=start_date, end_date=end_date
+        )
+
+    def get_meal_history_for_range(
+        self,
+        user_id: str,
+        start_date: date,
+        end_date: date,
+    ) -> list[MealLogEntry]:
+        """Return submitted history for an inclusive bounded date range."""
+        return self.get_submitted_meals(
+            user_id, start_date=start_date, end_date=end_date
+        )
 
     def save_plan(self, user_id: str, plan: WeeklyPlan) -> None:
         self.table.put_item(
@@ -832,6 +1108,323 @@ class DynamoRepository:
         )
 
     @staticmethod
+    def _batch_ledger_key(user_id: str, iso_week: str) -> dict[str, str]:
+        """Return the exact key for one user's ISO-week batch ledger."""
+        return {
+            "PK": f"USER#{user_id}",
+            "SK": f"BATCH_LEDGER#{iso_week}",
+        }
+
+    @staticmethod
+    def _iso_week_bounds(iso_week: str) -> tuple[date, date]:
+        """Return validated Monday/Sunday bounds for a persisted ISO week."""
+        try:
+            year_text, week_text = iso_week.split("-W", 1)
+            start = date.fromisocalendar(int(year_text), int(week_text), 1)
+        except AttributeError, TypeError, ValueError:
+            raise ValueError(
+                "iso_week must identify a valid ISO week"
+            ) from None
+        return start, start + timedelta(days=6)
+
+    def get_weekly_batch_ledger(
+        self,
+        user_id: str,
+        iso_week: str,
+        *,
+        as_of: date | None = None,
+    ) -> WeeklyBatchLedger:
+        """Read one bounded weekly ledger and expire unusable sources."""
+        self._iso_week_bounds(iso_week)
+        key = self._batch_ledger_key(user_id, iso_week)
+        response = self.table.get_item(Key=key)
+        item = response.get("Item")
+        if not item:
+            return WeeklyBatchLedger(iso_week=iso_week)
+        ledger = WeeklyBatchLedger.model_validate(self._data(item))
+        if as_of is None:
+            return ledger
+
+        last_conflict: ClientError | None = None
+        expiry_writes = 0
+        while True:
+            expired_ledger = self._materialize_weekly_batch_expiry(
+                ledger, as_of
+            )
+            if expired_ledger is None:
+                return ledger
+            if expiry_writes >= _WEEKLY_BATCH_EXPIRY_MAX_ATTEMPTS:
+                assert last_conflict is not None
+                raise last_conflict
+            try:
+                expiry_writes += 1
+                self._put_weekly_batch_ledger_conditionally(
+                    user_id,
+                    expired_ledger,
+                    expected_revision=ledger.revision,
+                    expected_entries=ledger.entries,
+                )
+            except ClientError as exc:
+                if not self._is_conditional_failure(exc):
+                    raise
+                last_conflict = exc
+                response = self.table.get_item(
+                    Key=key,
+                    ConsistentRead=True,
+                )
+                item = response.get("Item")
+                if not item:
+                    raise
+                ledger = WeeklyBatchLedger.model_validate(self._data(item))
+                continue
+            return expired_ledger
+
+    @staticmethod
+    def _materialize_weekly_batch_expiry(
+        ledger: WeeklyBatchLedger, as_of: date
+    ) -> WeeklyBatchLedger | None:
+        """Return an expired revision, or ``None`` when no change is needed."""
+        expired_entries: list[BatchLedgerEntry] = []
+        changed = False
+        for entry in ledger.entries:
+            expired = as_of > entry.week_end or (
+                entry.state is BatchLedgerState.PROVISIONAL
+                and as_of > entry.preparation_date
+            )
+            if expired and entry.state in {
+                BatchLedgerState.PROVISIONAL,
+                BatchLedgerState.AVAILABLE,
+            }:
+                expired_entries.append(
+                    entry.model_copy(
+                        update={
+                            "state": BatchLedgerState.EXPIRED,
+                            "remaining_portions": 0,
+                        }
+                    )
+                )
+                changed = True
+            else:
+                expired_entries.append(entry)
+        if not changed:
+            return None
+        return WeeklyBatchLedger(
+            iso_week=ledger.iso_week,
+            revision=ledger.revision + 1,
+            entries=expired_entries,
+        )
+
+    def put_weekly_batch_ledger(
+        self, user_id: str, ledger: WeeklyBatchLedger
+    ) -> None:
+        """Write one validated weekly ledger without reading the partition."""
+        self._iso_week_bounds(ledger.iso_week)
+        self.table.put_item(
+            Item={
+                **self._batch_ledger_key(user_id, ledger.iso_week),
+                **ledger.model_dump(mode="json"),
+            }
+        )
+
+    def save_weekly_batch_ledger(
+        self,
+        user_id: str,
+        ledger: WeeklyBatchLedger,
+        *,
+        expected_revision: int | None = None,
+        expected_entries: list[BatchLedgerEntry] | None = None,
+    ) -> bool:
+        """Conditionally replace one weekly ledger without a table scan."""
+        try:
+            self._put_weekly_batch_ledger_conditionally(
+                user_id,
+                ledger,
+                expected_revision=expected_revision,
+                expected_entries=expected_entries,
+            )
+        except ClientError as exc:
+            if self._is_conditional_failure(exc):
+                return False
+            raise
+        return True
+
+    def _put_weekly_batch_ledger_conditionally(
+        self,
+        user_id: str,
+        ledger: WeeklyBatchLedger,
+        *,
+        expected_revision: int | None = None,
+        expected_entries: list[BatchLedgerEntry] | None,
+    ) -> None:
+        """Issue a CAS ledger put."""
+        item = {
+            **self._batch_ledger_key(user_id, ledger.iso_week),
+            **ledger.model_dump(mode="json"),
+        }
+        names: dict[str, str] = {}
+        values: dict[str, Any] = {}
+        conditions: list[str] = []
+        if expected_entries is None:
+            if expected_revision is None:
+                conditions.append("attribute_not_exists(#pk)")
+                names["#pk"] = "PK"
+            else:
+                conditions.append("#revision = :expected_revision")
+                names["#revision"] = "revision"
+                values[":expected_revision"] = expected_revision
+        else:
+            conditions.append("#entries = :expected_entries")
+            names["#entries"] = "entries"
+            values[":expected_entries"] = [
+                entry.model_dump(mode="json") for entry in expected_entries
+            ]
+            if expected_revision is not None:
+                conditions.append("#revision = :expected_revision")
+                names["#revision"] = "revision"
+                values[":expected_revision"] = expected_revision
+        kwargs = {
+            "Item": item,
+            "ConditionExpression": " AND ".join(conditions),
+            "ExpressionAttributeNames": names,
+        }
+        if values:
+            kwargs["ExpressionAttributeValues"] = values
+        self.table.put_item(**kwargs)
+
+    def _batch_ledger_transaction_items(
+        self,
+        user_id: str,
+        plan: WeeklyPlan,
+        batch_entries: list[BatchLedgerEntry],
+        *,
+        expected_revision: int | None,
+        replaced_request_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Build conditional ledger puts for one atomic plan publication.
+
+        A replacement may provide the exact request owner whose provisional
+        reservations are being superseded.  When it does, reservations from
+        other in-flight requests are retained.  The compatibility fallback
+        keeps the existing plan/revision ownership boundary for callers that
+        do not have an owner snapshot.
+        """
+        dates = {
+            plan.week_start + timedelta(days=offset) for offset in range(7)
+        }
+        weeks = {
+            f"{value.isocalendar().year:04d}-W{value.isocalendar().week:02d}"
+            for value in dates
+        }
+        weeks.update(
+            (
+                f"{entry.preparation_date.isocalendar().year:04d}-W"
+                f"{entry.preparation_date.isocalendar().week:02d}"
+            )
+            for entry in batch_entries
+        )
+        incoming_by_week: dict[str, list[BatchLedgerEntry]] = {}
+        for entry in batch_entries:
+            iso = entry.preparation_date.isocalendar()
+            key = f"{iso.year:04d}-W{iso.week:02d}"
+            incoming_by_week.setdefault(key, []).append(entry)
+
+        plan_id = f"plan-{plan.week_start.isoformat()}"
+        items: list[dict[str, Any]] = []
+        for iso_week in sorted(weeks):
+            response = self.table.get_item(
+                Key=self._batch_ledger_key(user_id, iso_week)
+            )
+            raw_item = response.get("Item")
+            existing = (
+                WeeklyBatchLedger.model_validate(self._data(raw_item))
+                if raw_item
+                else WeeklyBatchLedger(iso_week=iso_week)
+            )
+            retained = list(existing.entries)
+            if expected_revision is not None:
+                retained = [
+                    entry
+                    for entry in retained
+                    if not (
+                        entry.state is BatchLedgerState.PROVISIONAL
+                        and entry.source_plan_id == plan_id
+                        and entry.source_revision == expected_revision
+                        and (
+                            replaced_request_id is None
+                            or entry.source_request_id == replaced_request_id
+                        )
+                    )
+                ]
+
+            by_id = {entry.batch_id: entry for entry in retained}
+            for entry in incoming_by_week.get(iso_week, []):
+                previous = by_id.get(entry.batch_id)
+                if previous is not None:
+                    if previous.state is BatchLedgerState.AVAILABLE:
+                        continue
+                    if previous != entry:
+                        raise ValueError(
+                            "batch reservation conflicts with existing ledger"
+                        )
+                    continue
+                by_id[entry.batch_id] = entry
+            merged = WeeklyBatchLedger(
+                iso_week=iso_week,
+                revision=existing.revision + 1,
+                entries=sorted(by_id.values(), key=lambda item: item.batch_id),
+            )
+            old_entries = list(existing.entries)
+            if merged.entries == old_entries:
+                continue
+            put: dict[str, Any] = {
+                "TableName": self.table.name,
+                "Item": {
+                    **self._batch_ledger_key(user_id, iso_week),
+                    **merged.model_dump(mode="json"),
+                },
+            }
+            if raw_item is None:
+                put["ConditionExpression"] = "attribute_not_exists(#pk)"
+                put["ExpressionAttributeNames"] = {"#pk": "PK"}
+            else:
+                put["ConditionExpression"] = "#entries = :old_entries"
+                put["ExpressionAttributeNames"] = {"#entries": "entries"}
+                put["ExpressionAttributeValues"] = {
+                    ":old_entries": [
+                        entry.model_dump(mode="json") for entry in old_entries
+                    ]
+                }
+            items.append({"Put": put})
+        return items
+
+    def get_available_batch_portions(
+        self,
+        user_id: str,
+        target_date: date,
+        *,
+        meal_type: Any | None = None,
+    ) -> list[BatchLedgerEntry]:
+        """Return available portions from the target date's ISO-week ledger."""
+        del (
+            meal_type
+        )  # The ledger stores preparation type; rules own reuse scope.
+        iso = target_date.isocalendar()
+        iso_week = f"{iso.year:04d}-W{iso.week:02d}"
+        ledger = self.get_weekly_batch_ledger(
+            user_id, iso_week, as_of=target_date
+        )
+        return sorted(
+            (
+                entry
+                for entry in ledger.entries
+                if entry.state is BatchLedgerState.AVAILABLE
+                and entry.remaining_portions > 0
+                and entry.preparation_date < target_date
+            ),
+            key=lambda entry: (entry.preparation_date, entry.batch_id),
+        )
+
+    @staticmethod
     def _is_conditional_failure(exc: ClientError) -> bool:
         error = exc.response.get("Error", {})
         code = error.get("Code") if isinstance(error, dict) else None
@@ -840,20 +1433,51 @@ class DynamoRepository:
     @staticmethod
     def _is_transaction_conditional_failure(exc: ClientError) -> bool:
         """Return whether a transaction failed only on an expected condition."""
+        return DynamoRepository._classify_transaction_conflict(exc) in {
+            TransactionConflictKind.STALE_WORK,
+            TransactionConflictKind.DUPLICATE_SUBMISSION,
+            TransactionConflictKind.INVENTORY_CHANGED,
+        }
+
+    @staticmethod
+    def _classify_transaction_conflict(
+        exc: ClientError, *, operation: str | None = None
+    ) -> TransactionConflictKind:
+        """Classify a DynamoDB cancellation without inspecting payload data."""
         error = exc.response.get("Error", {})
         code = error.get("Code") if isinstance(error, dict) else None
+        if code in {
+            "ProvisionedThroughputExceededException",
+            "ThrottlingException",
+            "InternalServerError",
+            "RequestLimitExceeded",
+        }:
+            return TransactionConflictKind.RETRYABLE
         if code != "TransactionCanceledException":
-            return False
+            return TransactionConflictKind.UNKNOWN
         reasons = exc.response.get("CancellationReasons")
         if not isinstance(reasons, list):
-            return False
-        reason_codes = {
-            reason.get("Code") for reason in reasons if isinstance(reason, dict)
-        }
-        return "ConditionalCheckFailed" in reason_codes and reason_codes <= {
-            "ConditionalCheckFailed",
-            "None",
-        }
+            return TransactionConflictKind.UNKNOWN
+        reason_codes = [
+            reason.get("Code") if isinstance(reason, dict) else None
+            for reason in reasons
+        ]
+        if "TransactionConflict" in reason_codes:
+            return TransactionConflictKind.RETRYABLE
+        if set(reason_codes) - {"ConditionalCheckFailed", "None"}:
+            return TransactionConflictKind.UNKNOWN
+        if "ConditionalCheckFailed" not in reason_codes:
+            return TransactionConflictKind.UNKNOWN
+        if operation == "ledger_mutation":
+            return TransactionConflictKind.INVENTORY_CHANGED
+        if operation == "meal_confirmation" and len(reason_codes) >= 4:
+            if reason_codes[3] == "ConditionalCheckFailed":
+                return TransactionConflictKind.INVENTORY_CHANGED
+            if reason_codes[2] == "ConditionalCheckFailed":
+                return TransactionConflictKind.DUPLICATE_SUBMISSION
+            if reason_codes[0] == "ConditionalCheckFailed":
+                return TransactionConflictKind.DUPLICATE_SUBMISSION
+        return TransactionConflictKind.STALE_WORK
 
     @staticmethod
     def _is_meal_duplicate_transaction(exc: ClientError) -> bool:
@@ -886,6 +1510,7 @@ class DynamoRepository:
         plan: WeeklyPlan,
         *,
         expected_revision: int | None,
+        batch_entries: list[BatchLedgerEntry] | None = None,
     ) -> bool:
         """Save a generated draft only when its snapshot is still current."""
         if expected_revision is None:
@@ -917,6 +1542,30 @@ class DynamoRepository:
             put_kwargs["ExpressionAttributeValues"] = (
                 expression_attribute_values
             )
+        if batch_entries is not None:
+            ledger_items = self._batch_ledger_transaction_items(
+                user_id,
+                plan,
+                batch_entries,
+                expected_revision=expected_revision,
+            )
+            try:
+                self._transact_write_with_retry(
+                    [
+                        {
+                            "Put": {
+                                "TableName": self.table.name,
+                                **put_kwargs,
+                            }
+                        }
+                    ]
+                    + ledger_items
+                )
+            except ClientError as exc:
+                if self._is_transaction_conditional_failure(exc):
+                    return False
+                raise
+            return True
         try:
             self.table.put_item(**put_kwargs)
         except ClientError as exc:
@@ -933,6 +1582,7 @@ class DynamoRepository:
         expected_revision: int | None,
         request_id: str,
         expected_state_revision: int,
+        batch_entries: list[BatchLedgerEntry] | None = None,
     ) -> bool:
         """Publish a tracked draft and release its request atomically."""
         plan_item = {
@@ -964,9 +1614,47 @@ class DynamoRepository:
         }
         if plan_values:
             plan_put["ExpressionAttributeValues"] = plan_values
+        if batch_entries is not None:
+            ledger_items = self._batch_ledger_transaction_items(
+                user_id,
+                plan,
+                batch_entries,
+                expected_revision=expected_revision,
+            )
+            state_delete = {
+                "Delete": {
+                    "TableName": self.table.name,
+                    "Key": self._conversation_key(user_id),
+                    "ConditionExpression": (
+                        "#request_id = :request_id AND "
+                        "#revision = :expected_state_revision"
+                    ),
+                    "ExpressionAttributeNames": {
+                        "#request_id": "request_id",
+                        "#revision": "revision",
+                    },
+                    "ExpressionAttributeValues": {
+                        ":request_id": request_id,
+                        ":expected_state_revision": expected_state_revision,
+                    },
+                }
+            }
+            try:
+                self._transact_write_with_retry(
+                    [
+                        {"Put": plan_put},
+                        *ledger_items,
+                        state_delete,
+                    ]
+                )
+            except ClientError as exc:
+                if self._is_transaction_conditional_failure(exc):
+                    return False
+                raise
+            return True
         try:
-            self.table.meta.client.transact_write_items(
-                TransactItems=[
+            self._transact_write_with_retry(
+                [
                     {"Put": plan_put},
                     {
                         "Delete": {
@@ -1003,6 +1691,7 @@ class DynamoRepository:
         *,
         expected_revision: int | None,
         repair_id: str,
+        batch_entries: list[BatchLedgerEntry] | None = None,
     ) -> RepairPublicationOutcome:
         """Atomically publish one untracked repair and its replay marker."""
         if expected_revision is None:
@@ -1038,9 +1727,26 @@ class DynamoRepository:
             "Item": self._repair_marker_key(user_id, repair_id),
             "ConditionExpression": "attribute_not_exists(PK)",
         }
+        if batch_entries is not None:
+            ledger_items = self._batch_ledger_transaction_items(
+                user_id,
+                plan,
+                batch_entries,
+                expected_revision=expected_revision,
+            )
+            try:
+                self._transact_write_with_retry(
+                    [plan_put, *ledger_items, {"Put": marker_put}]
+                )
+            except ClientError as exc:
+                outcome = self._repair_publication_outcome(exc)
+                if outcome is None:
+                    raise
+                return outcome
+            return RepairPublicationOutcome.PUBLISHED
         try:
-            self.table.meta.client.transact_write_items(
-                TransactItems=[{"Put": plan_put}, {"Put": marker_put}]
+            self._transact_write_with_retry(
+                [{"Put": plan_put}, {"Put": marker_put}]
             )
         except ClientError as exc:
             outcome = self._repair_publication_outcome(exc)
@@ -1059,18 +1765,19 @@ class DynamoRepository:
         if code != "TransactionCanceledException":
             return None
         reasons = exc.response.get("CancellationReasons")
-        if not isinstance(reasons, list) or len(reasons) != 2:
+        if not isinstance(reasons, list) or len(reasons) < 2:
             return None
-        first = reasons[0] if isinstance(reasons[0], dict) else {}
-        second = reasons[1] if isinstance(reasons[1], dict) else {}
-        first_code = first.get("Code")
-        second_code = second.get("Code")
-        if second_code == "ConditionalCheckFailed" and first_code in {
-            "None",
-            "ConditionalCheckFailed",
-        }:
+        codes = [
+            reason.get("Code") if isinstance(reason, dict) else None
+            for reason in reasons
+        ]
+        if codes[-1] == "ConditionalCheckFailed" and all(
+            code in {"None", "ConditionalCheckFailed"} for code in codes[:-1]
+        ):
             return RepairPublicationOutcome.DUPLICATE
-        if first_code == "ConditionalCheckFailed" and second_code == "None":
+        if codes[0] == "ConditionalCheckFailed" and all(
+            code in {"None", "ConditionalCheckFailed"} for code in codes[1:]
+        ):
             return RepairPublicationOutcome.STALE
         return None
 
@@ -1082,6 +1789,8 @@ class DynamoRepository:
         expected_plan_revision: int,
         request_id: str,
         expected_state_revision: int,
+        batch_entries: list[BatchLedgerEntry] | None = None,
+        replaced_request_id: str | None = None,
     ) -> bool:
         """Publish a revision and remove its request in one transaction."""
         plan_item = {
@@ -1089,9 +1798,20 @@ class DynamoRepository:
             "SK": f"PLAN#{plan.week_start_date}",
             **plan.model_dump(by_alias=True, mode="json"),
         }
+        ledger_items = (
+            self._batch_ledger_transaction_items(
+                user_id,
+                plan,
+                batch_entries,
+                expected_revision=expected_plan_revision,
+                replaced_request_id=replaced_request_id,
+            )
+            if batch_entries is not None
+            else []
+        )
         try:
-            self.table.meta.client.transact_write_items(
-                TransactItems=[
+            self._transact_write_with_retry(
+                [
                     {
                         "Put": {
                             "TableName": self.table.name,
@@ -1112,6 +1832,7 @@ class DynamoRepository:
                             },
                         }
                     },
+                    *ledger_items,
                     {
                         "Delete": {
                             "TableName": self.table.name,
@@ -1427,6 +2148,54 @@ class DynamoRepository:
         return (
             WeeklyPlan.model_validate(self._data(items[0])) if items else None
         )
+
+    def get_planned_batch_link(
+        self, user_id: str, target_date: date, meal_type: MealType
+    ) -> PlannedBatchLink | None:
+        """Return one unambiguous batch link for a planned meal slot."""
+        response = self.table.query(
+            KeyConditionExpression=Key("PK").eq(f"USER#{user_id}")
+            & Key("SK").begins_with("PLAN#"),
+            ScanIndexForward=False,
+            Limit=_PLANNED_BATCH_PLAN_QUERY_LIMIT,
+        )
+        candidates: list[tuple[int, int, date, PlannedBatchLink]] = []
+        for item in response.get("Items", []):
+            try:
+                plan = WeeklyPlan.model_validate(self._data(item))
+            except ValidationError:
+                logger.warning(
+                    "Skipping malformed plan item reason_code=malformed"
+                )
+                continue
+            if not plan.week_start <= target_date <= plan.week_end:
+                continue
+            day_number = (target_date - plan.week_start).days + 1
+            day = next(
+                (
+                    plan_day
+                    for plan_day in plan.days
+                    if plan_day.day == day_number
+                ),
+                None,
+            )
+            if day is None:
+                continue
+            matches = [
+                meal.batch_link
+                for meal in day.meals
+                if meal.meal_type is meal_type and meal.batch_link is not None
+            ]
+            if len(matches) != 1:
+                continue
+            status_rank = int(plan.status is PlanStatus.CONFIRMED)
+            candidates.append(
+                (status_rank, plan.revision, plan.week_start, matches[0])
+            )
+
+        if not candidates:
+            return None
+        return max(candidates, key=lambda candidate: candidate[:3])[-1]
 
     def get_active_plan(
         self, user_id: str, on_date: date | None = None

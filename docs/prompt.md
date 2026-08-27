@@ -48,7 +48,7 @@ weaken, or reinterpret constraints or strict rules.
 
 === GENERATED PLAN CONTRACT ===
 Include exactly one breakfast, one lunch, and one dinner on each
-of the 7 days. Snack is optional, and do not add other meal types.
+of the requested 1-7 days. Snack is optional, and do not add other meal types.
 Every present meal must include at least one non-empty ingredient
 item and positive est_calories.
 
@@ -74,7 +74,15 @@ Return strictly valid JSON matching this schema:
             {"item": "Ingredient", "amount": "Quantity"}
           ],
           "est_calories": 500,
-          "outcome": "unreported"
+          "outcome": "unreported",
+          "batch_link": {
+            "batch_id": "application-issued-id",
+            "role": "preparation|leftover",
+            "source_date": "YYYY-MM-DD",
+            "source_meal_type": "lunch|dinner",
+            "portion": 1,
+            "total_yield": 2
+          }
         }
       ]
     }
@@ -83,8 +91,22 @@ Return strictly valid JSON matching this schema:
 ```
 
 The real prompt replaces the placeholders with the user's profile,
-requested week, preference, interpreted requirements, meal history, and
-previous-plan feedback. The complete schema requires all seven days.
+requested week and 1-7 day horizon, request preference, application-owned
+horizon obligations, available batch portions, meal history, and previous-
+plan feedback. The `days` array contains exactly the requested consecutive
+day numbers. `batch_link` is optional for ordinary meals. For a preparation,
+the application-owned `batch_id`, `role: "preparation"`, `portion: 1`, and
+`total_yield` of 2 or 3 identify the source. A leftover uses the same batch
+ID, `role: "leftover"`, its exact source date and lunch/dinner source type,
+and portion 2 or 3. Batch links are limited to lunch and dinner and every
+linked meal still needs complete ingredients.
+
+The application validates constraints, obligations, and batch links after
+parsing. Strict obligations must match their exact listed dates and meal
+types; available portions, preparation order, reuse count, and ISO-week
+boundaries are checked against application-owned state. The model response
+is not proof of compliance. Invalid output receives bounded repair feedback,
+and a second invalid response is terminal without publishing a draft.
 
 The application validates the generated plan in priority order: constraints,
 strict rules, then completeness. It checks declared meal names and ingredient

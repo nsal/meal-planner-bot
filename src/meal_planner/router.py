@@ -6,9 +6,16 @@ from enum import Enum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from meal_planner.models.schemas import (
+    BatchMealRole,
     MealCallbackAction,
     MealLogDraft,
     MealOutcome,
@@ -119,6 +126,28 @@ class MealCallback(BaseModel):
 
     action: MealCallbackAction
     submission_id: str
+    batch_role: BatchMealRole | None = None
+
+    @field_validator("submission_id")
+    @classmethod
+    def require_canonical_submission_id(cls, value: str) -> str:
+        """Keep callback identifiers bounded to application UUIDs."""
+        try:
+            canonical = str(UUID(value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("submission_id must be a valid UUID") from exc
+        if canonical != value.casefold():
+            raise ValueError("submission_id must use canonical UUID spelling")
+        return canonical
+
+    @model_validator(mode="after")
+    def validate_batch_role(self) -> "MealCallback":
+        """Allow a role only on an explicit batch confirmation."""
+        if self.batch_role is not None and self.action is not (
+            MealCallbackAction.CONFIRM
+        ):
+            raise ValueError("batch roles are only valid for confirmation")
+        return self
 
 
 class MealInputParseResult(BaseModel):
@@ -213,7 +242,7 @@ def parse_meal_callback(data: str) -> MealCallback | None:
         return None
 
     parts = data.split(":")
-    if len(parts) != 3 or parts[0] != "meal":
+    if len(parts) not in {3, 4} or parts[0] != "meal":
         return None
 
     try:
@@ -225,10 +254,21 @@ def parse_meal_callback(data: str) -> MealCallback | None:
     if str(submission_id) != parts[2].lower():
         return None
 
-    return MealCallback(
-        action=action,
-        submission_id=str(submission_id),
-    )
+    batch_role = None
+    if len(parts) == 4:
+        try:
+            batch_role = BatchMealRole(parts[3])
+        except TypeError, ValueError:
+            return None
+
+    try:
+        return MealCallback(
+            action=action,
+            submission_id=str(submission_id),
+            batch_role=batch_role,
+        )
+    except ValidationError:
+        return None
 
 
 def parse_checkin_callback(data: str) -> CheckinCallback | None:

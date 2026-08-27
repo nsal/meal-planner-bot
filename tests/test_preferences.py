@@ -1,14 +1,22 @@
 """Tests for evidence-based meal-plan preference validation."""
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from meal_planner.dietary_rules import project_dietary_obligations
 from meal_planner.models import (
+    BatchLedgerEntry,
+    BatchLedgerState,
+    BatchMealRole,
+    BatchRule,
     ConstraintEntry,
+    DietaryObligation,
     DietaryRule,
     Ingredient,
+    MealLogEntry,
     PlanDay,
+    PlannedBatchLink,
     PlannedMeal,
     PreferenceRequirement,
     RuleOperator,
@@ -27,8 +35,10 @@ from meal_planner.preferences import (
     format_horizon_clarification,
     format_satisfaction_summary,
     format_unmet_preference_clauses,
+    match_logged_meal,
     match_requirement,
     matches_food,
+    validate_batch_links,
     validate_generated_plan,
     validate_horizon_feasibility,
 )
@@ -108,6 +118,7 @@ def meal(
     name: str,
     ingredients: list[str] | None = None,
     calories: int = 500,
+    batch_link: dict[str, object] | None = None,
 ) -> PlannedMeal:
     """Build a planned meal for evidence and completeness tests."""
     return PlannedMeal(
@@ -115,6 +126,7 @@ def meal(
         name=name,
         ingredients=[Ingredient(item=item) for item in ingredients or []],
         est_calories=calories,
+        batch_link=batch_link,
     )
 
 
@@ -128,6 +140,151 @@ def plan_with(
             PlanDay(day=day, meals=meals_by_day.get(day, []))
             for day in range(1, 8)
         ],
+    )
+
+
+def obligation(
+    *,
+    identifier: str = "eggs-2026-W34-2026-08-19",
+    source_rule_id: str = "eggs-rule",
+    target_date: date = date(2026, 8, 19),
+    count: int = 1,
+    meal_type: MealType | None = MealType.BREAKFAST,
+    strength: RuleStrength = RuleStrength.STRICT,
+    operator: RuleOperator = RuleOperator.AT_LEAST,
+    eligible_dates: list[date] | None = None,
+) -> DietaryObligation:
+    """Build one exact-date obligation for validator tests."""
+    dates = eligible_dates or [target_date]
+    return DietaryObligation(
+        id=identifier,
+        source_rule_id=source_rule_id,
+        iso_week="2026-W34",
+        horizon_start=min(dates),
+        horizon_end=max(dates),
+        eligible_dates=dates,
+        operator=operator,
+        count=count,
+        foods_any_of=["egg"],
+        meal_type=meal_type,
+        strength=strength,
+    )
+
+
+def complete_plan_with_egg(*, day: int, meal_type: MealType) -> WeeklyPlan:
+    """Build a complete Monday-anchored plan with one selected egg meal."""
+    meals = {
+        current_day: [
+            meal(
+                MealType.BREAKFAST,
+                "Oats",
+                ["oats"],
+            ),
+            meal(MealType.LUNCH, "Soup", ["beans"]),
+            meal(MealType.DINNER, "Rice", ["rice"]),
+        ]
+        for current_day in range(1, 8)
+    }
+    selected = meals[day]
+    selected = [item for item in selected if item.meal_type is not meal_type]
+    selected.append(meal(meal_type, "Egg meal", ["egg"]))
+    meals[day] = selected
+    return plan_with(meals)
+
+
+def _wednesday_profile_rules() -> tuple[list[DietaryRule], BatchRule]:
+    """Return the exact confirmed rules used by the Wednesday scenario."""
+    return (
+        [
+            rule(
+                ["egg"],
+                3,
+                identifier="eggs-three-breakfasts",
+                operator=RuleOperator.AT_LEAST,
+                meal_type=MealType.BREAKFAST,
+            ),
+            rule(
+                ["pancake", "crepe"],
+                1,
+                identifier="pancakes-saturday",
+                operator=RuleOperator.AT_LEAST,
+                meal_type=MealType.BREAKFAST,
+                weekdays=[Weekday.SATURDAY],
+            ),
+            rule(
+                ["fish"],
+                1,
+                identifier="fish-one-dinner",
+                operator=RuleOperator.AT_LEAST,
+                meal_type=MealType.DINNER,
+            ),
+        ],
+        BatchRule(
+            id="batch-two-meals",
+            source_text="batch cooking covers two lunch or dinner meals",
+            foods_any_of=["chicken"],
+            preparation_meal_types=[MealType.LUNCH, MealType.DINNER],
+            reuse_meal_types=[MealType.LUNCH, MealType.DINNER],
+            total_yield=2,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("earlier_egg_count", "expected_egg_count"),
+    [(0, 1), (1, 1), (2, 0)],
+)
+def test_wednesday_one_day_projection_counts_only_prior_submitted_eggs(
+    earlier_egg_count: int, expected_egg_count: int
+) -> None:
+    """Wednesday's one-day obligations are stable as history is submitted."""
+    rules, batch_rule = _wednesday_profile_rules()
+    assert batch_rule.total_yield == 2
+    assert batch_rule.preparation_meal_types == [
+        MealType.LUNCH,
+        MealType.DINNER,
+    ]
+    monday = date(2026, 8, 24)
+    submitted = [
+        MealLogEntry(
+            date=monday + timedelta(days=index),
+            meal_type=MealType.BREAKFAST,
+            description="Egg toast",
+            created_at=datetime(2026, 8, 24 + index, 8, tzinfo=timezone.utc),
+        )
+        for index in range(earlier_egg_count)
+    ]
+
+    obligations = project_dietary_obligations(
+        rules,
+        submitted,
+        start_date=date(2026, 8, 26),
+        end_date=date(2026, 8, 26),
+    )
+
+    summarized = [
+        (tuple(obligation.foods_any_of), obligation.meal_type, obligation.count)
+        for obligation in obligations
+    ]
+    assert (
+        summarized
+        == [
+            (("egg",), MealType.BREAKFAST, expected_egg_count),
+            (("fish",), MealType.DINNER, 1),
+        ]
+        if expected_egg_count
+        else [
+            (("fish",), MealType.DINNER, 1),
+        ]
+    )
+    assert all(
+        date(2026, 8, 26) in obligation.eligible_dates
+        for obligation in obligations
+    )
+    assert not any(
+        "pancake" in obligation.foods_any_of
+        or "crepe" in obligation.foods_any_of
+        for obligation in obligations
     )
 
 
@@ -480,6 +637,536 @@ def test_completeness_requires_three_meals_ingredients_and_calories() -> None:
         (2, MealType.BREAKFAST, "nonpositive_calories"),
         (2, MealType.LUNCH, "missing_meal_type"),
     ]
+
+
+def _batch_plan() -> WeeklyPlan:
+    """Return a complete plan with one preparation and one leftover."""
+    meals = {
+        day: [
+            meal(MealType.BREAKFAST, "Oats", ["oats"]),
+            meal(MealType.LUNCH, "Bean soup", ["beans"]),
+            meal(MealType.DINNER, "Rice", ["rice"]),
+        ]
+        for day in range(1, 8)
+    }
+    meals[1][2] = meal(
+        MealType.DINNER,
+        "Chicken dinner",
+        ["chicken"],
+        batch_link={"batch_id": "batch-chicken", "role": "preparation"},
+    )
+    meals[2][1] = meal(
+        MealType.LUNCH,
+        "Chicken leftover",
+        ["chicken"],
+        batch_link={
+            "batch_id": "batch-chicken",
+            "role": "leftover",
+            "source_date": "2026-08-17",
+            "source_meal_type": "dinner",
+            "portion": 2,
+        },
+    )
+    return plan_with(meals)
+
+
+def _available_batch(*, total: int = 2, remaining: int = 1) -> BatchLedgerEntry:
+    """Return an available source for batch-link validation."""
+    return BatchLedgerEntry(
+        batch_id="batch-available",
+        source_plan_id="plan-1",
+        source_request_id="request-1",
+        source_revision=1,
+        preparation_date=date(2026, 8, 17),
+        preparation_meal_type=MealType.DINNER,
+        food="chicken",
+        total_portions=total,
+        remaining_portions=remaining,
+        state=BatchLedgerState.AVAILABLE,
+        week_end=date(2026, 8, 23),
+    )
+
+
+def test_batch_links_validate_source_role_scope_and_portion() -> None:
+    """A preparation plus a later same-week lunch leftover is compliant."""
+    result = validate_batch_links(_batch_plan())
+
+    assert result.is_valid
+    assert result.issues == ()
+    assert [
+        (link.batch_id, link.role, link.portion) for link in result.links
+    ] == [
+        ("batch-chicken", BatchMealRole.PREPARATION, 1),
+        ("batch-chicken", BatchMealRole.LEFTOVER, 2),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("missing_source", "batch_missing_source"),
+        ("duplicate_source", "batch_duplicate_source"),
+        ("excessive_reuse", "batch_excessive_reuse"),
+        ("wrong_id", "batch_unknown_source"),
+        ("before_preparation", "batch_reuse_before_preparation"),
+        ("unavailable", "batch_unavailable_portion"),
+        ("cross_week", "batch_cross_week"),
+    ],
+)
+def test_batch_validation_rejects_unsafe_reuse_shapes(
+    mutation: str, code: str
+) -> None:
+    """Every invalid source shape receives one bounded application code."""
+    plan = _batch_plan()
+    if mutation == "missing_source":
+        plan.days[1].meals[1].batch_link = (
+            plan.days[1]
+            .meals[1]
+            .batch_link.model_copy(update={"batch_id": "missing"})
+        )
+        plan.days[0].meals[2].batch_link = None
+    elif mutation == "duplicate_source":
+        plan.days[1].meals[1].batch_link = plan.days[0].meals[2].batch_link
+    elif mutation == "excessive_reuse":
+        plan.days[3].meals[1].batch_link = (
+            plan.days[1].meals[1].batch_link.model_copy(update={"portion": 3})
+        )
+        plan.days[4].meals[1].batch_link = (
+            plan.days[1].meals[1].batch_link.model_copy(update={"portion": 3})
+        )
+    elif mutation == "wrong_id":
+        plan.days[1].meals[1].batch_link = (
+            plan.days[1]
+            .meals[1]
+            .batch_link.model_copy(update={"batch_id": "batch-available"})
+        )
+    elif mutation == "before_preparation":
+        plan.days[0].meals[1].batch_link = (
+            plan.days[1]
+            .meals[1]
+            .batch_link.model_copy(update={"source_date": date(2026, 8, 11)})
+        )
+    elif mutation == "unavailable":
+        plan.days[1].meals[1].batch_link = (
+            plan.days[1]
+            .meals[1]
+            .batch_link.model_copy(
+                update={
+                    "batch_id": "batch-available",
+                    "source_date": date(2026, 8, 17),
+                }
+            )
+        )
+        plan.days[2].meals[1].batch_link = (
+            plan.days[1].meals[1].batch_link.model_copy(update={"portion": 3})
+        )
+    elif mutation == "cross_week":
+        plan.days[1].meals[1].batch_link = (
+            plan.days[1]
+            .meals[1]
+            .batch_link.model_copy(update={"source_date": date(2026, 8, 3)})
+        )
+
+    available = [_available_batch()] if mutation == "unavailable" else []
+    result = (
+        validate_batch_links(plan)
+        if mutation == "missing_source"
+        else validate_batch_links(plan, available_batches=available)
+    )
+
+    assert not result.is_valid
+    assert code in {issue.code for issue in result.issues}
+
+
+def test_batch_validation_rejects_unavailable_and_keeps_ordinary() -> None:
+    """Inventory limits apply only to linked meals, not ordinary meals."""
+    plan = _batch_plan()
+    plan.days[0].meals[2].batch_link = None
+    plan.days[1].meals[1].batch_link = (
+        plan.days[1]
+        .meals[1]
+        .batch_link.model_copy(update={"batch_id": "batch-available"})
+    )
+    result = validate_batch_links(plan, available_batches=[])
+
+    assert not result.is_valid
+    assert result.issues[0].code == "batch_unknown_source"
+
+    ordinary = plan_with(
+        {
+            day: [
+                meal(MealType.BREAKFAST, "Oats", ["oats"]),
+                meal(MealType.LUNCH, "Soup", ["beans"]),
+                meal(MealType.DINNER, "Rice", ["rice"]),
+            ]
+            for day in range(1, 8)
+        }
+    )
+    assert validate_batch_links(ordinary).is_valid
+
+
+def test_batch_validation_rejects_portion_number_beyond_available_stock() -> (
+    None
+):
+    """A remaining count of one cannot satisfy a request for portion three."""
+    plan = plan_with(
+        {
+            day: [
+                meal(MealType.BREAKFAST, "Oats", ["oats"]),
+                meal(MealType.LUNCH, "Chicken leftover", ["chicken"]),
+                meal(MealType.DINNER, "Rice", ["rice"]),
+            ]
+            for day in range(1, 8)
+        }
+    )
+    plan.days[1].meals[1].batch_link = PlannedBatchLink(
+        batch_id="batch-available",
+        role="leftover",
+        source_date="2026-08-17",
+        source_meal_type="dinner",
+        portion=3,
+    )
+
+    result = validate_batch_links(
+        plan, available_batches=[_available_batch(remaining=1)]
+    )
+
+    assert not result.is_valid
+    assert any(
+        issue.code == "batch_unavailable_portion" for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("total", "remaining", "portion", "is_valid"),
+    [
+        (2, 1, 2, True),
+        (3, 2, 2, True),
+        (3, 2, 3, False),
+        (3, 1, 3, True),
+        (3, 1, 2, False),
+        (2, 1, 3, False),
+    ],
+)
+def test_batch_validation_uses_canonical_available_portion_ordinals(
+    total: int, remaining: int, portion: int, is_valid: bool
+) -> None:
+    """Planning exposes exactly the ordinals still available in inventory."""
+    plan = plan_with(
+        {
+            2: [
+                meal(MealType.BREAKFAST, "Oats", ["oats"]),
+                meal(
+                    MealType.LUNCH,
+                    "Chicken leftover",
+                    ["chicken"],
+                    batch_link={
+                        "batch_id": "batch-available",
+                        "role": "leftover",
+                        "source_date": "2026-08-17",
+                        "source_meal_type": "dinner",
+                        "portion": portion,
+                    },
+                ),
+                meal(MealType.DINNER, "Rice", ["rice"]),
+            ]
+        }
+    )
+
+    result = validate_batch_links(
+        plan,
+        available_batches=[_available_batch(total=total, remaining=remaining)],
+    )
+
+    assert result.is_valid is is_valid
+    if not is_valid:
+        assert any(
+            issue.code
+            in {
+                "batch_unavailable_portion",
+                "batch_noncanonical_ordinal_order",
+            }
+            for issue in result.issues
+        )
+
+
+def test_batch_linked_meals_require_complete_ingredients() -> None:
+    """Batch intent cannot bypass the ordinary ingredient contract."""
+    plan = _batch_plan()
+    plan.days[0].meals[2].ingredients = []
+
+    result = validate_generated_plan(plan)
+
+    assert not result.is_valid
+    assert any(
+        issue.code == "empty_ingredients" and issue.day == 1
+        for issue in result.issues
+    )
+
+
+def _confirmed_batch_rule_plan() -> WeeklyPlan:
+    """Return a complete plan satisfying one confirmed three-meal rule."""
+    plan = _batch_plan()
+    plan.days[0].meals[2] = meal(
+        MealType.DINNER,
+        "Chicken dinner",
+        ["chicken"],
+        batch_link={
+            "batch_id": "batch-chicken",
+            "role": "preparation",
+            "total_yield": 3,
+        },
+    )
+    plan.days[1].meals[1] = meal(
+        MealType.LUNCH,
+        "Chicken leftover",
+        ["chicken"],
+        batch_link={
+            "batch_id": "batch-chicken",
+            "role": "leftover",
+            "source_date": "2026-08-17",
+            "source_meal_type": "dinner",
+            "portion": 2,
+        },
+    )
+    plan.days[2].meals[2] = meal(
+        MealType.DINNER,
+        "Chicken leftover",
+        ["chicken"],
+        batch_link={
+            "batch_id": "batch-chicken",
+            "role": "leftover",
+            "source_date": "2026-08-17",
+            "source_meal_type": "dinner",
+            "portion": 3,
+        },
+    )
+    return plan
+
+
+def _confirmed_batch_rule() -> BatchRule:
+    """Return the rule represented by ``_confirmed_batch_rule_plan``."""
+    return BatchRule(
+        id="batch-rule-1",
+        source_text="cook chicken for three meals",
+        foods_any_of=["chicken"],
+        preparation_meal_types=[MealType.DINNER],
+        reuse_meal_types=[MealType.LUNCH, MealType.DINNER],
+        total_yield=3,
+    )
+
+
+def test_generated_plan_enforces_a_confirmed_batch_rule() -> None:
+    """A preparation and every ordered leftover satisfy the typed rule."""
+    result = validate_generated_plan(
+        _confirmed_batch_rule_plan(), batch_rules=[_confirmed_batch_rule()]
+    )
+
+    assert result.is_valid
+    assert result.issues == ()
+
+
+def _available_three_portion_plan(
+    portions: tuple[int, ...],
+) -> WeeklyPlan:
+    """Return Tuesday/Wednesday leftovers for an available three-batch."""
+    meals = {
+        day: [
+            meal(MealType.BREAKFAST, "Oats", ["oats"]),
+            meal(MealType.LUNCH, "Beans", ["beans"]),
+            meal(MealType.DINNER, "Rice", ["rice"]),
+        ]
+        for day in range(1, 8)
+    }
+    for day, portion in zip((2, 3), portions):
+        meal_type = MealType.LUNCH if day == 2 else MealType.DINNER
+        meal_index = 1 if meal_type is MealType.LUNCH else 2
+        meals[day][meal_index] = meal(
+            meal_type,
+            "Chicken leftover",
+            ["chicken"],
+            batch_link={
+                "batch_id": "batch-available",
+                "role": "leftover",
+                "source_date": "2026-08-17",
+                "source_meal_type": "dinner",
+                "portion": portion,
+            },
+        )
+    return plan_with(meals)
+
+
+def test_available_batch_leftovers_must_start_at_next_ledger_portion() -> None:
+    """A later available portion cannot skip the ledger's next portion."""
+    result = validate_generated_plan(
+        _available_three_portion_plan((3,)),
+        available_batches=[_available_batch(total=3, remaining=2)],
+    )
+
+    assert not result.is_valid
+    assert any(
+        issue.code == "batch_noncanonical_ordinal_order"
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("batch_source", "portions", "expected_valid"),
+    [
+        ("confirmed", (2, 3), True),
+        ("confirmed", (3, 2), False),
+        ("available", (2, 3), True),
+        ("available", (3, 2), False),
+    ],
+)
+def test_batch_leftovers_require_chronological_canonical_ordinals(
+    batch_source: str,
+    portions: tuple[int, int],
+    expected_valid: bool,
+) -> None:
+    """Chronological leftovers must use each batch's next ordinals."""
+    if batch_source == "confirmed":
+        plan = _confirmed_batch_rule_plan()
+        for day, portion in zip((2, 3), portions, strict=True):
+            plan.days[day - 1].meals[1 if day == 2 else 2].batch_link = (
+                plan.days[day - 1]
+                .meals[1 if day == 2 else 2]
+                .batch_link.model_copy(update={"portion": portion})
+            )
+        result = validate_generated_plan(
+            plan, batch_rules=[_confirmed_batch_rule()]
+        )
+    else:
+        result = validate_generated_plan(
+            _available_three_portion_plan(portions),
+            available_batches=[_available_batch(total=3, remaining=2)],
+        )
+
+    assert result.is_valid is expected_valid
+    if not expected_valid:
+        expected_codes = {
+            "batch_rule_wrong_leftover_ordinal",
+            "batch_noncanonical_ordinal_order",
+        }
+        assert expected_codes.intersection(
+            issue.code for issue in result.issues
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        ("omitted_preparation", "batch_rule_missing_preparation"),
+        ("wrong_food", "batch_rule_wrong_food"),
+        (
+            "disallowed_preparation_meal_type",
+            "batch_rule_invalid_preparation_meal_type",
+        ),
+        ("disallowed_reuse_meal_type", "batch_rule_invalid_reuse_meal_type"),
+        ("wrong_total_yield", "batch_rule_wrong_yield"),
+        ("missing_leftover_ordinal", "batch_rule_missing_leftover"),
+        ("duplicate_leftover_ordinal", "batch_rule_duplicate_leftover"),
+        ("wrong_leftover_count", "batch_rule_wrong_leftover_count"),
+        ("reuse_before_preparation", "batch_rule_reuse_before_preparation"),
+        ("ambiguous_batch", "batch_rule_ambiguous_match"),
+        ("cross_linked_batch", "batch_rule_cross_linked"),
+    ],
+)
+def test_confirmed_batch_rule_rejects_each_mismatch(
+    mutation: str, expected_code: str
+) -> None:
+    """Every confirmed batch-rule mismatch receives a stable code."""
+    plan = _confirmed_batch_rule_plan()
+    if mutation == "omitted_preparation":
+        plan.days[0].meals[2].batch_link = None
+    elif mutation == "wrong_food":
+        plan.days[0].meals[2].ingredients = [Ingredient(item="beef")]
+    elif mutation == "disallowed_preparation_meal_type":
+        plan.days[0].meals[2] = meal(
+            MealType.LUNCH,
+            "Chicken lunch",
+            ["chicken"],
+            batch_link={
+                "batch_id": "batch-chicken",
+                "role": "preparation",
+                "total_yield": 3,
+            },
+        )
+    elif mutation == "disallowed_reuse_meal_type":
+        plan.days[1].meals[1] = meal(
+            MealType.BREAKFAST,
+            "Chicken leftover",
+            ["chicken"],
+            batch_link={
+                "batch_id": "batch-chicken",
+                "role": "leftover",
+                "source_date": "2026-08-17",
+                "source_meal_type": "dinner",
+                "portion": 2,
+            },
+        )
+    elif mutation == "wrong_total_yield":
+        plan.days[0].meals[2].batch_link = (
+            plan.days[0]
+            .meals[2]
+            .batch_link.model_copy(update={"total_yield": 2})
+        )
+    elif mutation == "missing_leftover_ordinal":
+        plan.days[2].meals[2].batch_link = None
+    elif mutation == "duplicate_leftover_ordinal":
+        plan.days[2].meals[2].batch_link = (
+            plan.days[2].meals[2].batch_link.model_copy(update={"portion": 2})
+        )
+    elif mutation == "wrong_leftover_count":
+        plan.days[3].meals[1] = meal(
+            MealType.LUNCH,
+            "Chicken leftover",
+            ["chicken"],
+            batch_link={
+                "batch_id": "batch-chicken",
+                "role": "leftover",
+                "source_date": "2026-08-17",
+                "source_meal_type": "dinner",
+                "portion": 2,
+            },
+        )
+    elif mutation == "reuse_before_preparation":
+        plan.days[0].meals[1] = meal(
+            MealType.LUNCH,
+            "Chicken leftover",
+            ["chicken"],
+            batch_link={
+                "batch_id": "batch-chicken",
+                "role": "leftover",
+                "source_date": date(2026, 8, 17),
+                "source_meal_type": "dinner",
+                "portion": 2,
+            },
+        )
+    elif mutation == "ambiguous_batch":
+        plan.days[4].meals[2] = meal(
+            MealType.DINNER,
+            "Chicken dinner two",
+            ["chicken"],
+            batch_link={
+                "batch_id": "batch-second",
+                "role": "preparation",
+                "total_yield": 2,
+            },
+        )
+    elif mutation == "cross_linked_batch":
+        plan.days[2].meals[2].batch_link = (
+            plan.days[2]
+            .meals[2]
+            .batch_link.model_copy(update={"batch_id": "batch-other"})
+        )
+
+    result = validate_generated_plan(
+        plan, batch_rules=[_confirmed_batch_rule()]
+    )
+
+    assert not result.is_valid
+    assert expected_code in {issue.code for issue in result.issues}
 
 
 @pytest.mark.parametrize(
@@ -1030,6 +1717,110 @@ def test_rule_summaries_are_bounded_and_do_not_include_raw_source_text() -> (
     assert long_source not in best_effort_summary
 
 
+def test_dated_obligation_accepts_only_the_exact_horizon_date_and_scope() -> (
+    None
+):
+    """A matching food on the owned date and meal type satisfies it."""
+    result = validate_generated_plan(
+        complete_plan_with_egg(day=3, meal_type=MealType.BREAKFAST),
+        obligations=[obligation()],
+    )
+
+    assert result.is_valid
+    assert result.rules[0].actual_count == 1
+    assert result.rules[0].obligation_id == "eggs-2026-W34-2026-08-19"
+    assert result.rules[0].matched_dates == (date(2026, 8, 19),)
+
+
+@pytest.mark.parametrize(
+    ("day", "meal_type", "expected_code"),
+    [
+        (2, MealType.BREAKFAST, "obligation_wrong_date"),
+        (3, MealType.LUNCH, "obligation_wrong_meal_scope"),
+    ],
+)
+def test_dated_obligation_rejects_wrong_date_or_meal_scope(
+    day: int, meal_type: MealType, expected_code: str
+) -> None:
+    """Out-of-scope matches do not satisfy a dated obligation."""
+    result = validate_generated_plan(
+        complete_plan_with_egg(day=day, meal_type=meal_type),
+        obligations=[obligation()],
+    )
+
+    assert not result.is_valid
+    assert any(issue.code == expected_code for issue in result.issues)
+
+
+def test_dated_obligation_reports_missing_and_excess_matches() -> None:
+    """Strict obligations reject both missing and excessive matches."""
+    missing = validate_generated_plan(
+        complete_plan_with_egg(day=1, meal_type=MealType.BREAKFAST),
+        obligations=[obligation()],
+    )
+    assert not missing.is_valid
+    assert any(issue.code == "obligation_missing" for issue in missing.issues)
+
+    plan = complete_plan_with_egg(day=3, meal_type=MealType.BREAKFAST)
+    plan.days[2].meals.append(meal(MealType.SNACK, "Egg snack", ["egg"]))
+    excessive = validate_generated_plan(
+        plan,
+        obligations=[
+            obligation(count=1, meal_type=None, operator=RuleOperator.EXACTLY)
+        ],
+    )
+    assert not excessive.is_valid
+    assert any(issue.code == "obligation_excess" for issue in excessive.issues)
+
+
+def test_obligations_are_isolated_by_iso_week() -> None:
+    """Same relative day in another ISO week cannot satisfy an obligation."""
+    next_week = DietaryObligation(
+        id="eggs-2026-W35-2026-08-24",
+        source_rule_id="eggs-rule",
+        iso_week="2026-W35",
+        horizon_start=date(2026, 8, 24),
+        horizon_end=date(2026, 8, 24),
+        eligible_dates=[date(2026, 8, 24)],
+        operator="at_least",
+        count=1,
+        foods_any_of=["egg"],
+        meal_type="breakfast",
+    )
+    result = validate_generated_plan(
+        complete_plan_with_egg(day=3, meal_type=MealType.BREAKFAST),
+        obligations=[next_week],
+    )
+
+    assert not result.is_valid
+    assert any(issue.code == "obligation_missing" for issue in result.issues)
+
+
+def test_best_effort_obligation_miss_is_non_blocking() -> None:
+    """A best-effort dated obligation is reported but never blocks a draft."""
+    result = validate_generated_plan(
+        complete_plan_with_egg(day=1, meal_type=MealType.BREAKFAST),
+        obligations=[obligation(strength=RuleStrength.BEST_EFFORT)],
+    )
+
+    assert result.is_valid
+    assert not result.rules[0].is_satisfied
+    assert "not met" in format_best_effort_summary(result)
+
+
+def test_obligation_summary_uses_owned_id_and_dates_not_source_text() -> None:
+    """Application summaries expose bounded ownership metadata only."""
+    dated = obligation(identifier="private-source-id")
+    result = validate_generated_plan(
+        complete_plan_with_egg(day=3, meal_type=MealType.BREAKFAST),
+        obligations=[dated],
+    )
+
+    summary = format_satisfaction_summary(result)
+    assert "private-source-id" in summary
+    assert "2026-08-19" in summary
+
+
 def test_absent_weekday_upper_bound_and_exact_zero_are_feasible() -> None:
     """Zero eligible slots do not make non-positive obligations impossible."""
     monday = date(2026, 8, 17)
@@ -1329,3 +2120,27 @@ def test_strict_horizon_shortfall_remains_blocking(
     assert result.advisory_shortfalls == ()
     assert result.rules[0].strength is RuleStrength.STRICT
     assert result.clarification is not None
+
+
+def test_logged_meal_match_respects_scope_and_whole_words() -> None:
+    """Submitted evidence is matched without coupling it to planned meals."""
+    entry = MealLogEntry(
+        date=date(2026, 8, 8),
+        meal_type=MealType.DINNER,
+        description="Fish tacos with rice",
+        created_at=datetime(2026, 8, 8, 18, tzinfo=timezone.utc),
+    )
+    fish = rule(
+        ["fish", "tofu"],
+        1,
+        meal_type=MealType.DINNER,
+        weekdays=[Weekday.SATURDAY],
+    )
+    mushrooms = rule(["mushroom"], 1, meal_type=MealType.DINNER)
+
+    evidence = match_logged_meal(entry, fish)
+
+    assert evidence is not None
+    assert evidence.date == entry.date
+    assert evidence.matched_foods == ("fish",)
+    assert match_logged_meal(entry, mushrooms) is None

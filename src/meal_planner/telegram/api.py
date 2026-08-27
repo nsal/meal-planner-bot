@@ -9,9 +9,12 @@ from typing import Any
 from uuid import UUID
 
 from meal_planner.models.schemas import (
+    BatchMealRole,
+    BatchRule,
     GrocerySection,
     MealCallbackAction,
     MealOutcome,
+    PlannedBatchLink,
     PlannedMeal,
     ProfileEditCategory,
     ProfileEditOperation,
@@ -46,27 +49,39 @@ def _format_nutrient_target(label: str, target: int | None) -> str:
 def _meal_callback_data(
     action: MealCallbackAction,
     submission_id: UUID | str,
+    batch_role: BatchMealRole | None = None,
 ) -> str:
     """Build a canonical, Telegram-safe callback for a meal submission."""
     try:
         canonical_id = str(UUID(str(submission_id)))
     except (AttributeError, ValueError) as exc:
         raise ValueError("submission_id must be a valid UUID") from exc
-    callback_data = f"meal:{action.value}:{canonical_id}"
+    role_suffix = f":{batch_role.value}" if batch_role is not None else ""
+    callback_data = f"meal:{action.value}:{canonical_id}{role_suffix}"
     if len(callback_data.encode("utf-8")) > 64:
         raise ValueError("meal callback data exceeds Telegram's byte limit")
     return callback_data
 
 
-def meal_review_keyboard(submission_id: UUID | str) -> InlineKeyboard:
+def meal_review_keyboard(
+    submission_id: UUID | str,
+    batch_link: PlannedBatchLink | None = None,
+) -> InlineKeyboard:
     """Return one-row Confirm and Cancel buttons for a staged meal."""
+    confirm_text = "✅ Confirm"
+    confirm_role: BatchMealRole | None = None
+    if batch_link is not None:
+        confirm_role = batch_link.role
+        confirm_text = f"✅ Confirm {batch_link.role.value}"
     return {
         "inline_keyboard": [
             [
                 {
-                    "text": "✅ Confirm",
+                    "text": confirm_text,
                     "callback_data": _meal_callback_data(
-                        MealCallbackAction.CONFIRM, submission_id
+                        MealCallbackAction.CONFIRM,
+                        submission_id,
+                        confirm_role,
                     ),
                     "style": "success",
                 },
@@ -249,6 +264,17 @@ class TelegramAPI:
             ", ".join(item.source_text for item in profile.dietary_preferences)
             or "None"
         )
+        batch_rule_lines: list[str] = []
+        for rule in profile.batch_rules:
+            preparation = ", ".join(
+                item.value for item in rule.preparation_meal_types
+            )
+            reuse = ", ".join(item.value for item in rule.reuse_meal_types)
+            batch_rule_lines.append(
+                f"{rule.source_text} (prepare {preparation}; "
+                f"reuse {reuse}; {rule.total_yield} meals)"
+            )
+        batch_rules = "; ".join(batch_rule_lines) or "None"
         lines = [
             f"Family name: {profile.name}",
             f"People count: {profile.people_count}",
@@ -261,6 +287,7 @@ class TelegramAPI:
             ),
             f"Dietary constraints: {constraints}",
             f"Dietary preferences: {preferences}",
+            f"Batch rules: {batch_rules}",
         ]
         keyboard = {
             "inline_keyboard": [
@@ -433,7 +460,18 @@ class TelegramAPI:
             "Meaning:",
         ]
         for rule in rules:
-            if hasattr(rule, "forbidden_terms"):
+            if isinstance(rule, BatchRule):
+                preparation = ", ".join(
+                    meal_type.value for meal_type in rule.preparation_meal_types
+                )
+                reuse = ", ".join(
+                    meal_type.value for meal_type in rule.reuse_meal_types
+                )
+                lines.append(
+                    f"- Batch: prepare for {preparation}; reuse for {reuse}; "
+                    f"{rule.total_yield} meals"
+                )
+            elif hasattr(rule, "forbidden_terms"):
                 lines.append("- Exclude: " + ", ".join(rule.forbidden_terms))
             else:
                 scope = (
@@ -471,17 +509,27 @@ class TelegramAPI:
         chat_id: int | str,
         submitted_text: str,
         submission_id: UUID | str,
+        *,
+        batch_link: PlannedBatchLink | None = None,
     ) -> list[dict[str, Any]]:
         """Echo a submitted meal and ask whether it should be saved."""
+        batch_prompt = ""
+        if batch_link is not None:
+            batch_prompt = (
+                "\n\nThis matches a planned batch "
+                f"{batch_link.role.value}. Confirm it as the "
+                f"batch {batch_link.role.value} or cancel."
+            )
         text = (
             "Review this meal submission:\n"
             f"{submitted_text}\n\n"
             "Confirm to save it or cancel."
+            f"{batch_prompt}"
         )
         return self.send_message(
             chat_id,
             text,
-            reply_markup=meal_review_keyboard(submission_id),
+            reply_markup=meal_review_keyboard(submission_id, batch_link),
         )
 
     def send_meal_saved(
@@ -500,6 +548,16 @@ class TelegramAPI:
     def send_plan(
         self, chat_id: int | str, plan: WeeklyPlan
     ) -> list[dict[str, Any]]:
+        batch_yields: dict[str, int] = {}
+        for plan_day in plan.days:
+            for meal in plan_day.meals:
+                if meal.batch_link is None:
+                    continue
+                link = meal.batch_link
+                inferred_yield = link.total_yield or link.portion
+                batch_yields[link.batch_id] = max(
+                    2, batch_yields.get(link.batch_id, 0), inferred_yield
+                )
         lines = [
             f"Meal Plan (starting {plan.week_start_date})",
             f"Status: {plan.status.value}",
@@ -513,9 +571,18 @@ class TelegramAPI:
                     if meal.outcome is MealOutcome.UNREPORTED
                     else f" [{meal.outcome.value}]"
                 )
+                batch_label = ""
+                if meal.batch_link is not None:
+                    if meal.batch_link.role is BatchMealRole.PREPARATION:
+                        batch_label = (
+                            f" [Batch preparation; makes "
+                            f"{batch_yields[meal.batch_link.batch_id]} meals]"
+                        )
+                    else:
+                        batch_label = " [Batch leftover]"
                 lines.append(
                     f"• {meal.meal_type.value.capitalize()}: {meal.name} "
-                    f"({meal.est_calories} kcal){outcome}"
+                    f"({meal.est_calories} kcal){batch_label}{outcome}"
                 )
             lines.append("")
         return self.send_message(chat_id, "\n".join(lines).strip())

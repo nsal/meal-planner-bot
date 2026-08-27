@@ -5,6 +5,7 @@ import logging
 import signal
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from uuid import UUID
 
 import pytest
 from botocore.config import Config
@@ -17,15 +18,20 @@ from meal_planner.llm.client import (
     LLMTransientError,
 )
 from meal_planner.models.schemas import (
+    BatchLedgerState,
+    BatchMealRole,
+    BatchRule,
     ConstraintEntry,
     ConversationState,
     ConversationWorkflowKind,
     ConversationWorkflowStep,
+    DietaryObligation,
     DietaryRule,
     GroceryStatus,
     MealOutcome,
     MealType,
     PlanGenerationContext,
+    PlannedBatchLink,
     PlanRevisionContext,
     PlanStatus,
     PreferenceRequirement,
@@ -43,7 +49,13 @@ from meal_planner.preferences import (
     ValidationIssue,
 )
 from meal_planner.telegram.api import split_text
-from tests.factories import make_plan, make_plan_payload, make_profile
+from tests.factories import (
+    make_batch_ledger_entry,
+    make_batch_rule,
+    make_plan,
+    make_plan_payload,
+    make_profile,
+)
 
 
 def _revision_state(
@@ -166,6 +178,86 @@ def _dietary_rule(
     )
 
 
+def _batch_rule_plan_payload(
+    week: date, *, complete: bool, reversed_ordinals: bool = False
+) -> dict[str, Any]:
+    """Return a provider payload with one valid or incomplete batch."""
+    payload = _complete_plan_payload(week)
+    payload["days"][0]["meals"][2].update(
+        {
+            "name": "Chicken dinner",
+            "ingredients": [{"item": "chicken"}],
+            "batch_link": {
+                "batch_id": "provider-chicken",
+                "role": "preparation",
+                "total_yield": 3,
+            },
+        }
+    )
+    payload["days"][1]["meals"][1].update(
+        {
+            "name": "Chicken leftover",
+            "ingredients": [{"item": "chicken"}],
+            "batch_link": {
+                "batch_id": "provider-chicken",
+                "role": "leftover",
+                "source_date": week.isoformat(),
+                "source_meal_type": "dinner",
+                "portion": 3 if reversed_ordinals else 2,
+            },
+        }
+    )
+    if complete:
+        payload["days"][2]["meals"][2].update(
+            {
+                "name": "Chicken leftover",
+                "ingredients": [{"item": "chicken"}],
+                "batch_link": {
+                    "batch_id": "provider-chicken",
+                    "role": "leftover",
+                    "source_date": week.isoformat(),
+                    "source_meal_type": "dinner",
+                    "portion": 2 if reversed_ordinals else 3,
+                },
+            }
+        )
+    return payload
+
+
+def _confirmed_batch_rule() -> BatchRule:
+    """Return the typed batch rule used by planner workflow tests."""
+    return make_batch_rule(
+        source_text="cook chicken for three meals",
+        total_yield=3,
+    )
+
+
+def _dated_obligation(
+    week: date,
+    *,
+    target_day: int = 1,
+    identifier: str = "eggs-2026-W34-2026-08-17",
+    strength: RuleStrength = RuleStrength.STRICT,
+) -> DietaryObligation:
+    """Build an application-owned obligation for a plan date."""
+    target_date = week + timedelta(days=target_day - 1)
+    iso = target_date.isocalendar()
+    iso_week = f"{iso.year:04d}-W{iso.week:02d}"
+    return DietaryObligation(
+        id=identifier,
+        source_rule_id="eggs-rule",
+        iso_week=iso_week,
+        horizon_start=target_date,
+        horizon_end=target_date,
+        eligible_dates=[target_date],
+        operator="at_least",
+        count=1,
+        foods_any_of=["egg"],
+        meal_type=MealType.BREAKFAST,
+        strength=strength,
+    )
+
+
 def test_generate_plan_saves_draft_without_groceries(mocker: Any) -> None:
     repo = mocker.MagicMock()
     events: list[str] = []
@@ -195,6 +287,1317 @@ def test_generate_plan_saves_draft_without_groceries(mocker: Any) -> None:
         1, "Review this draft, request edits, then tell me to confirm it."
     )
     assert events == ["persist", "send_plan", "send_message"]
+
+
+def test_one_day_preparation_reserves_future_batch_portions(
+    mocker: Any,
+) -> None:
+    """A preparation meal publishes a provisional two-meal reservation."""
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.save_generated_draft.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    week = date(2026, 8, 20)
+    payload = _complete_plan_payload(week)
+    payload["days"] = payload["days"][:1]
+    payload["days"][0]["meals"][2]["name"] = "Chicken dinner"
+    payload["days"][0]["meals"][2]["ingredients"] = [{"item": "chicken"}]
+    payload["days"][0]["meals"][2]["batch_link"] = {
+        "batch_id": "batch-chicken",
+        "role": BatchMealRole.PREPARATION.value,
+    }
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user", 1, week_start=week, plan_days=1
+    )
+
+    call = repo.save_generated_draft.call_args
+    entries = call.kwargs["batch_entries"]
+    assert len(entries) == 1
+    assert entries[0].batch_id.startswith("batch-")
+    assert entries[0].batch_id != "batch-chicken"
+    assert entries[0].total_portions == 2
+    assert entries[0].remaining_portions == 1
+    assert entries[0].state is BatchLedgerState.PROVISIONAL
+    assert entries[0].source_revision == 0
+
+
+def test_wednesday_profile_one_day_plan_is_compliant_and_reserves_batch(
+    mocker: Any,
+) -> None:
+    """The Wednesday plan satisfies obligations and creates a source batch."""
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_latest_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_available_batch_portions.return_value = []
+    repo.save_generated_draft.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    wednesday = date(2026, 8, 26)
+    payload = _complete_plan_payload(wednesday)
+    payload["days"] = payload["days"][:1]
+    payload["days"][0]["meals"] = [
+        {
+            "meal_type": "breakfast",
+            "name": "Egg toast",
+            "ingredients": [{"item": "egg"}],
+            "est_calories": 400,
+        },
+        {
+            "meal_type": "lunch",
+            "name": "Chicken batch lunch",
+            "ingredients": [{"item": "chicken"}],
+            "est_calories": 500,
+            "batch_link": {
+                "batch_id": "batch-chicken",
+                "role": "preparation",
+                "total_yield": 2,
+            },
+        },
+        {
+            "meal_type": "dinner",
+            "name": "Fish with rice",
+            "ingredients": [{"item": "fish"}, {"item": "rice"}],
+            "est_calories": 600,
+        },
+    ]
+    llm.chat_json_sync.return_value = payload
+    egg_obligation = DietaryObligation(
+        id="eggs-three-breakfasts-2026-W35-2026-08-26",
+        source_rule_id="eggs-three-breakfasts",
+        iso_week="2026-W35",
+        horizon_start=wednesday,
+        horizon_end=wednesday,
+        eligible_dates=[wednesday],
+        operator="at_least",
+        count=1,
+        foods_any_of=["egg"],
+        meal_type=MealType.BREAKFAST,
+    )
+    fish_obligation = egg_obligation.model_copy(
+        update={
+            "id": "fish-one-dinner-2026-W35-2026-08-26",
+            "source_rule_id": "fish-one-dinner",
+            "foods_any_of": ["fish"],
+            "meal_type": MealType.DINNER,
+        }
+    )
+    constraint = ConstraintEntry(
+        id="no-mushrooms",
+        source_text="no mushrooms",
+        forbidden_terms=["mushroom"],
+    )
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user",
+        1,
+        week_start=wednesday,
+        plan_days=1,
+        obligations=[egg_obligation, fish_obligation],
+        constraint_rules=[constraint],
+        available_batches=[],
+    )
+
+    saved = repo.save_generated_draft.call_args.args[1]
+    assert saved.week_start == wednesday
+    assert [meal.name for meal in saved.days[0].meals] == [
+        "Egg toast",
+        "Chicken batch lunch",
+        "Fish with rice",
+    ]
+    assert all(
+        "mushroom" not in meal.name.casefold()
+        and all(
+            "mushroom" not in item.item.casefold() for item in meal.ingredients
+        )
+        for meal in saved.days[0].meals
+    )
+    batch_entries = repo.save_generated_draft.call_args.kwargs["batch_entries"]
+    assert len(batch_entries) == 1
+    assert batch_entries[0].total_portions == 2
+    assert batch_entries[0].remaining_portions == 1
+    assert batch_entries[0].state is BatchLedgerState.PROVISIONAL
+    assert api.send_plan.call_args.args[1] == saved
+
+
+def test_non_compliant_wednesday_output_is_terminal_without_draft(
+    mocker: Any,
+) -> None:
+    """A mushroom/egg violation cannot publish or weaken the snapshot."""
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_latest_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_available_batch_portions.return_value = []
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    wednesday = date(2026, 8, 26)
+    payload = _complete_plan_payload(wednesday)
+    payload["days"] = payload["days"][:1]
+    payload["days"][0]["meals"][0].update(
+        {"name": "Mushroom toast", "ingredients": [{"item": "mushroom"}]}
+    )
+    llm.chat_json_sync.return_value = payload
+    obligation = _dated_obligation(wednesday)
+    constraint = ConstraintEntry(
+        id="no-mushrooms",
+        source_text="no mushrooms",
+        forbidden_terms=["mushroom"],
+    )
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user",
+        1,
+        week_start=wednesday,
+        plan_days=1,
+        obligations=[obligation],
+        constraint_rules=[constraint],
+        available_batches=[],
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    api.send_plan.assert_not_called()
+    assert "no draft was saved" in api.send_message.call_args.args[1].lower()
+    assert "safety constraint" in api.send_message.call_args.args[1].lower()
+
+
+def test_preparation_yield_is_preserved_in_batch_reservation(
+    mocker: Any,
+) -> None:
+    """An explicit three-meal preparation reserves two future portions."""
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.save_generated_draft.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    week = date(2026, 8, 20)
+    payload = _complete_plan_payload(week)
+    payload["days"] = payload["days"][:1]
+    payload["days"][0]["meals"][2].update(
+        {
+            "name": "Chicken dinner",
+            "ingredients": [{"item": "chicken"}],
+            "batch_link": {
+                "batch_id": "batch-chicken",
+                "role": BatchMealRole.PREPARATION.value,
+                "total_yield": 3,
+            },
+        }
+    )
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user", 1, week_start=week, plan_days=1
+    )
+
+    entries = repo.save_generated_draft.call_args.kwargs["batch_entries"]
+    assert entries[0].total_portions == 3
+    assert entries[0].remaining_portions == 2
+
+
+def test_provider_batch_id_is_replaced_before_plan_and_ledger_persistence(
+    mocker: Any,
+) -> None:
+    """Provider-local preparation IDs never reach durable batch state."""
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_latest_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_available_batch_portions.return_value = []
+    repo.save_generated_draft.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    week = date(2026, 8, 20)
+    provider_batch_id = "provider-selected-batch"
+    payload = _complete_plan_payload(week)
+    payload["days"] = payload["days"][:3]
+    payload["days"][0]["meals"][2].update(
+        {
+            "name": "Chicken dinner",
+            "ingredients": [{"item": "chicken"}],
+            "batch_link": {
+                "batch_id": provider_batch_id,
+                "role": BatchMealRole.PREPARATION.value,
+                "total_yield": 3,
+            },
+        }
+    )
+    for day_number, portion in ((2, 2), (3, 3)):
+        payload["days"][day_number - 1]["meals"][1].update(
+            {
+                "name": f"Chicken leftover lunch {day_number}",
+                "ingredients": [{"item": "chicken"}],
+                "batch_link": {
+                    "batch_id": provider_batch_id,
+                    "role": BatchMealRole.LEFTOVER.value,
+                    "source_date": week.isoformat(),
+                    "source_meal_type": MealType.DINNER.value,
+                    "portion": portion,
+                },
+            }
+        )
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user", 1, week_start=week, plan_days=3
+    )
+
+    saved = repo.save_generated_draft.call_args.args[1]
+    saved_batch_ids = {
+        meal.batch_link.batch_id
+        for plan_day in saved.days
+        for meal in plan_day.meals
+        if meal.batch_link is not None
+    }
+    entries = repo.save_generated_draft.call_args.kwargs["batch_entries"]
+
+    assert provider_batch_id not in saved_batch_ids
+    assert provider_batch_id not in {entry.batch_id for entry in entries}
+    assert len(saved_batch_ids) == 1
+    assert entries[0].batch_id in saved_batch_ids
+
+
+def test_stale_publication_receives_canonical_batch_ids_but_publishes_nothing(
+    mocker: Any,
+) -> None:
+    """A stale write cannot publish a provider-owned reservation."""
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_latest_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_available_batch_portions.return_value = []
+    repo.save_generated_draft.return_value = False
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    week = date(2026, 8, 20)
+    provider_batch_id = "stale-provider-batch"
+    payload = _complete_plan_payload(week)
+    payload["days"] = payload["days"][:1]
+    payload["days"][0]["meals"][2]["batch_link"] = {
+        "batch_id": provider_batch_id,
+        "role": BatchMealRole.PREPARATION.value,
+    }
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user", 1, week_start=week, plan_days=1
+    )
+
+    saved = repo.save_generated_draft.call_args.args[1]
+    entries = repo.save_generated_draft.call_args.kwargs["batch_entries"]
+    assert all(
+        meal.batch_link is None or meal.batch_link.batch_id != provider_batch_id
+        for plan_day in saved.days
+        for meal in plan_day.meals
+    )
+    assert all(entry.batch_id != provider_batch_id for entry in entries)
+    api.send_plan.assert_not_called()
+
+
+def test_each_provider_preparation_gets_one_id_and_rewrites_its_leftovers(
+    mocker: Any,
+) -> None:
+    """New preparation IDs map one-to-one through all linked leftovers."""
+    week = date(2026, 8, 20)
+    plan = make_plan(week_start=week, plan_days=4)
+    plan.days[0].meals[0] = (
+        plan.days[0]
+        .meals[0]
+        .model_copy(
+            update={
+                "batch_link": PlannedBatchLink(
+                    batch_id="provider-a",
+                    role=BatchMealRole.PREPARATION,
+                    total_yield=3,
+                )
+            }
+        )
+    )
+    plan.days[1].meals[0] = (
+        plan.days[1]
+        .meals[0]
+        .model_copy(
+            update={
+                "batch_link": PlannedBatchLink(
+                    batch_id="provider-b",
+                    role=BatchMealRole.PREPARATION,
+                    total_yield=2,
+                )
+            }
+        )
+    )
+    plan.days[2].meals[0] = (
+        plan.days[2]
+        .meals[0]
+        .model_copy(
+            update={
+                "batch_link": PlannedBatchLink(
+                    batch_id="provider-a",
+                    role=BatchMealRole.LEFTOVER,
+                    source_date=week,
+                    source_meal_type=MealType.LUNCH,
+                    portion=2,
+                )
+            }
+        )
+    )
+    plan.days[3].meals[0] = (
+        plan.days[3]
+        .meals[0]
+        .model_copy(
+            update={
+                "batch_link": PlannedBatchLink(
+                    batch_id="provider-b",
+                    role=BatchMealRole.LEFTOVER,
+                    source_date=week + timedelta(days=1),
+                    source_meal_type=MealType.LUNCH,
+                    portion=2,
+                )
+            }
+        )
+    )
+
+    canonical = PlannerHandler._canonicalize_batch_ids(
+        plan, available_batches=[]
+    )
+
+    canonical_ids = {
+        meal.batch_link.batch_id
+        for plan_day in canonical.days
+        for meal in plan_day.meals
+        if meal.batch_link is not None
+    }
+    assert len(canonical_ids) == 2
+    assert not canonical_ids.intersection({"provider-a", "provider-b"})
+    assert (
+        canonical.days[0].meals[0].batch_link.batch_id
+        == canonical.days[2].meals[0].batch_link.batch_id
+    )
+    assert (
+        canonical.days[1].meals[0].batch_link.batch_id
+        == canonical.days[3].meals[0].batch_link.batch_id
+    )
+    assert plan.days[0].meals[0].batch_link.batch_id == "provider-a"
+
+
+def test_available_ids_are_preserved_and_unknown_ids_are_not_mapped() -> None:
+    """Only application-issued available inventory IDs survive unchanged."""
+    week = date(2026, 8, 20)
+    available = make_batch_ledger_entry(
+        batch_id="application-inventory-id",
+        state=BatchLedgerState.AVAILABLE,
+    ).model_copy(update={"total_portions": 3, "remaining_portions": 2})
+    plan = make_plan(week_start=week, plan_days=2)
+    plan.days[0].meals[0] = (
+        plan.days[0]
+        .meals[0]
+        .model_copy(
+            update={
+                "batch_link": PlannedBatchLink(
+                    batch_id=available.batch_id,
+                    role=BatchMealRole.LEFTOVER,
+                    source_date=available.preparation_date,
+                    source_meal_type=available.preparation_meal_type,
+                    portion=2,
+                )
+            }
+        )
+    )
+    plan.days[1].meals[0] = (
+        plan.days[1]
+        .meals[0]
+        .model_copy(
+            update={
+                "batch_link": PlannedBatchLink(
+                    batch_id="unknown-inventory-id",
+                    role=BatchMealRole.LEFTOVER,
+                    source_date=available.preparation_date,
+                    source_meal_type=available.preparation_meal_type,
+                    portion=2,
+                )
+            }
+        )
+    )
+
+    canonical = PlannerHandler._canonicalize_batch_ids(
+        plan, available_batches=[available]
+    )
+
+    assert canonical.days[0].meals[0].batch_link.batch_id == available.batch_id
+    assert (
+        canonical.days[1].meals[0].batch_link.batch_id == "unknown-inventory-id"
+    )
+
+
+def test_duplicate_or_inventory_colliding_preparation_tokens_do_not_map(
+    mocker: Any,
+) -> None:
+    """Ambiguous and colliding provider identities fail before publication."""
+    week = date(2026, 8, 20)
+    duplicate = make_plan(week_start=week, plan_days=2)
+    preparation = PlannedBatchLink(
+        batch_id="duplicate-provider-token",
+        role=BatchMealRole.PREPARATION,
+    )
+    duplicate.days[0].meals[0].batch_link = preparation
+    duplicate.days[1].meals[0].batch_link = preparation
+
+    with pytest.raises(ValueError, match="duplicate provider"):
+        PlannerHandler._canonicalize_batch_ids(duplicate, available_batches=[])
+
+    colliding = make_plan(week_start=week, plan_days=1)
+    colliding.days[0].meals[0].batch_link = PlannedBatchLink(
+        batch_id="provider-token",
+        role=BatchMealRole.PREPARATION,
+    )
+    generated_id = f"batch-{UUID('12345678-1234-5678-1234-567812345678').hex}"
+    available = make_batch_ledger_entry(
+        batch_id=generated_id,
+        state=BatchLedgerState.AVAILABLE,
+    )
+    mocker.patch(
+        "meal_planner.planner_handler.uuid4",
+        return_value=UUID("12345678-1234-5678-1234-567812345678"),
+    )
+
+    with pytest.raises(ValueError, match="application-owned"):
+        PlannerHandler._canonicalize_batch_ids(
+            colliding, available_batches=[available]
+        )
+
+
+def test_planner_uses_available_leftover_before_new_preparation(
+    mocker: Any,
+) -> None:
+    """An available matching batch is selected without creating a source."""
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.save_generated_draft.return_value = True
+    available = make_batch_ledger_entry(
+        state=BatchLedgerState.AVAILABLE,
+    ).model_copy(update={"total_portions": 3, "remaining_portions": 1})
+    repo.get_available_batch_portions.return_value = [available]
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    week = date(2026, 8, 20)
+    payload = _complete_plan_payload(week)
+    payload["days"] = payload["days"][:1]
+    payload["days"][0]["meals"][1]["name"] = "Chicken leftover lunch"
+    payload["days"][0]["meals"][1]["ingredients"] = [{"item": "chicken"}]
+    payload["days"][0]["meals"][1]["batch_link"] = {
+        "batch_id": available.batch_id,
+        "role": BatchMealRole.LEFTOVER.value,
+        "source_date": available.preparation_date.isoformat(),
+        "source_meal_type": available.preparation_meal_type.value,
+        "portion": 3,
+    }
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user", 1, week_start=week, plan_days=1
+    )
+
+    repo.get_available_batch_portions.assert_called_once_with(
+        "user", date(2026, 8, 20), meal_type=MealType.LUNCH
+    )
+    assert repo.save_generated_draft.call_args.kwargs["batch_entries"] == []
+
+
+def test_generation_repairs_skipped_available_portion_before_publication(
+    mocker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A skipped inventory portion is repaired before any durable write."""
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    available = make_batch_ledger_entry(
+        state=BatchLedgerState.AVAILABLE,
+    ).model_copy(update={"total_portions": 3, "remaining_portions": 2})
+    repo.get_available_batch_portions.return_value = [available]
+    repo.save_generated_draft.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    week = date(2026, 8, 20)
+
+    skipped = _complete_plan_payload(week)
+    skipped["days"] = skipped["days"][:1]
+    skipped["days"][0]["meals"][1].update(
+        {
+            "name": "Chicken leftover lunch",
+            "ingredients": [{"item": "chicken"}],
+            "batch_link": {
+                "batch_id": available.batch_id,
+                "role": BatchMealRole.LEFTOVER.value,
+                "source_date": available.preparation_date.isoformat(),
+                "source_meal_type": available.preparation_meal_type.value,
+                "portion": 3,
+            },
+        }
+    )
+    repaired = _complete_plan_payload(week)
+    repaired["days"] = repaired["days"][:1]
+    repaired["days"][0]["meals"][1].update(
+        {
+            "name": "Chicken leftover lunch",
+            "ingredients": [{"item": "chicken"}],
+            "batch_link": {
+                "batch_id": available.batch_id,
+                "role": BatchMealRole.LEFTOVER.value,
+                "source_date": available.preparation_date.isoformat(),
+                "source_meal_type": available.preparation_meal_type.value,
+                "portion": 2,
+            },
+        }
+    )
+    llm.chat_json_sync.side_effect = [skipped, repaired]
+    state = _plan_request_state(week)
+    repo.get_conversation_state.return_value = state
+    lambda_client = mocker.MagicMock()
+    lambda_client.invoke.return_value = {"StatusCode": 202}
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "meal-planner-planner")
+
+    handler = PlannerHandler(repo, api, llm, lambda_client=lambda_client)
+    handler.generate_plan(
+        "user",
+        1,
+        week_start=week,
+        plan_days=1,
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    repo.save_generated_draft_and_clear_conversation_state.assert_not_called()
+    api.send_plan.assert_not_called()
+    assert llm.chat_json_sync.call_count == 1
+    assert lambda_client.invoke.call_count == 1
+
+    handler.generate_plan(
+        "user",
+        1,
+        week_start=week,
+        plan_days=1,
+        attempt=2,
+        repair_feedback=(
+            "code=batch_noncanonical_ordinal_order location=days[0].meals.lunch"
+        ),
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    repo.save_generated_draft_and_clear_conversation_state.assert_called_once()
+    api.send_plan.assert_called_once()
+    assert llm.chat_json_sync.call_count == 2
+    saved = (
+        repo.save_generated_draft_and_clear_conversation_state.call_args.args[1]
+    )
+    assert saved.days[0].meals[1].batch_link.portion == 2
+
+
+def test_generation_context_carries_obligations_unchanged_to_repair(
+    mocker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repair event receives the exact application-owned snapshot."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 26)
+    state = _plan_request_state(week)
+    obligation = DietaryObligation(
+        id="rule-1-2026-W35-2026-08-26",
+        source_rule_id="rule-1",
+        iso_week="2026-W35",
+        horizon_start=week,
+        horizon_end=week,
+        eligible_dates=[week],
+        operator="at_least",
+        count=1,
+        foods_any_of=["egg"],
+        meal_type="breakfast",
+        evidence_ids=["submitted-1"],
+    )
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_latest_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_conversation_state.return_value = state
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    invalid = _complete_plan_payload(week)
+    invalid["days"] = invalid["days"][:1]
+    llm.chat_json_sync.return_value = invalid
+    lambda_client = mocker.MagicMock()
+    lambda_client.invoke.return_value = {"StatusCode": 202}
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "planner-function")
+
+    PlannerHandler(
+        repo,
+        api,
+        llm,
+        lambda_client=lambda_client,
+    ).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        plan_days=3,
+        obligations=[obligation],
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    event = json.loads(lambda_client.invoke.call_args.kwargs["Payload"])
+    assert event["obligations"] == [obligation.model_dump(mode="json")]
+
+
+def test_generation_event_rejects_malformed_obligation_snapshot(
+    mocker: Any,
+) -> None:
+    """Malformed obligation payloads are rejected before generation."""
+    handler = PlannerHandler(
+        mocker.MagicMock(), mocker.MagicMock(), mocker.MagicMock()
+    )
+
+    accepted = handler.handle_event(
+        {
+            "action": "generate_plan",
+            "user_id": "user",
+            "chat_id": 1,
+            "week_start": "2026-08-26",
+            "plan_days": 1,
+            "obligations": [{"id": "bad"}],
+        }
+    )
+
+    assert not accepted
+
+
+def test_generation_enforces_batch_rule_before_repair_or_publication(
+    mocker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An invalid batch candidate queues bounded repair without saving."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    state = _plan_request_state(week)
+    batch_rule = _confirmed_batch_rule()
+    repo.get_profile.return_value = make_profile().model_copy(
+        update={"batch_rules": [batch_rule]}
+    )
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.get_conversation_state.return_value = state
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = _batch_rule_plan_payload(
+        week, complete=False
+    )
+    lambda_client = mocker.MagicMock()
+    lambda_client.invoke.return_value = {"StatusCode": 202}
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "meal-planner-planner")
+
+    PlannerHandler(repo, api, llm, lambda_client=lambda_client).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        batch_rules=[batch_rule],
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    repo.save_generated_draft_and_clear_conversation_state.assert_not_called()
+    api.send_plan.assert_not_called()
+    repair_event = json.loads(lambda_client.invoke.call_args.kwargs["Payload"])
+    assert repair_event["batch_rules"] == [batch_rule.model_dump(mode="json")]
+    assert "code=batch_rule_missing_leftover" in repair_event["repair_feedback"]
+    assert "provider-chicken" not in repair_event["repair_feedback"]
+    assert batch_rule.source_text not in repair_event["repair_feedback"]
+
+
+def test_generation_publishes_only_a_compliant_repaired_batch_plan(
+    mocker: Any,
+) -> None:
+    """A second attempt publishes only after the typed rule is satisfied."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    state = _plan_request_state(week)
+    batch_rule = _confirmed_batch_rule()
+    repo.get_profile.return_value = make_profile().model_copy(
+        update={"batch_rules": [batch_rule]}
+    )
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.get_conversation_state.return_value = state
+    repo.save_generated_draft_and_clear_conversation_state.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = _batch_rule_plan_payload(
+        week, complete=True
+    )
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        batch_rules=[batch_rule],
+        attempt=2,
+        repair_feedback="code=batch_rule_missing_leftover location=rules",
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    repo.save_generated_draft_and_clear_conversation_state.assert_called_once()
+    api.send_plan.assert_called_once()
+
+
+def test_generation_rejects_reversed_batch_ordinals_before_publication(
+    mocker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reversed candidate cannot reserve or publish a batch plan."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    state = _plan_request_state(week)
+    batch_rule = _confirmed_batch_rule()
+    repo.get_profile.return_value = make_profile().model_copy(
+        update={"batch_rules": [batch_rule]}
+    )
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.get_conversation_state.return_value = state
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = _batch_rule_plan_payload(
+        week, complete=True, reversed_ordinals=True
+    )
+    lambda_client = mocker.MagicMock()
+    lambda_client.invoke.return_value = {"StatusCode": 202}
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "meal-planner-planner")
+
+    PlannerHandler(repo, api, llm, lambda_client=lambda_client).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        batch_rules=[batch_rule],
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    repo.save_generated_draft_and_clear_conversation_state.assert_not_called()
+    api.send_plan.assert_not_called()
+    repair_event = json.loads(lambda_client.invoke.call_args.kwargs["Payload"])
+    assert (
+        "batch_rule_wrong_leftover_ordinal" in repair_event["repair_feedback"]
+    )
+    assert len(repair_event["repair_feedback"]) <= 800
+    assert "provider-chicken" not in repair_event["repair_feedback"]
+
+
+def test_noncompliant_batch_repair_is_terminal_without_publication(
+    mocker: Any,
+) -> None:
+    """A second invalid batch attempt cannot queue or publish another plan."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 10)
+    state = _plan_request_state(week)
+    batch_rule = _confirmed_batch_rule()
+    repo.get_profile.return_value = make_profile().model_copy(
+        update={"batch_rules": [batch_rule]}
+    )
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.get_conversation_state.return_value = state
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = _batch_rule_plan_payload(
+        week, complete=False
+    )
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        batch_rules=[batch_rule],
+        attempt=2,
+        repair_feedback="code=batch_rule_missing_leftover location=rules",
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    repo.save_generated_draft_and_clear_conversation_state.assert_not_called()
+    repo.mark_conversation_retry_ready.assert_called_once()
+    api.send_plan.assert_not_called()
+
+
+def test_revision_enforces_profile_batch_rule_before_replacement(
+    mocker: Any,
+) -> None:
+    """A noncompliant revision keeps the current plan and reservation."""
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    batch_rule = _confirmed_batch_rule()
+    repo.get_profile.return_value = make_profile().model_copy(
+        update={"batch_rules": [batch_rule]}
+    )
+    repo.get_plan.return_value = make_plan(week_start=week, revision=4)
+    repo.get_conversation_state.return_value = state
+    repo.get_available_batch_portions.return_value = []
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = _batch_rule_plan_payload(
+        week, complete=False
+    )
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment=state.amendment or "",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    repo.replace_draft_and_clear_revision_state.assert_not_called()
+    api.send_plan.assert_not_called()
+    assert batch_rule.source_text in llm.chat_json_sync.call_args.args[0]
+
+
+def test_revision_rejects_reversed_batch_ordinals_before_replacement(
+    mocker: Any,
+) -> None:
+    """A reversed revision leaves its current draft and reservation intact."""
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    batch_rule = _confirmed_batch_rule()
+    repo.get_profile.return_value = make_profile().model_copy(
+        update={"batch_rules": [batch_rule]}
+    )
+    repo.get_plan.return_value = make_plan(week_start=week, revision=4)
+    repo.get_conversation_state.return_value = state
+    repo.get_available_batch_portions.return_value = []
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = _batch_rule_plan_payload(
+        week, complete=True, reversed_ordinals=True
+    )
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment=state.amendment or "",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    repo.replace_draft_and_clear_revision_state.assert_not_called()
+    api.send_plan.assert_not_called()
+
+
+def test_revision_publishes_compliant_profile_batch_rule_replacement(
+    mocker: Any,
+) -> None:
+    """A compliant revision retains the exact typed rule snapshot."""
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    batch_rule = _confirmed_batch_rule()
+    repo.get_profile.return_value = make_profile().model_copy(
+        update={"batch_rules": [batch_rule]}
+    )
+    repo.get_plan.return_value = make_plan(week_start=week, revision=4)
+    repo.get_conversation_state.return_value = state
+    repo.get_available_batch_portions.return_value = []
+    repo.replace_draft_and_clear_revision_state.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = _batch_rule_plan_payload(
+        week, complete=True
+    )
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment=state.amendment or "",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    repo.replace_draft_and_clear_revision_state.assert_called_once()
+    api.send_plan.assert_called_once()
+
+
+def test_revision_normalizes_retained_yield_before_rule_validation(
+    mocker: Any,
+) -> None:
+    """An omitted retained yield does not consume the bounded repair."""
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    batch_rule = _confirmed_batch_rule()
+    batch_id = "existing-application-batch"
+    profile = make_profile().model_copy(update={"batch_rules": [batch_rule]})
+    current = make_plan(week_start=week, revision=4)
+    current.days[0].meals[0].meal_type = MealType.DINNER
+    current.days[0].meals[0].batch_link = PlannedBatchLink(
+        batch_id=batch_id,
+        role=BatchMealRole.PREPARATION,
+        total_yield=3,
+    )
+    for day, meal_type, portion in (
+        (1, MealType.LUNCH, 2),
+        (2, MealType.DINNER, 3),
+    ):
+        current.days[day].meals[0].meal_type = meal_type
+        current.days[day].meals[0].batch_link = PlannedBatchLink(
+            batch_id=batch_id,
+            role=BatchMealRole.LEFTOVER,
+            source_date=week,
+            source_meal_type=MealType.DINNER,
+            portion=portion,
+        )
+    repo.get_profile.return_value = profile
+    repo.get_plan.return_value = current
+    repo.get_conversation_state.return_value = state
+    repo.get_available_batch_portions.return_value = []
+    repo.replace_draft_and_clear_revision_state.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = _batch_rule_plan_payload(week, complete=True)
+    for plan_day in payload["days"]:
+        for meal in plan_day["meals"]:
+            batch_link = meal.get("batch_link")
+            if batch_link is not None:
+                batch_link["batch_id"] = batch_id
+    del payload["days"][0]["meals"][2]["batch_link"]["total_yield"]
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment=state.amendment or "",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    llm.chat_json_sync.assert_called_once()
+    replacement = repo.replace_draft_and_clear_revision_state.call_args.args[1]
+    assert replacement.days[0].meals[2].batch_link.total_yield == 3
+    assert (
+        "Repair the previous response"
+        not in (llm.chat_json_sync.call_args.args[1])
+    )
+    assert api.send_plan.call_count == 1
+
+
+@pytest.mark.parametrize("case", ["new_missing", "retained_changed"])
+def test_revision_yield_normalization_rejects_invalid_preparations(
+    mocker: Any, case: str
+) -> None:
+    """Invalid new or retained preparation yields stay bounded and private."""
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    batch_rule = _confirmed_batch_rule()
+    batch_id = "existing-application-batch"
+    profile = make_profile().model_copy(update={"batch_rules": [batch_rule]})
+    current = make_plan(week_start=week, revision=4)
+    if case == "retained_changed":
+        current.days[0].meals[0].batch_link = PlannedBatchLink(
+            batch_id=batch_id,
+            role=BatchMealRole.PREPARATION,
+            total_yield=3,
+        )
+    repo.get_profile.return_value = profile
+    repo.get_plan.return_value = current
+    repo.get_conversation_state.return_value = state
+    repo.get_available_batch_portions.return_value = []
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = make_plan_payload(week)
+    payload["days"][0]["meals"][0]["batch_link"] = {
+        "batch_id": batch_id if case == "retained_changed" else "new-batch",
+        "role": BatchMealRole.PREPARATION.value,
+        "total_yield": 2 if case == "retained_changed" else None,
+    }
+    if case == "new_missing":
+        del payload["days"][0]["meals"][0]["batch_link"]["total_yield"]
+    llm.chat_json_sync.return_value = payload
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment=state.amendment or "",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    assert llm.chat_json_sync.call_count == 2
+    assert (
+        "code=batch_rule_wrong_yield"
+        in (llm.chat_json_sync.call_args_list[1].args[1])
+    )
+    assert (
+        "revision preparation yield"
+        not in (llm.chat_json_sync.call_args_list[1].args[1])
+    )
+    repo.replace_draft_and_clear_revision_state.assert_not_called()
+    api.send_plan.assert_not_called()
+
+
+def test_revision_repair_normalizes_against_immutable_revision_snapshots(
+    mocker: Any,
+) -> None:
+    """Both attempts use the current draft, rules, and inventory snapshots."""
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    batch_rule = _confirmed_batch_rule()
+    batch_id = "existing-application-batch"
+    profile = make_profile().model_copy(update={"batch_rules": [batch_rule]})
+    current = make_plan(week_start=week, revision=4)
+    current.days[0].meals[0].batch_link = PlannedBatchLink(
+        batch_id=batch_id,
+        role=BatchMealRole.PREPARATION,
+        total_yield=3,
+    )
+    available = make_batch_ledger_entry(
+        batch_id="unrelated-available-batch", state=BatchLedgerState.AVAILABLE
+    )
+    repo.get_profile.return_value = profile
+    repo.get_plan.return_value = current
+    repo.get_conversation_state.return_value = state
+    repo.get_available_batch_portions.return_value = [available]
+    repo.replace_draft_and_clear_revision_state.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    invalid = make_plan_payload(week)
+    valid = _batch_rule_plan_payload(week, complete=True)
+    invalid["days"][0]["meals"][0]["batch_link"] = {
+        "batch_id": batch_id,
+        "role": BatchMealRole.PREPARATION.value,
+        "total_yield": 2,
+    }
+    for plan_day in valid["days"]:
+        for meal in plan_day["meals"]:
+            batch_link = meal.get("batch_link")
+            if batch_link is not None:
+                batch_link["batch_id"] = batch_id
+    del valid["days"][0]["meals"][2]["batch_link"]["total_yield"]
+    provider_messages: list[str] = []
+
+    def provider_response(prompt: str, user_message: str) -> dict[str, Any]:
+        del prompt
+        provider_messages.append(user_message)
+        if len(provider_messages) == 1:
+            current.days[0].meals[0].batch_link.total_yield = 2
+            profile.batch_rules[0].total_yield = 2
+            available.remaining_portions = 0
+            return invalid
+        return valid
+
+    llm.chat_json_sync.side_effect = provider_response
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment=state.amendment or "",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    assert len(provider_messages) == 2
+    assert "code=batch_rule_wrong_yield" in provider_messages[1]
+    replacement = repo.replace_draft_and_clear_revision_state.call_args.args[1]
+    assert replacement.days[0].meals[2].batch_link.total_yield == 3
+    assert repo.replace_draft_and_clear_revision_state.call_count == 1
+
+
+def test_revision_repairs_batch_rule_violation_using_snapshotted_rule(
+    mocker: Any,
+) -> None:
+    """A rule-invalid revision gets one repair before publication."""
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    batch_rule = _confirmed_batch_rule()
+    profile = make_profile().model_copy(update={"batch_rules": [batch_rule]})
+    current = make_plan(week_start=week, revision=4)
+    repo.get_profile.return_value = profile
+    repo.get_plan.return_value = current
+    repo.get_conversation_state.return_value = state
+    repo.get_available_batch_portions.return_value = []
+    repo.replace_draft_and_clear_revision_state.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    invalid = _batch_rule_plan_payload(week, complete=False)
+    compliant = _batch_rule_plan_payload(week, complete=True)
+    provider_messages: list[str] = []
+
+    def provider_response(prompt: str, user_message: str) -> dict[str, Any]:
+        del prompt
+        provider_messages.append(user_message)
+        assert not repo.replace_draft_and_clear_revision_state.called
+        assert not repo.mark_conversation_retry_ready.called
+        if len(provider_messages) == 1:
+            profile.batch_rules[0].foods_any_of[0] = "fish"
+            return invalid
+        return compliant
+
+    llm.chat_json_sync.side_effect = provider_response
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment=state.amendment or "",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    assert llm.chat_json_sync.call_count == 2
+    assert "code=batch_rule_missing_leftover" in provider_messages[1]
+    repo.replace_draft_and_clear_revision_state.assert_called_once()
+    api.send_plan.assert_called_once()
+    assert api.send_message.call_count == 1
+
+
+def test_revision_invalid_batch_rule_candidate_has_one_repair_bound(
+    mocker: Any,
+) -> None:
+    """A second rule-invalid revision preserves the current draft."""
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    batch_rule = _confirmed_batch_rule()
+    profile = make_profile().model_copy(update={"batch_rules": [batch_rule]})
+    repo.get_profile.return_value = profile
+    repo.get_plan.return_value = make_plan(week_start=week, revision=4)
+    repo.get_conversation_state.return_value = state
+    repo.get_available_batch_portions.return_value = []
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    invalid = _batch_rule_plan_payload(week, complete=False)
+    mutated_rule_candidate = _batch_rule_plan_payload(week, complete=False)
+    mutated_rule_candidate["days"][0]["meals"][2]["batch_link"][
+        "total_yield"
+    ] = 2
+    provider_messages: list[str] = []
+
+    def provider_response(prompt: str, user_message: str) -> dict[str, Any]:
+        del prompt
+        provider_messages.append(user_message)
+        assert not repo.replace_draft_and_clear_revision_state.called
+        assert not repo.mark_conversation_retry_ready.called
+        if len(provider_messages) == 1:
+            profile.batch_rules[0].total_yield = 2
+            return invalid
+        return mutated_rule_candidate
+
+    llm.chat_json_sync.side_effect = provider_response
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment=state.amendment or "",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    assert llm.chat_json_sync.call_count == 2
+    assert "code=batch_rule_missing_leftover" in provider_messages[1]
+    repo.replace_draft_and_clear_revision_state.assert_not_called()
+    repo.mark_conversation_retry_ready.assert_called_once()
+    api.send_plan.assert_not_called()
+    assert api.send_message.call_count == 1
+
+
+def test_revision_without_confirmed_batch_rules_keeps_one_provider_call(
+    mocker: Any,
+) -> None:
+    """Revisions without batch rules retain their existing call count."""
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(week_start=week, revision=4)
+    repo.get_conversation_state.return_value = state
+    repo.get_available_batch_portions.return_value = []
+    repo.replace_draft_and_clear_revision_state.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = _revision_payload(week, 7)
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment=state.amendment or "",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    llm.chat_json_sync.assert_called_once()
+    repo.replace_draft_and_clear_revision_state.assert_called_once()
+    api.send_plan.assert_called_once()
 
 
 def test_generate_plan_saves_compliant_draft_once_with_evidence_summary(
@@ -1252,6 +2655,31 @@ def test_validation_feedback_preserves_exact_meal_slot(
     assert "code=missing_meal_type" in feedback
 
 
+def test_batch_feedback_is_bounded_and_application_owned() -> None:
+    """Batch repair feedback contains codes and safe ownership metadata only."""
+    issue = ValidationIssue(
+        code="batch_unavailable_portion",
+        message="The provider returned private meal ingredients.",
+        day=2,
+        meal_type=MealType.LUNCH,
+        batch_id="batch-chicken",
+        batch_role=BatchMealRole.LEFTOVER,
+    )
+    validation = PlanValidationResult(
+        valid=False,
+        requirements=(),
+        issues=(issue,),
+    )
+
+    feedback = PlannerHandler._validation_feedback(validation)
+
+    assert feedback == (
+        "code=batch_unavailable_portion location=days[1].meals.lunch "
+        "role=leftover"
+    )
+    assert issue.message not in feedback
+
+
 def test_empty_day_repair_feedback_preserves_required_slots(
     mocker: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2251,6 +3679,87 @@ def test_default_repair_client_has_bounded_botocore_policy(
     }
 
 
+def test_generation_prompt_and_repair_retain_the_same_obligation_snapshot(
+    mocker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repair transport carries exact dates and ownership unchanged."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 17)
+    state = _plan_request_state(week)
+    saved_obligation = _dated_obligation(week, target_day=3)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    repo.get_conversation_state.return_value = state
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    invalid_payload = _complete_plan_payload(week)
+    invalid_payload["days"] = invalid_payload["days"][:3]
+    llm.chat_json_sync.return_value = invalid_payload
+    lambda_client = mocker.MagicMock()
+    lambda_client.invoke.return_value = {"StatusCode": 202}
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "planner-function")
+
+    PlannerHandler(
+        repo,
+        api,
+        llm,
+        lambda_client=lambda_client,
+    ).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        plan_days=3,
+        obligations=[saved_obligation],
+        request_id=state.request_id,
+        state_revision=state.revision,
+    )
+
+    prompt = llm.chat_json_sync.call_args.args[0]
+    assert saved_obligation.id in prompt
+    assert "2026-08-19" in prompt
+    repair_event = json.loads(lambda_client.invoke.call_args.kwargs["Payload"])
+    assert repair_event["obligations"] == [
+        saved_obligation.model_dump(mode="json")
+    ]
+    assert (
+        f"obligation={saved_obligation.id}" in repair_event["repair_feedback"]
+    )
+    assert "date=2026-08-19" in repair_event["repair_feedback"]
+    assert repo.save_generated_draft.call_count == 0
+
+
+def test_terminal_noncompliant_obligation_attempt_cannot_publish(
+    mocker: Any,
+) -> None:
+    """A failed second attempt never saves or delivers a non-compliant plan."""
+    repo = mocker.MagicMock()
+    week = date(2026, 8, 17)
+    obligation_snapshot = _dated_obligation(week, target_day=3)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.chat_json_sync.return_value = _complete_plan_payload(week)
+
+    PlannerHandler(repo, api, llm).generate_plan(
+        "user",
+        1,
+        week_start=week,
+        plan_days=3,
+        obligations=[obligation_snapshot],
+        attempt=2,
+        repair_feedback="code=obligation_missing location=dates",
+        repair_id="repair-1",
+    )
+
+    repo.save_generated_draft.assert_not_called()
+    api.send_plan.assert_not_called()
+
+
 def test_repair_ownership_failure_logs_operation_elapsed_time(
     mocker: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -2796,6 +4305,239 @@ def test_revise_plan_publishes_normalized_replacement_before_delivery(
     repo.replace_draft_and_clear_revision_state.assert_called_once()
     assert api.send_plan.call_count == 1
     assert "revised draft" in api.send_message.call_args.args[1]
+
+
+def test_revise_plan_canonicalizes_new_preparation_before_reservation(
+    mocker: Any,
+) -> None:
+    """Revised provider preparations use the same owned-ID boundary."""
+    repo = mocker.MagicMock()
+    week = date.today()
+    current = make_plan(week_start=week, revision=4)
+    state = _revision_state(week)
+    provider_batch_id = "revision-provider-batch"
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = current
+    repo.get_conversation_state.return_value = state
+    repo.get_available_batch_portions.return_value = []
+    repo.replace_draft_and_clear_revision_state.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = make_plan_payload(week)
+    payload["days"][0]["meals"][0]["batch_link"] = {
+        "batch_id": provider_batch_id,
+        "role": BatchMealRole.PREPARATION.value,
+        "total_yield": 3,
+    }
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment="Avoid cauliflower",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    replacement = repo.replace_draft_and_clear_revision_state.call_args.args[1]
+    entries = repo.replace_draft_and_clear_revision_state.call_args.kwargs[
+        "batch_entries"
+    ]
+    assert replacement.days[0].meals[0].batch_link.batch_id != provider_batch_id
+    assert entries[0].batch_id != provider_batch_id
+    assert (
+        entries[0].batch_id == replacement.days[0].meals[0].batch_link.batch_id
+    )
+
+
+def test_revise_plan_preserves_three_meal_preparation_yield(
+    mocker: Any,
+) -> None:
+    """A retained three-meal source keeps both future portions."""
+    repo = mocker.MagicMock()
+    week = date.today()
+    batch_id = "existing-application-batch"
+    current = make_plan(week_start=week, revision=4)
+    current.days[0].meals[0].batch_link = PlannedBatchLink(
+        batch_id=batch_id,
+        role=BatchMealRole.PREPARATION,
+        total_yield=3,
+    )
+    state = _revision_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = current
+    repo.get_conversation_state.return_value = state
+    repo.get_available_batch_portions.return_value = []
+    repo.replace_draft_and_clear_revision_state.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = make_plan_payload(week)
+    payload["days"][0]["meals"][0]["batch_link"] = {
+        "batch_id": batch_id,
+        "role": BatchMealRole.PREPARATION.value,
+    }
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment="Avoid cauliflower",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    entries = repo.replace_draft_and_clear_revision_state.call_args.kwargs[
+        "batch_entries"
+    ]
+    assert entries[0].total_portions == 3
+    assert entries[0].remaining_portions == 2
+
+
+@pytest.mark.parametrize(
+    "batch_link",
+    [
+        {"batch_id": "new-batch", "role": "preparation"},
+        {
+            "batch_id": "new-batch",
+            "role": "preparation",
+            "total_yield": 4,
+        },
+    ],
+)
+def test_revision_rejects_missing_or_out_of_bounds_new_yield(
+    mocker: Any, batch_link: dict[str, object]
+) -> None:
+    """Invalid new preparation yields cannot reach publication."""
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(week_start=week, revision=4)
+    repo.get_conversation_state.return_value = state
+    repo.get_available_batch_portions.return_value = []
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = make_plan_payload(week)
+    payload["days"][0]["meals"][0]["batch_link"] = batch_link
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment=state.amendment or "",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    repo.replace_draft_and_clear_revision_state.assert_not_called()
+    api.send_plan.assert_not_called()
+
+
+def test_revision_rejects_yield_mismatch_with_linked_leftovers(
+    mocker: Any,
+) -> None:
+    """A leftover beyond the declared revised yield is rejected."""
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(week_start=week, revision=4)
+    repo.get_conversation_state.return_value = state
+    repo.get_available_batch_portions.return_value = []
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = make_plan_payload(week)
+    payload["days"][0]["meals"][0]["batch_link"] = {
+        "batch_id": "new-batch",
+        "role": BatchMealRole.PREPARATION.value,
+        "total_yield": 2,
+    }
+    payload["days"][1]["meals"][0]["batch_link"] = {
+        "batch_id": "new-batch",
+        "role": BatchMealRole.LEFTOVER.value,
+        "source_date": week.isoformat(),
+        "source_meal_type": MealType.LUNCH.value,
+        "portion": 3,
+    }
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment=state.amendment or "",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    repo.replace_draft_and_clear_revision_state.assert_not_called()
+    api.send_plan.assert_not_called()
+
+
+def test_revision_rejects_changed_available_batch_metadata(
+    mocker: Any,
+) -> None:
+    """A revision cannot alter trusted available inventory metadata."""
+    repo = mocker.MagicMock()
+    week = date.today()
+    state = _revision_state(week)
+    available = make_batch_ledger_entry(
+        batch_id="available-batch", state=BatchLedgerState.AVAILABLE
+    ).model_copy(
+        update={
+            "preparation_date": week - timedelta(days=1),
+            "preparation_meal_type": MealType.LUNCH,
+            "week_end": week + timedelta(days=6 - week.weekday()),
+        }
+    )
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = make_plan(week_start=week, revision=4)
+    repo.get_conversation_state.return_value = state
+    repo.get_available_batch_portions.return_value = [available]
+    repo.mark_conversation_retry_ready.return_value = True
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    payload = make_plan_payload(week)
+    payload["days"][1]["meals"][0]["batch_link"] = {
+        "batch_id": available.batch_id,
+        "role": BatchMealRole.LEFTOVER.value,
+        "source_date": week.isoformat(),
+        "source_meal_type": available.preparation_meal_type.value,
+        "portion": 2,
+    }
+    llm.chat_json_sync.return_value = payload
+
+    PlannerHandler(repo, api, llm).revise_plan(
+        "user",
+        1,
+        PlanRevisionContext(
+            amendment=state.amendment or "",
+            request_id=state.request_id or "",
+            state_revision=state.revision,
+            expected_plan_revision=state.expected_plan_revision or 0,
+            week_start=week,
+        ),
+    )
+
+    repo.replace_draft_and_clear_revision_state.assert_not_called()
+    api.send_plan.assert_not_called()
 
 
 @pytest.mark.parametrize("plan_days", [1, 3])
@@ -3492,6 +5234,48 @@ def test_planner_failure_log_contains_only_operational_context(
     assert "user 7" not in caplog.text
 
 
+def test_provider_failure_log_excludes_all_user_and_meal_payload_fields(
+    mocker: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Provider failures log only bounded reason and model metadata."""
+    repo = mocker.MagicMock()
+    repo.get_profile.return_value = make_profile()
+    repo.get_plan.return_value = None
+    repo.get_meal_history.return_value = []
+    repo.get_latest_plan.return_value = None
+    api = mocker.MagicMock()
+    llm = mocker.MagicMock()
+    llm.model = "planner-model"
+    secrets = (
+        "provider output",
+        "meal description",
+        "secret foods",
+        "source text",
+        "batch-id-secret",
+        "raw payload",
+    )
+    llm.chat_json_sync.side_effect = LLMTimeoutError(" / ".join(secrets))
+
+    with caplog.at_level(
+        logging.WARNING, logger="meal_planner.planner_handler"
+    ):
+        PlannerHandler(repo, api, llm).generate_plan(
+            "private-user",
+            123,
+            week_start=date(2026, 8, 10),
+            preference="private source text",
+        )
+
+    assert all(secret not in caplog.text for secret in secrets)
+    record = next(
+        record
+        for record in caplog.records
+        if record.message.startswith("Planner LLM attempt failed")
+    )
+    assert record.category == "timeout"
+    assert record.model == "planner-model"
+
+
 @pytest.mark.parametrize(
     ("model", "expected"),
     [
@@ -3589,6 +5373,37 @@ def test_planner_success_does_not_emit_failure_log(
         record.message.startswith("Planner LLM attempt failed")
         for record in caplog.records
     )
+
+
+def test_available_batches_are_loaded_from_each_week_of_a_spanning_horizon(
+    mocker: Any,
+) -> None:
+    """A Sunday-to-Saturday horizon reads each ISO-week ledger once."""
+    repo = mocker.MagicMock()
+    first = make_batch_ledger_entry(batch_id="week-32").model_copy(
+        update={
+            "preparation_date": date(2026, 8, 9),
+            "week_end": date(2026, 8, 9),
+        }
+    )
+    second = make_batch_ledger_entry(batch_id="week-33").model_copy(
+        update={
+            "preparation_date": date(2026, 8, 10),
+            "week_end": date(2026, 8, 16),
+        }
+    )
+    repo.get_available_batch_portions.side_effect = [[first], [second]]
+    handler = PlannerHandler(repo, mocker.MagicMock())
+
+    batches = handler._load_available_batches_for_horizon(
+        "user", date(2026, 8, 9), 7
+    )
+
+    assert batches == [first, second]
+    assert repo.get_available_batch_portions.call_args_list == [
+        mocker.call("user", date(2026, 8, 9), meal_type=MealType.LUNCH),
+        mocker.call("user", date(2026, 8, 10), meal_type=MealType.LUNCH),
+    ]
 
 
 def test_planner_rejects_non_positive_attempt_limit(mocker: Any) -> None:
@@ -3892,6 +5707,7 @@ def test_handle_event_forwards_requirements_and_repair_metadata(
         "current_rules": [],
         "effective_rules": [],
         "constraint_rules": [],
+        "obligations": [],
         "attempt": 2,
         "repair_feedback": "r1 matched 2; expected exactly 3",
         "request_id": None,

@@ -4,12 +4,15 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Union, cast
+from typing import Any, Literal, Optional, Union
 
 from pydantic import ValidationError
 
+from meal_planner.dietary_rules import canonicalize_interpretation_rules
 from meal_planner.models.schemas import (
     MAX_PLAN_REQUIREMENTS,
+    BatchLedgerEntry,
+    BatchRule,
     ConstraintEntry,
     ConversationIntent,
     DietaryRule,
@@ -22,6 +25,7 @@ from meal_planner.models.schemas import (
     WeeklyPlan,
 )
 from meal_planner.normalization import normalize_food
+from meal_planner.preferences import validate_batch_links
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +33,11 @@ InterpretationMode = Literal[
     "constraint", "stored_preference", "current_plan_preference"
 ]
 PreferenceValidationReason = Literal["food", "count", "scope", "schema"]
-InterpretationRule = DietaryRule | ConstraintEntry
-PreferenceInterpretation = tuple[list[InterpretationRule], str | None]
+
+InterpretationRule = DietaryRule | BatchRule | ConstraintEntry
+# Keep the additive batch-rule result compatible with the legacy no-mode
+# caller while validating every runtime value as ``InterpretationRule``.
+PreferenceInterpretation = tuple[list[Any], str | None]
 PreferenceSignature = tuple[
     MealType | None, frozenset[tuple[str, ...]], frozenset[Weekday]
 ]
@@ -73,6 +80,40 @@ _COMPACT_FREQUENCY_PATTERN = re.compile(
     rf"|\s+(?:a|each|per)\s+{_FREQUENCY_PERIOD}"
     rf")(?![\w-])"
 )
+_UNSUPPORTED_SUBJECTIVE_PATTERN = re.compile(
+    r"\b(?:healthy|fun|cozy|interesting|creative|exciting)\b",
+    re.IGNORECASE,
+)
+_REQUIREMENT_KEYS = {
+    "id",
+    "source_text",
+    "foods_any_of",
+    "meal_type",
+    "weekdays",
+    "target_weekdays",
+    "generated_weekdays",
+    "cadence",
+    "period",
+    "schedule_kind",
+    "schedule_source",
+    "operator",
+    "count",
+    "exact_count",
+    "strength",
+}
+_BATCH_RULE_KEYS = {
+    "id",
+    "source_text",
+    "foods_any_of",
+    "preparation_meal_types",
+    "eligible_preparation_meal_types",
+    "reuse_meal_types",
+    "eligible_reuse_meal_types",
+    "total_yield",
+    "total_portions",
+    "yield",
+}
+_EXCLUSION_KEYS = {"id", "source_text", "forbidden_terms", "uninterpretable"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,33 +283,14 @@ def parse_conversational_response(
 
 def parse_plan_response(
     raw_text_or_dict: Union[str, dict[str, Any]],
+    *,
+    available_batches: list[BatchLedgerEntry] | None = None,
 ) -> Optional[WeeklyPlan]:
     """Parse raw text or dict into a WeeklyPlan model."""
-    if isinstance(raw_text_or_dict, dict):
-        try:
-            return WeeklyPlan.model_validate(raw_text_or_dict)
-        except ValidationError as exc:
-            del exc
-            logger.warning("Plan response failed schema validation")
-            return None
-
-    if not raw_text_or_dict or not raw_text_or_dict.strip():
-        return None
-
-    _, json_dict = _extract_json_block(raw_text_or_dict)
-    if not json_dict:
-        try:
-            json_dict = json.loads(raw_text_or_dict.strip())
-        except json.JSONDecodeError:
-            logger.warning("Could not find or parse JSON in plan response")
-            return None
-
-    try:
-        return WeeklyPlan.model_validate(json_dict)
-    except ValidationError as exc:
-        del exc
-        logger.warning("Plan response failed schema validation")
-        return None
+    plan, _feedback = parse_plan_response_with_metadata(
+        raw_text_or_dict, available_batches=available_batches
+    )
+    return plan
 
 
 def _normalise_weekdays(value: object) -> object:
@@ -377,6 +399,11 @@ def _has_ambiguous_operator_wording(source_text: str) -> bool:
     return len(operators) > 1
 
 
+def _has_unsupported_subjective_wording(source_text: str) -> bool:
+    """Return whether a clause needs clarification rather than a guess."""
+    return bool(_UNSUPPORTED_SUBJECTIVE_PATTERN.search(source_text))
+
+
 def _prepare_rule_payload(raw_rule: dict[str, Any]) -> dict[str, Any]:
     """Adapt legacy and wording-derived fields to :class:`DietaryRule`."""
     payload = dict(raw_rule)
@@ -445,18 +472,28 @@ def _rules_conflict(left: DietaryRule, right: DietaryRule) -> bool:
 def _parse_interpretation_data(
     raw_text_or_dict: Union[str, dict[str, Any]],
 ) -> Any:
-    """Decode provider JSON and return ``None`` for malformed input."""
+    """Decode only a JSON object with no surrounding provider prose."""
     if isinstance(raw_text_or_dict, dict):
         return raw_text_or_dict
-    if not raw_text_or_dict.strip():
+    text = raw_text_or_dict.strip()
+    if not text:
         return None
-    _, json_dict = _extract_json_block(raw_text_or_dict)
-    if json_dict is not None:
-        return json_dict
+
+    if text.startswith("```") and text.endswith("```"):
+        fenced = re.fullmatch(
+            r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL | re.IGNORECASE
+        )
+        if fenced is None:
+            return None
+        text = fenced.group(1).strip()
+    elif not (text.startswith("{") and text.endswith("}")):
+        return None
+
     try:
-        return json.loads(raw_text_or_dict.strip())
+        parsed = json.loads(text)
     except json.JSONDecodeError:
         return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def parse_preference_interpretation(
@@ -474,6 +511,19 @@ def parse_preference_interpretation(
     if not isinstance(data, dict):
         return _clarification_response(
             "The preference interpretation must be a JSON object."
+        )
+
+    allowed_keys = {
+        "mode",
+        "requirements",
+        "batch_rules",
+        "exclusions",
+        "clarification",
+        "unparsed_text",
+    }
+    if set(data).difference(allowed_keys):
+        return _clarification_response(
+            "The preference interpretation has unsupported fields."
         )
 
     declared_mode = data.get("mode")
@@ -511,20 +561,32 @@ def parse_preference_interpretation(
         )
 
     raw_requirements = data["requirements"]
+    raw_batch_rules = data.get("batch_rules", [])
     raw_exclusions = data.get("exclusions", [])
     if not isinstance(raw_requirements, list):
         return _clarification_response(
             "The interpretation requirements must be a list."
         )
+    if not isinstance(raw_batch_rules, list):
+        return _clarification_response(
+            "The interpretation batch_rules must be a list."
+        )
     if not isinstance(raw_exclusions, list):
         return _clarification_response(
             "The interpretation exclusions must be a list."
         )
-    if len(raw_requirements) + len(raw_exclusions) > MAX_PLAN_REQUIREMENTS:
+    if (
+        len(raw_requirements) + len(raw_batch_rules) + len(raw_exclusions)
+        > MAX_PLAN_REQUIREMENTS
+    ):
         return _clarification_response(_TOO_MANY_REQUIREMENTS_CLARIFICATION)
     if selected_mode == "constraint" and raw_requirements:
         return _clarification_response(
             "Constraint mode must return exclusions, not preference rules."
+        )
+    if selected_mode == "constraint" and raw_batch_rules:
+        return _clarification_response(
+            "Constraint mode must not return batch rules."
         )
     if selected_mode != "constraint" and raw_exclusions:
         return _clarification_response(
@@ -596,6 +658,19 @@ def parse_preference_interpretation(
                 return _clarification_response(
                     "One or more constraint exclusions are malformed."
                 )
+            if set(raw_exclusion).difference(_EXCLUSION_KEYS):
+                logger.warning(
+                    "Constraint exclusion failed schema validation "
+                    f"(interpretation_mode={selected_mode} "
+                    "reason_code=schema)",
+                    extra={
+                        "interpretation_mode": selected_mode,
+                        "reason_code": "schema",
+                    },
+                )
+                return _clarification_response(
+                    "One or more constraint exclusions are malformed."
+                )
             if exclusion.id in seen_exclusion_ids:
                 return _clarification_response(
                     f"The interpretation contains duplicate exclusion id: "
@@ -609,7 +684,7 @@ def parse_preference_interpretation(
             )
         return exclusions, None
 
-    if not raw_requirements:
+    if not raw_requirements and not raw_batch_rules:
         return _clarification_response(
             "Please provide a measurable meal preference."
         )
@@ -623,6 +698,11 @@ def parse_preference_interpretation(
             )
         source_text = raw_requirement.get("source_text")
         if isinstance(source_text, str):
+            if _has_unsupported_subjective_wording(source_text):
+                return _clarification_response(
+                    "Some preference wording is subjective; please name "
+                    "specific foods, counts, and meal scopes."
+                )
             if _is_best_effort_wording(source_text) and _has_strict_wording(
                 source_text
             ):
@@ -657,6 +737,18 @@ def parse_preference_interpretation(
             return _clarification_response(
                 "One or more preference requirements are malformed."
             )
+        if set(raw_requirement).difference(_REQUIREMENT_KEYS):
+            logger.warning(
+                "Preference requirement failed schema validation "
+                f"(interpretation_mode={selected_mode} reason_code=schema)",
+                extra={
+                    "interpretation_mode": selected_mode,
+                    "reason_code": "schema",
+                },
+            )
+            return _clarification_response(
+                "One or more preference requirements are malformed."
+            )
         if requirement.id in seen_ids:
             return _clarification_response(
                 f"The interpretation contains duplicate requirement id: "
@@ -666,8 +758,11 @@ def parse_preference_interpretation(
         requirements.append(requirement)
 
     for index, requirement in enumerate(requirements):
+        if not isinstance(requirement, DietaryRule):
+            continue
         if any(
-            _rules_conflict(requirement, other)
+            isinstance(other, DietaryRule)
+            and _rules_conflict(requirement, other)
             for other in requirements[index + 1 :]
         ):
             return _clarification_response(
@@ -675,19 +770,66 @@ def parse_preference_interpretation(
                 "desired counts for the same foods and scope."
             )
 
-    return cast(list[InterpretationRule], requirements), None
+    batch_rules: list[BatchRule] = []
+    seen_batch_ids: set[str] = set()
+    for raw_batch_rule in raw_batch_rules:
+        if not isinstance(raw_batch_rule, dict):
+            return _clarification_response("Each batch rule must be an object.")
+        try:
+            batch_rule = BatchRule.model_validate(raw_batch_rule)
+        except ValidationError:
+            logger.warning(
+                "Batch rule failed schema validation "
+                f"(interpretation_mode={selected_mode} reason_code=schema)",
+                extra={
+                    "interpretation_mode": selected_mode,
+                    "reason_code": "schema",
+                },
+            )
+            return _clarification_response(
+                "One or more batch rules are malformed."
+            )
+        if set(raw_batch_rule).difference(_BATCH_RULE_KEYS):
+            logger.warning(
+                "Batch rule failed schema validation "
+                f"(interpretation_mode={selected_mode} reason_code=schema)",
+                extra={
+                    "interpretation_mode": selected_mode,
+                    "reason_code": "schema",
+                },
+            )
+            return _clarification_response(
+                "One or more batch rules are malformed."
+            )
+        if batch_rule.id in seen_batch_ids:
+            return _clarification_response(
+                "The interpretation contains duplicate batch rule IDs."
+            )
+        seen_batch_ids.add(batch_rule.id)
+        batch_rules.append(batch_rule)
+
+    all_rules: list[DietaryRule | BatchRule] = requirements + batch_rules
+    return canonicalize_interpretation_rules(
+        all_rules, mode=selected_mode
+    ), None
 
 
 def parse_plan_response_with_feedback(
     raw_text_or_dict: Union[str, dict[str, Any]],
+    *,
+    available_batches: list[BatchLedgerEntry] | None = None,
 ) -> tuple[Optional[WeeklyPlan], str | None]:
     """Parse a plan and return bounded feedback for one repair."""
-    plan, feedback = parse_plan_response_with_metadata(raw_text_or_dict)
+    plan, feedback = parse_plan_response_with_metadata(
+        raw_text_or_dict, available_batches=available_batches
+    )
     return plan, feedback.render() if feedback is not None else None
 
 
 def parse_plan_response_with_metadata(
     raw_text_or_dict: Union[str, dict[str, Any]],
+    *,
+    available_batches: list[BatchLedgerEntry] | None = None,
 ) -> tuple[Optional[WeeklyPlan], PlanResponseFeedback | None]:
     """Parse a plan while retaining safe failure codes and locations."""
     data: Any = raw_text_or_dict
@@ -714,9 +856,22 @@ def parse_plan_response_with_metadata(
             issues=(SafeValidationIssue("not_object", "$"),),
         )
     try:
-        return WeeklyPlan.model_validate(data), None
+        plan = WeeklyPlan.model_validate(data)
     except ValidationError as exc:
         return None, _schema_feedback(exc)
+    batch_validation = validate_batch_links(
+        plan, available_batches=available_batches or []
+    )
+    if not batch_validation.is_valid:
+        first_issue = batch_validation.issues[0]
+        location = "days"
+        if first_issue.day is not None:
+            location = f"days[{first_issue.day - 1}].meals"
+        return None, PlanResponseFeedback(
+            category="compliance",
+            issues=(SafeValidationIssue(first_issue.code, location),),
+        )
+    return plan, None
 
 
 def parse_grocery_response(

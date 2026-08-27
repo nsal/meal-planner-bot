@@ -7,7 +7,12 @@ from unittest.mock import MagicMock
 import pytest
 from pytest_mock import MockerFixture
 
-from meal_planner.llm.client import FALLBACK_MESSAGE, LLMClient
+from meal_planner.llm.client import (
+    FALLBACK_MESSAGE,
+    LLMClient,
+    LLMResponseFormatError,
+    LLMTimeoutError,
+)
 
 
 class ProviderError(Exception):
@@ -237,6 +242,26 @@ async def test_strict_json_forwards_configured_timeout(
     assert await client.chat_json_strict("system", "user") == {"value": 1}
     assert completion.call_args.kwargs["timeout"] == 7.0
     assert completion.call_args.kwargs["max_retries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_strict_json_rejects_invalid_json_with_typed_failure(
+    client: LLMClient, mocker: MockerFixture
+) -> None:
+    mocker.patch("litellm.acompletion", return_value=_response("not json"))
+
+    with pytest.raises(LLMResponseFormatError):
+        await client.chat_json_strict("system", "user")
+
+
+@pytest.mark.asyncio
+async def test_strict_json_preserves_timeout_category(
+    client: LLMClient, mocker: MockerFixture
+) -> None:
+    mocker.patch("litellm.acompletion", side_effect=TimeoutError("private"))
+
+    with pytest.raises(LLMTimeoutError):
+        await client.chat_json_strict("system", "user")
 
 
 def test_sync_wrappers_return_text_and_json(
