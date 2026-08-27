@@ -97,7 +97,11 @@ from meal_planner.router import (
     route_update,
 )
 from meal_planner.telegram.access import TelegramAccessPolicy
-from meal_planner.telegram.api import TelegramAPI, TelegramAPIError
+from meal_planner.telegram.api import (
+    TelegramAPI,
+    TelegramAPIError,
+    profile_presentation_items,
+)
 from meal_planner.telegram.commands import render_help
 
 logger = logging.getLogger(__name__)
@@ -127,6 +131,21 @@ class MutationResult:
 
     success: bool
     message: str | None = None
+
+
+class ProfileLoadValidationError(RuntimeError):
+    """A persisted profile could not satisfy the current profile schema."""
+
+
+PROFILE_LOAD_RECOVERY_MESSAGE = (
+    "I couldn't safely load your profile. Please try again or edit it "
+    "through /profile."
+)
+
+STALE_PROFILE_REMOVAL_MESSAGE = (
+    "That profile removal is stale. Nothing was changed. Please reopen "
+    "/profile to get current buttons."
+)
 
 
 def _webhook_secret_is_valid(event: dict[str, Any]) -> bool:
@@ -171,6 +190,22 @@ class BotHandler:
         self.access_policy = access_policy or TelegramAccessPolicy(frozenset())
         self._processing_date = processing_date
 
+    def _load_profile(
+        self, user_id: str, *, consistent_read: bool = False
+    ) -> UserProfile | None:
+        """Load a profile while containing known persisted-schema failures."""
+        try:
+            if consistent_read:
+                return self.repo.get_profile(user_id, consistent_read=True)
+            return self.repo.get_profile(user_id)
+        except ValidationError:
+            logger.warning("Profile load rejected reason_code=validation")
+            raise ProfileLoadValidationError from None
+
+    def _send_profile_load_recovery(self, chat_id: int | str) -> None:
+        """Tell the user how to recover from an invalid saved profile."""
+        self.telegram_api.send_message(chat_id, PROFILE_LOAD_RECOVERY_MESSAGE)
+
     def handle_update(self, update: dict[str, Any]) -> dict[str, Any]:
         route = route_update(update)
         if route.route_type is RouteType.UNKNOWN:
@@ -191,8 +226,38 @@ class BotHandler:
                 self.handle_callback(route)
             elif route.route_type is RouteType.CONVERSATIONAL:
                 self.handle_conversational(route)
+        except ProfileLoadValidationError:
+            if route.chat_id is not None:
+                try:
+                    self._send_profile_load_recovery(route.chat_id)
+                except TelegramAPIError:
+                    logger.error(
+                        "Profile load recovery delivery failed "
+                        "reason_code=delivery"
+                    )
+            if route.callback_query_id:
+                try:
+                    self.telegram_api.answer_callback_query(
+                        route.callback_query_id, "Profile unavailable"
+                    )
+                except TelegramAPIError:
+                    logger.error("Failed to acknowledge profile callback")
         except TelegramAPIError:
             logger.error("Telegram delivery failed reason_code=delivery")
+        except Exception:
+            logger.error("Update handling failed reason_code=unexpected")
+            if route.chat_id is not None:
+                try:
+                    self.telegram_api.send_message(
+                        route.chat_id,
+                        "Sorry, I couldn't process that request. Please try "
+                        "again.",
+                    )
+                except TelegramAPIError:
+                    logger.error(
+                        "Update error delivery failed reason_code=delivery"
+                    )
+            return {"statusCode": 500, "body": "error"}
         return {"statusCode": 200, "body": "ok"}
 
     def handle_command(self, route: RouteResult) -> None:
@@ -229,7 +294,11 @@ class BotHandler:
         self.telegram_api.send_message(chat_id, render_help())
 
     def _cmd_start(self, chat_id: int | str, user_id: str) -> None:
-        profile = self.repo.get_profile(user_id)
+        try:
+            profile = self._load_profile(user_id)
+        except ProfileLoadValidationError:
+            self._send_profile_load_recovery(chat_id)
+            return
         if profile and profile.is_complete:
             message = (
                 f"Welcome back, {profile.name} family! Use /plan to "
@@ -253,7 +322,11 @@ class BotHandler:
         self.telegram_api.send_message(chat_id, message)
 
     def _cmd_profile(self, chat_id: int | str, user_id: str) -> None:
-        profile = self.repo.get_profile(user_id)
+        try:
+            profile = self._load_profile(user_id)
+        except ProfileLoadValidationError:
+            self._send_profile_load_recovery(chat_id)
+            return
         if not profile:
             self.telegram_api.send_message(
                 chat_id, "No complete profile found. Use /start to begin."
@@ -273,7 +346,11 @@ class BotHandler:
         self.telegram_api.send_profile(chat_id, profile)
 
     def _cmd_plan(self, chat_id: int | str, user_id: str) -> None:
-        profile = self.repo.get_profile(user_id)
+        try:
+            profile = self._load_profile(user_id)
+        except ProfileLoadValidationError:
+            self._send_profile_load_recovery(chat_id)
+            return
         if not profile or not profile.is_complete:
             self.telegram_api.send_message(
                 chat_id, "Complete your profile before generating a plan."
@@ -766,13 +843,9 @@ class BotHandler:
             return
 
         try:
-            profile = self.repo.get_profile(route.user_id, consistent_read=True)
-        except TypeError, ValueError, ValidationError:
-            self.telegram_api.send_message(
-                route.chat_id,
-                "I couldn't safely load your profile. Please try again or "
-                "edit it through /profile.",
-            )
+            profile = self._load_profile(route.user_id, consistent_read=True)
+        except ProfileLoadValidationError:
+            self._send_profile_load_recovery(route.chat_id)
             return
         if profile is None:
             self.telegram_api.send_message(
@@ -944,6 +1017,21 @@ class BotHandler:
                         "first.",
                     )
                     return
+                profile: UserProfile | None = None
+                if callback.operation is ProfileEditOperation.REMOVE:
+                    try:
+                        profile = self._load_profile(
+                            route.user_id, consistent_read=True
+                        )
+                    except ProfileLoadValidationError:
+                        self._send_profile_load_recovery(route.chat_id)
+                        return
+                    if profile is None:
+                        self.telegram_api.send_message(
+                            route.chat_id,
+                            "No complete profile found. Use /start to begin.",
+                        )
+                        return
                 now = datetime.now(timezone.utc)
                 candidate = state.model_copy(
                     update={
@@ -964,9 +1052,21 @@ class BotHandler:
                         "That profile menu changed. Please use /profile again.",
                     )
                     return
-                self.telegram_api.send_profile_operation(
-                    route.chat_id, callback.category, callback.operation
-                )
+                if profile is None:
+                    self.telegram_api.send_profile_operation(
+                        route.chat_id, callback.category, callback.operation
+                    )
+                else:
+                    self.telegram_api.send_profile_operation(
+                        route.chat_id,
+                        callback.category,
+                        callback.operation,
+                        profile,
+                    )
+                return
+
+            if callback.action is ProfileCallbackAction.REMOVE_SELECTION:
+                self._handle_profile_removal_callback(route, callback, state)
                 return
 
             if callback.action is ProfileCallbackAction.BACK:
@@ -1030,6 +1130,133 @@ class BotHandler:
                     logger.error(
                         "Failed to deliver profile callback error message"
                     )
+
+    def _handle_profile_removal_callback(
+        self,
+        route: RouteResult,
+        callback: ProfileCallback,
+        state: ConversationState,
+    ) -> None:
+        """Remove one revision-matched item and refresh its numbered list."""
+        assert route.chat_id is not None
+        assert route.user_id is not None
+        assert callback.category is not None
+        assert callback.index is not None
+        assert callback.profile_revision is not None
+        if (
+            state.step is not ConversationWorkflowStep.AWAITING_PROFILE_INPUT
+            or state.profile_category is not callback.category
+            or state.profile_operation is not ProfileEditOperation.REMOVE
+        ):
+            self.telegram_api.send_message(
+                route.chat_id,
+                STALE_PROFILE_REMOVAL_MESSAGE,
+            )
+            return
+
+        try:
+            profile = self._load_profile(route.user_id, consistent_read=True)
+        except ProfileLoadValidationError:
+            self._send_profile_load_recovery(route.chat_id)
+            return
+        if profile is None:
+            self.telegram_api.send_message(
+                route.chat_id, "No complete profile found. Use /start to begin."
+            )
+            return
+        if profile.profile_revision != callback.profile_revision:
+            self.telegram_api.send_message(
+                route.chat_id, STALE_PROFILE_REMOVAL_MESSAGE
+            )
+            return
+
+        items = profile_presentation_items(profile, callback.category)
+        if callback.index > len(items):
+            self.telegram_api.send_message(
+                route.chat_id,
+                "That profile selection is invalid. Nothing was changed.",
+            )
+            return
+        if (
+            callback.category is ProfileEditCategory.FAMILY
+            and len(profile.family_members) <= 1
+        ):
+            self.telegram_api.send_message(
+                route.chat_id,
+                "You must keep at least one family member.",
+            )
+            return
+
+        index = callback.index - 1
+        if callback.category is ProfileEditCategory.FAMILY:
+            members = list(profile.family_members)
+            members.pop(index)
+            updated = self._profile_with_updates(
+                profile,
+                {
+                    "family_members": [
+                        member.model_dump(mode="json") for member in members
+                    ],
+                    "people_count": len(members),
+                },
+            )
+        elif callback.category is ProfileEditCategory.DIETARY_CONSTRAINTS:
+            constraints = list(profile.dietary_constraints)
+            constraints.pop(index)
+            updated = self._profile_with_updates(
+                profile, {"dietary_constraints": constraints}
+            )
+        else:
+            preferences = list(profile.dietary_preferences)
+            batch_rules = list(profile.batch_rules)
+            if index < len(preferences):
+                preferences.pop(index)
+            else:
+                batch_rules.pop(index - len(preferences))
+            updated = self._profile_with_updates(
+                profile,
+                {
+                    "dietary_preferences": preferences,
+                    "batch_rules": batch_rules,
+                },
+            )
+
+        next_state = state.model_copy(
+            update={
+                "revision": state.revision + 1,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+        try:
+            committed = self.repo.remove_profile_item_and_transition_state(
+                route.user_id,
+                updated,
+                next_state,
+                state,
+                expected_profile_revision=callback.profile_revision,
+            )
+        except Exception:
+            logger.error(
+                "Profile removal transaction failed reason_code=persistence"
+            )
+            self.telegram_api.send_message(
+                route.chat_id,
+                "I couldn't save that profile change. Please try again.",
+            )
+            return
+        if not committed:
+            self.telegram_api.send_message(
+                route.chat_id, STALE_PROFILE_REMOVAL_MESSAGE
+            )
+            return
+
+        self.telegram_api.send_message(route.chat_id, "Profile item removed.")
+        self.telegram_api.send_profile_operation(
+            route.chat_id,
+            callback.category,
+            ProfileEditOperation.REMOVE,
+            committed,
+        )
 
     def _handle_meal_callback(
         self, route: RouteResult, callback: MealCallback
@@ -1420,7 +1647,7 @@ class BotHandler:
                 if message is not None:
                     self.telegram_api.send_message(route.chat_id, message)
                 return
-            profile = self.repo.get_profile(route.user_id)
+            profile = self._load_profile(route.user_id)
             profile_draft = self.repo.get_profile_draft(route.user_id)
             prompt = build_conversational_prompt(
                 profile=profile,
@@ -1468,6 +1695,8 @@ class BotHandler:
                 route.chat_id,
                 reply or "I got your message. What would you like to do next?",
             )
+        except ProfileLoadValidationError:
+            self._send_profile_load_recovery(route.chat_id)
         except Exception:
             logger.error(
                 "Conversational handling failed reason_code=unexpected"
@@ -1659,6 +1888,9 @@ class BotHandler:
         if category is None or operation is None:
             return "That profile edit is invalid. Please use /profile again."
 
+        if operation is ProfileEditOperation.REMOVE:
+            return "Please use the numbered buttons to remove a profile item."
+
         if self._decode_pending_profile_rules(state.last_update_id) is not None:
             return "Please confirm or cancel the pending profile change first."
 
@@ -1793,7 +2025,7 @@ class BotHandler:
             )
             return None
 
-        profile = self.repo.get_profile(user_id, consistent_read=True)
+        profile = self._load_profile(user_id, consistent_read=True)
         if profile is None:
             return "No complete profile found. Use /start to begin."
 
@@ -2386,13 +2618,9 @@ class BotHandler:
             return
 
         try:
-            profile = self.repo.get_profile(user_id)
-        except TypeError, ValueError, ValidationError:
-            self.telegram_api.send_message(
-                chat_id,
-                "I couldn't safely load your profile. Please try again or "
-                "edit it through /profile.",
-            )
+            profile = self._load_profile(user_id)
+        except ProfileLoadValidationError:
+            self._send_profile_load_recovery(chat_id)
             return
         if profile is None:
             self.telegram_api.send_message(

@@ -17,7 +17,10 @@ from meal_planner.models.schemas import (
     ProfileEditOperation,
 )
 from meal_planner.router import (
+    MAX_PROFILE_REMOVAL_INDEX,
+    MAX_PROFILE_REVISION,
     MealCallbackAction,
+    ProfileCallback,
     ProfileCallbackAction,
     RouteType,
     parse_checkin_callback,
@@ -392,6 +395,125 @@ def test_parse_every_accepted_profile_callback(payload: str) -> None:
         ProfileCallbackAction.CATEGORY,
         ProfileCallbackAction.OPERATION,
     }
+
+
+@pytest.mark.parametrize(
+    ("category", "index"),
+    [
+        (ProfileEditCategory.FAMILY, 1),
+        (ProfileEditCategory.DIETARY_CONSTRAINTS, 2),
+        (ProfileEditCategory.DIETARY_PREFERENCES, 3),
+    ],
+)
+def test_parse_profile_removal_selection_callbacks(
+    category: ProfileEditCategory,
+    index: int,
+) -> None:
+    """Parse revision-stamped selections for every removable category."""
+    payload = f"profile:remove:{category.value}:{index}:42"
+
+    callback = parse_profile_callback(payload)
+
+    assert callback is not None
+    assert callback.action is ProfileCallbackAction.REMOVE_SELECTION
+    assert callback.category is category
+    assert callback.index == index
+    assert callback.profile_revision == 42
+    assert callback.operation is None
+    assert callback.token is None
+
+
+def test_profile_removal_selection_model_requires_all_selection_fields() -> (
+    None
+):
+    """The typed model rejects incomplete removal selections."""
+    with pytest.raises(ValueError):
+        ProfileCallback(
+            action=ProfileCallbackAction.REMOVE_SELECTION,
+            category=ProfileEditCategory.FAMILY,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "profile:remove:family:1",
+        "profile:remove:family:1:0:extra",
+        "profile:remove:unknown:1:0",
+        "profile:remove:family:0:0",
+        "profile:remove:family:-1:0",
+        "profile:remove:family:41:0",
+        "profile:remove:family:1:-1",
+        "profile:remove:family:1:1.0",
+        "profile:remove:family:one:0",
+        "profile:remove:family:+1:0",
+        "profile:remove:family:1:+1",
+        "profile:remove:dietary_preferences:40:" + "9" * 40,
+    ],
+)
+def test_parse_profile_removal_selection_rejects_malformed_payload(
+    payload: str,
+) -> None:
+    """Reject malformed, invalid, and out-of-bounds selections."""
+    assert parse_profile_callback(payload) is None
+
+
+@pytest.mark.parametrize(
+    "extra_field",
+    ["operation", "token", "unexpected"],
+)
+def test_profile_removal_selection_model_rejects_extra_fields(
+    extra_field: str,
+) -> None:
+    """Do not permit fields from another callback shape."""
+    values: dict[str, object] = {
+        "action": ProfileCallbackAction.REMOVE_SELECTION,
+        "category": ProfileEditCategory.FAMILY,
+        "index": 1,
+        "profile_revision": 0,
+        extra_field: "unexpected",
+    }
+
+    with pytest.raises(ValueError):
+        ProfileCallback.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    ("index", "revision"),
+    [
+        (0, 0),
+        (-1, 0),
+        (MAX_PROFILE_REMOVAL_INDEX + 1, 0),
+        (1, -1),
+        (1, MAX_PROFILE_REVISION + 1),
+    ],
+)
+def test_profile_removal_selection_model_rejects_invalid_bounds(
+    index: int,
+    revision: int,
+) -> None:
+    """Keep model-level selection bounds independent of parsing."""
+    with pytest.raises(ValueError):
+        ProfileCallback(
+            action=ProfileCallbackAction.REMOVE_SELECTION,
+            category=ProfileEditCategory.FAMILY,
+            index=index,
+            profile_revision=revision,
+        )
+
+
+@pytest.mark.parametrize("category", list(ProfileEditCategory))
+def test_profile_removal_callbacks_fit_telegram_byte_limit(
+    category: ProfileEditCategory,
+) -> None:
+    """The generated worst-case supported callback stays below 64 bytes."""
+    payload = (
+        f"profile:remove:{category.value}:{MAX_PROFILE_REMOVAL_INDEX}:"
+        f"{MAX_PROFILE_REVISION}"
+    )
+
+    assert len(payload.encode("utf-8")) < 64
+    assert parse_profile_callback(payload) is not None
 
 
 @pytest.mark.parametrize(
