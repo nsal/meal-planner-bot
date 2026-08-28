@@ -6,12 +6,18 @@ import pytest
 from pydantic import ValidationError
 
 from meal_planner.models import (
+    PlanChatEvent as ExportedPlanChatEvent,
+)
+from meal_planner.models import (
     PlanDays as ExportedPlanDays,
 )
 from meal_planner.models import (
     PreferenceRequirement as ExportedPreferenceRequirement,
 )
 from meal_planner.models.schemas import (
+    MAX_PLAN_CHAT_MESSAGE_LENGTH,
+    MAX_PLAN_CHAT_REQUEST_LENGTH,
+    MAX_PLAN_CHAT_RESPONSE_LENGTH,
     BatchLedgerEntry,
     BatchLedgerState,
     BatchMealRole,
@@ -33,6 +39,8 @@ from meal_planner.models.schemas import (
     MealLogEntry,
     MealOutcome,
     MealType,
+    PlanChatAction,
+    PlanChatEvent,
     PlanDay,
     PlanDays,
     PlanGenerationContext,
@@ -54,7 +62,235 @@ from meal_planner.models.schemas import (
     WeeklyBatchLedger,
     WeeklyPlan,
 )
-from tests.factories import make_plan, make_profile
+from tests.factories import (
+    make_plan,
+    make_plan_chat_event,
+    make_plan_chat_state,
+    make_profile,
+)
+
+
+def test_plan_chat_states_require_the_fields_for_their_step() -> None:
+    """Plan chat states enforce awaiting, generating, and ready shapes."""
+    awaiting = make_plan_chat_state(
+        step=ConversationWorkflowStep.AWAITING_PLAN_REQUEST
+    )
+    generating = make_plan_chat_state(
+        step=ConversationWorkflowStep.PLAN_CHAT_GENERATING
+    )
+    ready = make_plan_chat_state(step=ConversationWorkflowStep.PLAN_CHAT_READY)
+
+    assert awaiting.session_id
+    assert awaiting.request_id is None
+    assert awaiting.initial_request is None
+    assert awaiting.pending_message is None
+    assert awaiting.latest_response is None
+    assert awaiting.context_date is None
+    assert generating.request_id
+    assert generating.initial_request == "Plan three family dinners"
+    assert generating.pending_message == "Plan three family dinners"
+    assert generating.latest_response is None
+    assert generating.context_date == date(2026, 8, 28)
+    assert ready.request_id
+    assert ready.initial_request == "Plan three family dinners"
+    assert ready.pending_message == "Here is a draft."
+    assert ready.latest_response == "Here is a draft."
+    assert ready.context_date == date(2026, 8, 28)
+
+
+def test_plan_chat_contract_bounds_text_and_identifiers() -> None:
+    """Plan chat text, UUIDs, timestamps, expiry, and revision are bounded."""
+    state = make_plan_chat_state(
+        step=ConversationWorkflowStep.PLAN_CHAT_GENERATING
+    )
+    restored = ConversationState.model_validate_json(state.model_dump_json())
+
+    assert restored == state
+    assert state.revision == 0
+    assert state.created_at.tzinfo is not None
+    assert state.updated_at.tzinfo is not None
+    assert state.expires_at > int(state.updated_at.timestamp())
+
+    with pytest.raises(ValidationError):
+        make_plan_chat_state(
+            step=ConversationWorkflowStep.PLAN_CHAT_GENERATING,
+            initial_request="x" * 2_001,
+        )
+    with pytest.raises(ValidationError):
+        make_plan_chat_state(
+            step=ConversationWorkflowStep.PLAN_CHAT_GENERATING,
+            pending_message="x" * (MAX_PLAN_CHAT_MESSAGE_LENGTH + 1),
+        )
+    with pytest.raises(ValidationError):
+        make_plan_chat_state(
+            step=ConversationWorkflowStep.PLAN_CHAT_READY,
+            latest_response="x" * 4_001,
+        )
+    with pytest.raises(ValidationError):
+        ConversationState.model_validate(
+            state.model_copy(update={"session_id": "not-a-uuid"})
+        )
+
+
+def test_plan_chat_text_limits_accept_their_boundaries() -> None:
+    """Each plan-chat text field accepts exactly its configured maximum."""
+    generating = make_plan_chat_state(
+        step=ConversationWorkflowStep.PLAN_CHAT_GENERATING,
+        initial_request="r" * MAX_PLAN_CHAT_REQUEST_LENGTH,
+        pending_message="m" * MAX_PLAN_CHAT_MESSAGE_LENGTH,
+    )
+    ready = make_plan_chat_state(
+        step=ConversationWorkflowStep.PLAN_CHAT_READY,
+        latest_response="x" * MAX_PLAN_CHAT_RESPONSE_LENGTH,
+    )
+
+    assert len(generating.initial_request or "") == (
+        MAX_PLAN_CHAT_REQUEST_LENGTH
+    )
+    assert len(generating.pending_message or "") == (
+        MAX_PLAN_CHAT_MESSAGE_LENGTH
+    )
+    assert len(ready.latest_response or "") == MAX_PLAN_CHAT_RESPONSE_LENGTH
+
+
+@pytest.mark.parametrize(
+    ("step", "field_name"),
+    [
+        (
+            ConversationWorkflowStep.AWAITING_PLAN_REQUEST,
+            "initial_request",
+        ),
+        (
+            ConversationWorkflowStep.AWAITING_PLAN_REQUEST,
+            "pending_message",
+        ),
+        (
+            ConversationWorkflowStep.AWAITING_PLAN_REQUEST,
+            "latest_response",
+        ),
+        (ConversationWorkflowStep.AWAITING_PLAN_REQUEST, "context_date"),
+        (ConversationWorkflowStep.PLAN_CHAT_GENERATING, "session_id"),
+        (ConversationWorkflowStep.PLAN_CHAT_GENERATING, "request_id"),
+        (ConversationWorkflowStep.PLAN_CHAT_GENERATING, "initial_request"),
+        (ConversationWorkflowStep.PLAN_CHAT_GENERATING, "pending_message"),
+        (ConversationWorkflowStep.PLAN_CHAT_GENERATING, "context_date"),
+        (ConversationWorkflowStep.PLAN_CHAT_GENERATING, "latest_response"),
+        (ConversationWorkflowStep.PLAN_CHAT_READY, "latest_response"),
+    ],
+)
+def test_plan_chat_rejects_forbidden_or_missing_step_fields(
+    step: ConversationWorkflowStep,
+    field_name: str,
+) -> None:
+    """Every plan-chat phase has an explicit required-field contract."""
+    state = make_plan_chat_state(step=step)
+    values = state.model_dump()
+    if step is ConversationWorkflowStep.AWAITING_PLAN_REQUEST or (
+        step is ConversationWorkflowStep.PLAN_CHAT_GENERATING
+        and field_name == "latest_response"
+    ):
+        values[field_name] = (
+            date(2026, 8, 28) if field_name == "context_date" else "value"
+        )
+    else:
+        values[field_name] = None
+
+    with pytest.raises(ValidationError):
+        ConversationState.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "meal_draft",
+        "preference",
+        "plan_start",
+        "profile_category",
+        "target_week",
+    ],
+)
+def test_plan_chat_rejects_cross_workflow_fields(field_name: str) -> None:
+    """Plan chat cannot carry fields owned by another workflow."""
+    values: dict[str, object] = {
+        "step": ConversationWorkflowStep.AWAITING_PLAN_REQUEST,
+        "session_id": make_plan_chat_state().session_id,
+        field_name: MealLogDraft() if field_name == "meal_draft" else "value",
+    }
+    if field_name in {"profile_category"}:
+        values[field_name] = ProfileEditCategory.DIETARY_PREFERENCES
+    if field_name in {"plan_start", "target_week"}:
+        values[field_name] = date(2026, 8, 28)
+
+    with pytest.raises(ValidationError):
+        ConversationState(
+            **_conversation_state_values(),
+            workflow_kind=ConversationWorkflowKind.PLAN_CHAT,
+            **values,
+        )
+
+
+def test_plan_chat_rejects_stale_timestamps_and_malformed_state() -> None:
+    """Plan chat keeps timestamp ordering and expiry invariants."""
+    now = datetime(2026, 8, 28, 12, tzinfo=timezone.utc)
+    values = {
+        "workflow_kind": ConversationWorkflowKind.PLAN_CHAT,
+        "step": ConversationWorkflowStep.AWAITING_PLAN_REQUEST,
+        "session_id": make_plan_chat_state().session_id,
+        "created_at": now,
+        "updated_at": now + timedelta(minutes=1),
+        "expires_at": now + timedelta(minutes=1),
+    }
+    with pytest.raises(ValidationError):
+        ConversationState(**values)
+    with pytest.raises(ValidationError):
+        ConversationState(
+            **{
+                **values,
+                "updated_at": now - timedelta(minutes=1),
+                "expires_at": now + timedelta(hours=1),
+            }
+        )
+
+
+def test_plan_chat_event_contains_only_bounded_identifiers() -> None:
+    """The worker event is typed, canonical, and free of context payloads."""
+    event = make_plan_chat_event()
+
+    assert event.action is PlanChatAction.GENERATE_PLAN_CHAT
+    assert event.state_revision == 0
+    assert event.model_dump() == event.model_dump(mode="python")
+    assert ExportedPlanChatEvent is PlanChatEvent
+
+    with pytest.raises(ValidationError):
+        PlanChatEvent(
+            **event.model_dump(),
+            prompt="do not put context in events",
+        )
+    with pytest.raises(ValidationError):
+        PlanChatEvent(**{**event.model_dump(), "session_id": "not-a-uuid"})
+    with pytest.raises(ValidationError):
+        PlanChatEvent(
+            **{
+                **event.model_dump(),
+                "request_id": event.request_id.upper(),
+            }
+        )
+    with pytest.raises(ValidationError):
+        PlanChatEvent(**{**event.model_dump(), "state_revision": -1})
+    with pytest.raises(ValidationError):
+        PlanChatEvent(
+            **{
+                key: value
+                for key, value in event.model_dump().items()
+                if key != "action"
+            }
+        )
+    with pytest.raises(ValidationError):
+        PlanChatEvent(**{**event.model_dump(), "action": "unknown_action"})
+    with pytest.raises(ValidationError):
+        PlanChatEvent(**{**event.model_dump(), "user_id": "u" * 101})
+    with pytest.raises(ValidationError):
+        PlanChatEvent(**{**event.model_dump(), "chat_id": "c" * 101})
 
 
 def test_weekly_rule_and_schedule_contract_round_trips() -> None:

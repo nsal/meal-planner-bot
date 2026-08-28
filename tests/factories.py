@@ -1,7 +1,8 @@
 """Shared typed factories for complete domain objects."""
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 from meal_planner.models.schemas import (
     BatchLedgerEntry,
@@ -9,12 +10,17 @@ from meal_planner.models.schemas import (
     BatchMealRole,
     BatchRule,
     ConstraintEntry,
+    ConversationState,
+    ConversationWorkflowKind,
+    ConversationWorkflowStep,
     DietaryPreferenceEntry,
     DietaryRule,
     FamilyMember,
     GrocerySection,
     GroceryStatus,
     MealOutcome,
+    PlanChatAction,
+    PlanChatEvent,
     PlanDay,
     PlanDays,
     PlannedBatchLink,
@@ -173,6 +179,69 @@ def make_profile(*, with_nutrient_targets: bool = False) -> UserProfile:
         ],
         dietary_constraints=[],
         dietary_preferences=[],
+    )
+
+
+def make_plan_chat_state(
+    step: ConversationWorkflowStep = (
+        ConversationWorkflowStep.AWAITING_PLAN_REQUEST
+    ),
+    *,
+    initial_request: str = "Plan three family dinners",
+    pending_message: str | None = None,
+    latest_response: str | None = None,
+    context_date: date = date(2026, 8, 28),
+    revision: int = 0,
+) -> ConversationState:
+    """Return a valid state for any temporary plan-chat phase."""
+    now = datetime(2026, 8, 28, 12, tzinfo=timezone.utc)
+    session_id = str(uuid4())
+    if step is ConversationWorkflowStep.AWAITING_PLAN_REQUEST:
+        initial_request_value = None
+        pending_message_value = None
+        latest_response_value = None
+        context_date_value = None
+        request_id = None
+    else:
+        initial_request_value = initial_request
+        request_id = str(uuid4())
+        pending_message_value = pending_message or initial_request
+        context_date_value = context_date
+        latest_response_value = latest_response
+        if step is ConversationWorkflowStep.PLAN_CHAT_READY:
+            latest_response_value = latest_response or "Here is a draft."
+            pending_message_value = pending_message or latest_response_value
+
+    return ConversationState(
+        workflow_kind=ConversationWorkflowKind.PLAN_CHAT,
+        step=step,
+        session_id=session_id,
+        request_id=request_id,
+        initial_request=initial_request_value,
+        pending_message=pending_message_value,
+        latest_response=latest_response_value,
+        context_date=context_date_value,
+        revision=revision,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(hours=24),
+    )
+
+
+def make_plan_chat_event(
+    *,
+    session_id: str | None = None,
+    request_id: str | None = None,
+    state_revision: int = 0,
+) -> PlanChatEvent:
+    """Return a valid identifier-only plan-chat worker event."""
+    return PlanChatEvent(
+        action=PlanChatAction.GENERATE_PLAN_CHAT,
+        user_id="12345",
+        chat_id=12345,
+        session_id=session_id or str(uuid4()),
+        request_id=request_id or str(uuid4()),
+        state_revision=state_revision,
     )
 
 

@@ -6,6 +6,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Annotated, Any
+from uuid import UUID
 
 from pydantic import (
     AliasChoices,
@@ -62,6 +63,49 @@ PreferenceFood = Annotated[
 RepairFeedback = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=800),
+]
+MAX_PLAN_CHAT_REQUEST_LENGTH = 2_000
+MAX_PLAN_CHAT_RESPONSE_LENGTH = 4_000
+MAX_PLAN_CHAT_MESSAGE_LENGTH = MAX_PLAN_CHAT_RESPONSE_LENGTH
+MAX_PLAN_CHAT_STATE_BYTES = 32_000
+PlanChatRequest = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=MAX_PLAN_CHAT_REQUEST_LENGTH,
+    ),
+]
+PlanChatMessage = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=MAX_PLAN_CHAT_MESSAGE_LENGTH,
+    ),
+]
+PlanChatResponse = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=MAX_PLAN_CHAT_RESPONSE_LENGTH,
+    ),
+]
+PlanChatUUID = Annotated[
+    str,
+    StringConstraints(
+        min_length=36,
+        max_length=36,
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab]"
+            r"[0-9a-f]{3}-[0-9a-f]{12}$"
+        ),
+    ),
+]
+PlanChatIdentifier = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
 ]
 
 _GENERIC_NO_VALUE_PHRASES = frozenset(
@@ -1019,6 +1063,7 @@ class ConversationWorkflowKind(str, Enum):
     PLAN_REQUEST = "plan_request"
     PLAN_REVISION = "plan_revision"
     PROFILE_EDIT = "profile_edit"
+    PLAN_CHAT = "plan_chat"
 
 
 class ConversationWorkflowStep(str, Enum):
@@ -1036,6 +1081,58 @@ class ConversationWorkflowStep(str, Enum):
     RETRY_READY = "retry_ready"
     PROFILE_MENU = "profile_menu"
     AWAITING_PROFILE_INPUT = "awaiting_profile_input"
+    AWAITING_PLAN_REQUEST = "awaiting_plan_request"
+    PLAN_CHAT_GENERATING = "plan_chat_generating"
+    PLAN_CHAT_READY = "plan_chat_ready"
+
+
+class PlanChatAction(str, Enum):
+    """Actions accepted by the asynchronous plan-chat worker."""
+
+    GENERATE_PLAN_CHAT = "generate_plan_chat"
+
+
+class PlanChatEvent(BaseModel):
+    """Small event contract used to invoke the plan-chat worker."""
+
+    model_config = {"extra": "forbid"}
+
+    action: PlanChatAction
+    user_id: PlanChatIdentifier
+    chat_id: int | PlanChatIdentifier
+    session_id: PlanChatUUID
+    request_id: PlanChatUUID
+    state_revision: int = Field(ge=0)
+
+    @field_validator("user_id")
+    @classmethod
+    def validate_user_id(cls, value: str) -> str:
+        """Reject blank user identifiers without normalizing their value."""
+        if not value:
+            raise ValueError("user_id must not be blank")
+        return value
+
+    @field_validator("chat_id")
+    @classmethod
+    def validate_chat_id(cls, value: int | str) -> int | str:
+        """Keep Telegram chat identifiers bounded and positive."""
+        if isinstance(value, bool):
+            raise ValueError("chat_id must be an identifier")
+        if isinstance(value, int):
+            if value <= 0:
+                raise ValueError("chat_id must be positive")
+            return value
+        if not value:
+            raise ValueError("chat_id must not be blank")
+        return value
+
+    @field_validator("session_id", "request_id")
+    @classmethod
+    def validate_uuid_spelling(cls, value: str) -> str:
+        """Require canonical lowercase spelling for UUID identifiers."""
+        if str(UUID(value)) != value:
+            raise ValueError("plan-chat identifiers must use canonical UUIDs")
+        return value
 
 
 class MealLogDraft(BaseModel):
@@ -1103,6 +1200,11 @@ class ConversationState(BaseModel):
         validation_alias=AliasChoices("target_week", "week_start"),
     )
     expected_plan_revision: int | None = Field(default=None, ge=0)
+    session_id: PlanChatUUID | None = None
+    initial_request: PlanChatRequest | None = None
+    pending_message: PlanChatMessage | None = None
+    latest_response: PlanChatResponse | None = None
+    context_date: date | None = None
     request_id: RequestId | None = None
     revision: int = Field(default=0, ge=0)
     created_at: datetime
@@ -1194,6 +1296,17 @@ class ConversationState(BaseModel):
         ]
         if len(tier_ids) != len(set(tier_ids)):
             raise ValueError("planning rule tiers must have unique IDs")
+        plan_chat_fields = (
+            self.session_id,
+            self.initial_request,
+            self.pending_message,
+            self.latest_response,
+            self.context_date,
+        )
+        if self.workflow_kind is not ConversationWorkflowKind.PLAN_CHAT and any(
+            field is not None for field in plan_chat_fields
+        ):
+            raise ValueError("plan-chat fields require a plan-chat workflow")
         meal_steps = {
             ConversationWorkflowStep.AWAITING_MEAL_INPUT,
             ConversationWorkflowStep.AWAITING_MEAL_CONFIRMATION,
@@ -1328,7 +1441,7 @@ class ConversationState(BaseModel):
                 raise ValueError(
                     "revision workflows require amendment and plan snapshot"
                 )
-        else:
+        elif self.workflow_kind is ConversationWorkflowKind.PROFILE_EDIT:
             if self.step not in {
                 ConversationWorkflowStep.PROFILE_MENU,
                 ConversationWorkflowStep.AWAITING_PROFILE_INPUT,
@@ -1376,12 +1489,102 @@ class ConversationState(BaseModel):
                     raise ValueError(
                         "profile operation is invalid for its category"
                     )
+        else:
+            plan_chat_steps = {
+                ConversationWorkflowStep.AWAITING_PLAN_REQUEST,
+                ConversationWorkflowStep.PLAN_CHAT_GENERATING,
+                ConversationWorkflowStep.PLAN_CHAT_READY,
+            }
+            if self.step not in plan_chat_steps:
+                raise ValueError("plan-chat workflows require a plan-chat step")
+            if not self.duration_collected:
+                raise ValueError(
+                    "plan-chat workflows cannot contain plan duration state"
+                )
+            if (
+                self.meal_draft is not None
+                or self.pending_batch_link is not None
+                or self.preference is not None
+                or self.plan_start is not None
+                or self.requirements
+                or self.stored_rules
+                or self.current_rules
+                or self.batch_rules
+                or self.effective_rules
+                or self.constraint_rules
+                or self.obligations
+                or self.profile_category is not None
+                or self.profile_operation is not None
+                or self.amendment is not None
+                or self.target_week is not None
+                or self.expected_plan_revision is not None
+            ):
+                raise ValueError(
+                    "plan-chat workflows cannot contain legacy fields"
+                )
+            if self.session_id is None:
+                raise ValueError("plan-chat workflows require a session ID")
+            if str(UUID(self.session_id)) != self.session_id:
+                raise ValueError(
+                    "plan-chat session ID must use canonical UUID spelling"
+                )
+            if self.step is ConversationWorkflowStep.AWAITING_PLAN_REQUEST:
+                if any(
+                    field is not None
+                    for field in (
+                        self.request_id,
+                        self.initial_request,
+                        self.pending_message,
+                        self.latest_response,
+                        self.context_date,
+                    )
+                ):
+                    raise ValueError(
+                        "awaiting plan requests cannot contain request data"
+                    )
+            else:
+                if (
+                    self.request_id is None
+                    or self.initial_request is None
+                    or self.pending_message is None
+                    or self.context_date is None
+                ):
+                    raise ValueError(
+                        "active plan-chat states require request context"
+                    )
+                if str(UUID(self.request_id)) != self.request_id:
+                    raise ValueError(
+                        "plan-chat request ID must use canonical UUID spelling"
+                    )
+                if (
+                    self.step is ConversationWorkflowStep.PLAN_CHAT_GENERATING
+                    and self.latest_response is not None
+                ):
+                    raise ValueError(
+                        "generating plan-chat states cannot contain a response"
+                    )
+                if (
+                    self.step is ConversationWorkflowStep.PLAN_CHAT_READY
+                    and self.latest_response is None
+                ):
+                    raise ValueError(
+                        "ready plan-chat states require a latest response"
+                    )
         if self.updated_at < self.created_at:
             raise ValueError("conversation state timestamps are out of order")
         if self.expires_at <= int(self.updated_at.timestamp()):
             raise ValueError(
                 "conversation state must expire after it is updated"
             )
+        if self.workflow_kind is ConversationWorkflowKind.PLAN_CHAT:
+            state_size = len(
+                json.dumps(
+                    self.model_dump(mode="json"),
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            if state_size > MAX_PLAN_CHAT_STATE_BYTES:
+                raise ValueError("plan-chat state exceeds its size limit")
         if self.workflow_kind is ConversationWorkflowKind.MEAL_LOG:
             assert self.meal_draft is not None
             if self.step in {

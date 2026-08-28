@@ -4167,6 +4167,7 @@ def test_fresh_plan_recalculates_obligations_after_submitted_meal(
     handler: BotHandler,
 ) -> None:
     """A new request sees newly persisted evidence while retry does not."""
+    reference_date = date(2026, 8, 26)
     rule = DietaryRule(
         id="weekly-eggs",
         source_text="eggs three breakfasts",
@@ -4196,13 +4197,13 @@ def test_fresh_plan_recalculates_obligations_after_submitted_meal(
         [],
         [
             MealLogEntry(
-                date=date.today() - timedelta(days=2),
+                date=reference_date - timedelta(days=2),
                 meal_type=MealType.BREAKFAST,
                 description="eggs on toast",
                 created_at=datetime.now(timezone.utc),
             ),
             MealLogEntry(
-                date=date.today() - timedelta(days=1),
+                date=reference_date - timedelta(days=1),
                 meal_type=MealType.BREAKFAST,
                 description="eggs and fruit",
                 created_at=datetime.now(timezone.utc),
@@ -4210,9 +4211,21 @@ def test_fresh_plan_recalculates_obligations_after_submitted_meal(
         ],
     ]
 
-    handler.handle_conversational(_plan_route("1, no preference", 6104))
+    handler.handle_conversational(
+        _plan_route(
+            "1, no preference",
+            6104,
+            reference_date=reference_date,
+        )
+    )
     first_saved = handler.repo.transition_conversation_state.call_args.args[1]
-    handler.handle_conversational(_plan_route("1, no preference", 6105))
+    handler.handle_conversational(
+        _plan_route(
+            "1, no preference",
+            6105,
+            reference_date=reference_date,
+        )
+    )
     second_saved = handler.repo.transition_conversation_state.call_args.args[1]
 
     assert first_saved.obligations[0].count == 1
@@ -6498,14 +6511,30 @@ def test_retry_date_revalidation_does_not_dispatch_after_state_loss(
     assert "changed" in handler.telegram_api.send_message.call_args.args[1]
 
 
-def _plan_route(text: str, update_id: int = 9000) -> RouteResult:
+def _plan_route(
+    text: str,
+    update_id: int = 9000,
+    *,
+    reference_date: date | None = None,
+) -> RouteResult:
     """Build a conversational route for focused plan-phase tests."""
+    raw_update: dict[str, Any] = {"update_id": update_id}
+    if reference_date is not None:
+        raw_update["message"] = {
+            "date": int(
+                datetime.combine(
+                    reference_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                ).timestamp()
+            )
+        }
     return RouteResult(
         route_type=RouteType.CONVERSATIONAL,
         chat_id=1,
         user_id="user",
         text=text,
-        raw_update={"update_id": update_id},
+        raw_update=raw_update,
     )
 
 
