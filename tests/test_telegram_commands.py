@@ -16,11 +16,7 @@ def test_catalogue_has_stable_order_and_telegram_payloads() -> None:
         "help",
         "profile",
         "plan",
-        "grocery",
-        "today",
         "submit_meals",
-        "checkin",
-        "cancel",
     ]
     assert BOT_COMMANDS[0].to_payload() == {
         "command": "start",
@@ -46,13 +42,14 @@ def test_render_help_uses_every_command_once() -> None:
     assert all(line.count("/") == 1 for line in lines)
 
 
-def test_plan_command_description_is_duration_neutral() -> None:
+def test_plan_command_description_describes_conversational_drafts() -> None:
     plan_command = next(
         command for command in BOT_COMMANDS if command.name == "plan"
     )
 
-    assert plan_command.description == "Create or retry a meal plan"
-    assert "weekly" not in render_help().lower()
+    assert plan_command.description == "Create a conversational meal-plan draft"
+    assert "confirm" not in render_help().lower()
+    assert "/cancel" not in render_help()
 
 
 @pytest.mark.parametrize(

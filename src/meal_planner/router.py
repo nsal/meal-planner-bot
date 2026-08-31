@@ -17,19 +17,18 @@ from pydantic import (
 )
 
 from meal_planner.models.schemas import (
-    BatchMealRole,
     MealCallbackAction,
     MealLogDraft,
-    MealOutcome,
     MealType,
+    PlanChatUUID,
     ProfileEditCategory,
     ProfileEditOperation,
 )
 from meal_planner.telegram.commands import BOT_COMMANDS
 
 MAX_CALLBACK_DATA_BYTES = 64
-# Profile lists contain at most 20 entries each.  Removal displays dietary
-# preferences and batch rules together, so 40 is the largest category index.
+# Profile lists contain at most 20 entries each, so this is the largest
+# category-relative removal index.
 MAX_PROFILE_REMOVAL_INDEX = 40
 MAX_PROFILE_REVISION = 2**63 - 1
 
@@ -61,13 +60,31 @@ class RouteResult(BaseModel):
 SUPPORTED_COMMANDS = frozenset(command.name for command in BOT_COMMANDS)
 
 
-class CheckinCallback(BaseModel):
-    """Validated, plan-specific check-in callback payload."""
+class PlanChatCallbackAction(str, Enum):
+    """Actions supported by the plan-chat controls."""
 
-    week_start: str
-    day: int = Field(ge=1, le=7)
-    meal_type: MealType
-    outcome: MealOutcome
+    END = "end"
+
+
+class PlanChatCallback(BaseModel):
+    """Validated callback payload for ending one plan-chat session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: PlanChatCallbackAction
+    session_id: PlanChatUUID
+
+    @field_validator("session_id")
+    @classmethod
+    def require_canonical_session_id(cls, value: str) -> str:
+        """Require the lowercase canonical spelling of a session UUID."""
+        try:
+            canonical = str(UUID(value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("session_id must be a valid UUID") from exc
+        if canonical != value:
+            raise ValueError("session_id must use canonical UUID spelling")
+        return value
 
 
 class ProfileCallbackAction(str, Enum):
@@ -79,8 +96,6 @@ class ProfileCallbackAction(str, Enum):
     BACK = "back"
     DONE = "done"
     CLOSE = "close"
-    CONFIRM = "confirm"
-    CANCEL = "cancel"
     REMOVE_SELECTION = "remove"
 
 
@@ -92,7 +107,6 @@ class ProfileCallback(BaseModel):
     action: ProfileCallbackAction
     category: ProfileEditCategory | None = None
     operation: ProfileEditOperation | None = None
-    token: str | None = None
     index: StrictInt | None = Field(
         default=None, ge=1, le=MAX_PROFILE_REMOVAL_INDEX
     )
@@ -107,7 +121,6 @@ class ProfileCallback(BaseModel):
             if (
                 self.category is None
                 or self.operation is not None
-                or self.token is not None
                 or self.index is None
                 or self.profile_revision is None
             ):
@@ -120,7 +133,6 @@ class ProfileCallback(BaseModel):
             if (
                 self.category is None
                 or self.operation is not None
-                or self.token is not None
                 or self.index is not None
                 or self.profile_revision is not None
             ):
@@ -130,7 +142,6 @@ class ProfileCallback(BaseModel):
             if (
                 self.category is None
                 or self.operation is None
-                or self.token is not None
                 or self.index is not None
                 or self.profile_revision is not None
             ):
@@ -140,24 +151,9 @@ class ProfileCallback(BaseModel):
             if not self.operation.is_valid_for(self.category):
                 raise ValueError("operation is invalid for its category")
             return self
-        if self.action in {
-            ProfileCallbackAction.CONFIRM,
-            ProfileCallbackAction.CANCEL,
-        }:
-            if (
-                self.category is not None
-                or self.operation is not None
-                or self.index is not None
-                or self.profile_revision is not None
-                or self.token is None
-                or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", self.token)
-            ):
-                raise ValueError("rule callbacks require one bounded token")
-            return self
         if (
             self.category is not None
             or self.operation is not None
-            or self.token is not None
             or self.index is not None
             or self.profile_revision is not None
         ):
@@ -170,7 +166,6 @@ class MealCallback(BaseModel):
 
     action: MealCallbackAction
     submission_id: str
-    batch_role: BatchMealRole | None = None
 
     @field_validator("submission_id")
     @classmethod
@@ -183,15 +178,6 @@ class MealCallback(BaseModel):
         if canonical != value.casefold():
             raise ValueError("submission_id must use canonical UUID spelling")
         return canonical
-
-    @model_validator(mode="after")
-    def validate_batch_role(self) -> "MealCallback":
-        """Allow a role only on an explicit batch confirmation."""
-        if self.batch_role is not None and self.action is not (
-            MealCallbackAction.CONFIRM
-        ):
-            raise ValueError("batch roles are only valid for confirmation")
-        return self
 
 
 class MealInputParseResult(BaseModel):
@@ -217,7 +203,8 @@ def parse_meal_input(
 
     The first two commas delimit the fields. Any later commas belong to the
     description. Date aliases are resolved against the supplied UTC calendar
-    date, and explicit dates may be no older than six days.
+    date, and explicit dates must be from UTC today through the previous
+    seven dates, inclusive (eight calendar dates).
     """
     values = text.split(",", maxsplit=2)
     if len(values) != 3:
@@ -249,8 +236,11 @@ def parse_meal_input(
     if parsed_date is not None:
         if parsed_date > reference_date:
             errors.append("date cannot be in the future")
-        elif parsed_date < reference_date - timedelta(days=6):
-            errors.append("date must be within the last 7 days")
+        elif parsed_date < reference_date - timedelta(days=7):
+            errors.append(
+                "date must be from UTC today through the previous seven "
+                "dates, inclusive (eight calendar dates)"
+            )
 
     parsed_meal_type: MealType | None = None
     if not meal_type_value:
@@ -286,7 +276,7 @@ def parse_meal_callback(data: str) -> MealCallback | None:
         return None
 
     parts = data.split(":")
-    if len(parts) not in {3, 4} or parts[0] != "meal":
+    if len(parts) != 3 or parts[0] != "meal":
         return None
 
     try:
@@ -298,41 +288,32 @@ def parse_meal_callback(data: str) -> MealCallback | None:
     if str(submission_id) != parts[2].lower():
         return None
 
-    batch_role = None
-    if len(parts) == 4:
-        try:
-            batch_role = BatchMealRole(parts[3])
-        except TypeError, ValueError:
-            return None
-
     try:
         return MealCallback(
             action=action,
             submission_id=str(submission_id),
-            batch_role=batch_role,
         )
     except ValidationError:
         return None
 
 
-def parse_checkin_callback(data: str) -> CheckinCallback | None:
-    """Parse the exact callback format accepted by check-in handlers."""
+def parse_plan_chat_callback(data: str) -> PlanChatCallback | None:
+    """Parse the exact plan-chat end callback within Telegram's byte limit."""
+    if not isinstance(data, str):
+        return None
     if len(data.encode("utf-8")) > MAX_CALLBACK_DATA_BYTES:
         return None
-    parts = data.split(":")
-    if len(parts) != 5 or parts[0] != "checkin":
-        return None
-    try:
-        from datetime import date
 
-        date.fromisoformat(parts[1])
-        return CheckinCallback(
-            week_start=parts[1],
-            day=int(parts[2]),
-            meal_type=MealType(parts[3]),
-            outcome=MealOutcome(parts[4]),
+    parts = data.split(":")
+    if len(parts) != 3 or parts[:2] != ["plan_chat", "end"]:
+        return None
+
+    try:
+        return PlanChatCallback(
+            action=PlanChatCallbackAction.END,
+            session_id=parts[2],
         )
-    except TypeError, ValueError:
+    except TypeError, ValueError, ValidationError:
         return None
 
 
@@ -373,13 +354,6 @@ def parse_profile_callback(data: str) -> ProfileCallback | None:
                 index=int(parts[3]),
                 profile_revision=int(parts[4]),
             )
-        if action in {
-            ProfileCallbackAction.CONFIRM,
-            ProfileCallbackAction.CANCEL,
-        }:
-            if len(parts) != 3:
-                return None
-            return ProfileCallback(action=action, token=parts[2])
         if action is ProfileCallbackAction.CATEGORY:
             if len(parts) != 3:
                 return None

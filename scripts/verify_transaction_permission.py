@@ -33,8 +33,6 @@ class DeploymentResources:
 
     bot_function_name: str
     bot_role_arn: str
-    planner_function_name: str
-    planner_role_arn: str
     table_name: str
     table_arn: str
 
@@ -115,9 +113,6 @@ def resolve_resources(
     bot_function_name = _stack_output(
         stack_response, "BotFunctionName", stack_name
     )
-    planner_function_name = _stack_output(
-        stack_response, "PlannerFunctionName", stack_name
-    )
     table_name = _stack_output(
         stack_response, "MealPlannerTableName", stack_name
     )
@@ -129,15 +124,6 @@ def resolve_resources(
         raise VerificationError("malformed AWS response from Lambda")
     bot_role_arn = _required_string(
         bot_function_response.get("Role"), "Bot Lambda role ARN"
-    )
-
-    planner_function_response = lambda_client.get_function_configuration(
-        FunctionName=planner_function_name
-    )
-    if not isinstance(planner_function_response, dict):
-        raise VerificationError("malformed AWS response from Lambda")
-    planner_role_arn = _required_string(
-        planner_function_response.get("Role"), "Planner Lambda role ARN"
     )
 
     table_response = dynamodb.describe_table(TableName=table_name)
@@ -153,8 +139,6 @@ def resolve_resources(
     return DeploymentResources(
         bot_function_name=bot_function_name,
         bot_role_arn=bot_role_arn,
-        planner_function_name=planner_function_name,
-        planner_role_arn=planner_role_arn,
         table_name=table_name,
         table_arn=table_arn,
     )
@@ -201,30 +185,16 @@ def _verify_role_permission(
 
 
 def verify_permission(iam: Any, resources: DeploymentResources) -> None:
-    """Require both deployed roles to allow the exact table transaction."""
-    first_error: VerificationError | None = None
-    for role_label, role_arn in (
-        ("BotFunction", resources.bot_role_arn),
-        ("PlannerFunction", resources.planner_role_arn),
-    ):
-        try:
-            _verify_role_permission(
-                iam, role_label, role_arn, resources.table_arn
-            )
-        except VerificationError as exc:
-            if first_error is None:
-                first_error = exc
-    if first_error is not None:
-        raise first_error
+    """Require only Bot's explicit table transaction permission."""
+    _verify_role_permission(
+        iam, "BotFunction", resources.bot_role_arn, resources.table_arn
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
     """Build the command-line parser."""
     parser = argparse.ArgumentParser(
-        description=(
-            "Verify the deployed Bot and Planner roles can transact on "
-            "their table."
-        )
+        description=("Verify the deployed Bot role can transact on its table.")
     )
     parser.add_argument("--stack-name", required=True)
     parser.add_argument("--region", required=True)
@@ -273,7 +243,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     print(
-        f"BotFunction and PlannerFunction roles explicitly allow "
+        f"BotFunction role explicitly allows "
         f"{TRANSACTION_ACTION} on {resources.table_arn}"
     )
     return 0

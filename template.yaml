@@ -19,24 +19,15 @@ Parameters:
     Description: >
       Comma-separated positive numeric Telegram user IDs allowed to use the
       Bot Lambda
-  ConversationalLlmModel:
+  PlanChatLlmModel:
     Type: String
     Default: gpt-5.6-luna
-    Description: LiteLLM model identifier for conversational replies
-  ConversationalLlmReasoningEffort:
-    Type: String
-    Default: medium
-    AllowedValues: [none, minimal, low, medium, high, xhigh, max]
-    Description: Reasoning effort for conversational replies
-  PlannerLlmModel:
-    Type: String
-    Default: gpt-5.6-luna
-    Description: LiteLLM model identifier for plans and groceries
-  PlannerLlmReasoningEffort:
+    Description: LiteLLM model identifier for Plan Chat drafts
+  PlanChatLlmReasoningEffort:
     Type: String
     Default: high
     AllowedValues: [none, minimal, low, medium, high, xhigh, max]
-    Description: Reasoning effort for plans and groceries
+    Description: Reasoning effort for Plan Chat drafts
   SecretRefreshToken:
     Type: String
     Description: Change this non-secret token whenever a referenced secret rotates
@@ -54,13 +45,6 @@ Globals:
         TELEGRAM_BOT_TOKEN: !Sub
           - '{{resolve:secretsmanager:${SecretName}:SecretString:telegram_bot_token}}'
           - SecretName: !Ref AppSecretsSecretName
-        LLM_API_KEY: !Sub
-          - '{{resolve:secretsmanager:${SecretName}:SecretString:llm_api_key}}'
-          - SecretName: !Ref AppSecretsSecretName
-        CONVERSATIONAL_LLM_MODEL: !Ref ConversationalLlmModel
-        CONVERSATIONAL_LLM_REASONING_EFFORT: !Ref ConversationalLlmReasoningEffort
-        PLANNER_LLM_MODEL: !Ref PlannerLlmModel
-        PLANNER_LLM_REASONING_EFFORT: !Ref PlannerLlmReasoningEffort
         SECRET_REFRESH_TOKEN: !Ref SecretRefreshToken
 
 Resources:
@@ -96,17 +80,12 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
-          PLANNER_FUNCTION_NAME: !Ref PlannerFunction
+          PLAN_CHAT_FUNCTION_NAME: !Ref PlanChatFunction
           TELEGRAM_WEBHOOK_SECRET: !Sub
             - '{{resolve:secretsmanager:${SecretName}:SecretString:telegram_webhook_secret}}'
             - SecretName: !Ref AppSecretsSecretName
           TELEGRAM_ALLOWED_USER_IDS: !Ref TelegramAllowedUserIds
-          BOT_FUNCTION_TIMEOUT_SECONDS: '30'
           BOT_TELEGRAM_REQUEST_TIMEOUT_SECONDS: '5'
-          BOT_LLM_REQUEST_TIMEOUT_SECONDS: '6'
-          BOT_LLM_MAX_RETRIES: '2'
-          BOT_LLM_INITIAL_BACKOFF_SECONDS: '1'
-          BOT_HANDLER_SAFETY_MARGIN_SECONDS: '4'
           SECRET_REFRESH_TOKEN: !Ref SecretRefreshToken
       Policies:
         - DynamoDBCrudPolicy:
@@ -116,7 +95,7 @@ Resources:
               Action: dynamodb:TransactWriteItems
               Resource: !GetAtt MealPlannerTable.Arn
         - LambdaInvokePolicy:
-            FunctionName: !Ref PlannerFunction
+            FunctionName: !Ref PlanChatFunction
       Events:
         TelegramWebhook:
           Type: HttpApi
@@ -124,40 +103,35 @@ Resources:
             Path: /webhook
             Method: post
 
-  PlannerFunction:
+  PlanChatFunction:
     Type: AWS::Serverless::Function
     Metadata:
       BuildMethod: python-uv
-      SamResourceId: PlannerFunction
+      SamResourceId: PlanChatFunction
     Properties:
-      FunctionName: !Sub ${AWS::StackName}-planner
+      FunctionName: !Sub ${AWS::StackName}-plan-chat
       CodeUri: ./
-      Handler: meal_planner.planner_handler.lambda_handler
+      Handler: meal_planner.plan_chat_handler.lambda_handler
       Timeout: 310
       MemorySize: 512
       Environment:
         Variables:
-          PLANNER_FUNCTION_TIMEOUT_SECONDS: '300'
-          PLANNER_TELEGRAM_REQUEST_TIMEOUT_SECONDS: '10'
-          PLANNER_LLM_REQUEST_TIMEOUT_SECONDS: '240'
-          PLANNER_LLM_MAX_RETRIES: '1'
-          PLANNER_LLM_INITIAL_BACKOFF_SECONDS: '1'
-          PLANNER_GROCERY_LLM_REQUEST_TIMEOUT_SECONDS: '120'
-          PLANNER_GROCERY_LLM_MAX_RETRIES: '2'
-          PLANNER_HANDLER_SAFETY_MARGIN_SECONDS: '20'
-          SECRET_REFRESH_TOKEN: !Ref SecretRefreshToken
+          LLM_API_KEY: !Sub
+            - '{{resolve:secretsmanager:${SecretName}:SecretString:llm_api_key}}'
+            - SecretName: !Ref AppSecretsSecretName
+          PLAN_CHAT_LLM_MODEL: !Ref PlanChatLlmModel
+          PLAN_CHAT_LLM_REASONING_EFFORT: !Ref PlanChatLlmReasoningEffort
+          PLAN_CHAT_TELEGRAM_REQUEST_TIMEOUT_SECONDS: '10'
+          PLAN_CHAT_LLM_REQUEST_TIMEOUT_SECONDS: '240'
       Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref MealPlannerTable
         - Statement:
             - Effect: Allow
-              Action: dynamodb:TransactWriteItems
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:PutItem
+                - dynamodb:DeleteItem
               Resource: !GetAtt MealPlannerTable.Arn
-        - Statement:
-            - Effect: Allow
-              Action: lambda:InvokeFunction
-              Resource: !Sub
-                arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-planner
 
 Outputs:
   WebhookUrl:
@@ -169,6 +143,6 @@ Outputs:
   BotFunctionName:
     Description: Bot Lambda Function Name
     Value: !Ref BotFunction
-  PlannerFunctionName:
-    Description: Planner Lambda Function Name
-    Value: !Ref PlannerFunction
+  PlanChatFunctionName:
+    Description: Plan Chat Lambda Function Name
+    Value: !Ref PlanChatFunction

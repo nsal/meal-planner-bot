@@ -43,12 +43,8 @@ BOT_COMMANDS: Final[tuple[TelegramCommand, ...]] = (
     TelegramCommand("start", "Start onboarding or view what to do next"),
     TelegramCommand("help", "Show the available commands"),
     TelegramCommand("profile", "View and amend the household profile"),
-    TelegramCommand("plan", "Create or retry a meal plan"),
-    TelegramCommand("grocery", "View the active grocery list"),
-    TelegramCommand("today", "View today's planned meals"),
+    TelegramCommand("plan", "Create a conversational meal-plan draft"),
     TelegramCommand("submit_meals", "Log meals eaten in the past week"),
-    TelegramCommand("checkin", "Record today's planned meal outcomes"),
-    TelegramCommand("cancel", "Cancel an unfinished workflow"),
 )
 
 

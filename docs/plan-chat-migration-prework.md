@@ -1,9 +1,8 @@
-# Plan Chat Migration Pre-work
+# Plan Chat migration pre-work
 
-Run this pre-work before executing the conversational-draft simplification
-plan. It prepares local SAM artifacts, verifies the repository, and captures a
-read-only AWS baseline. It does not deploy, clean up stack resources, or read
-or modify DynamoDB records.
+Run this pre-work before deploying the conversational Plan Chat workflow. It
+prepares local SAM artifacts, verifies the repository, and captures a
+read-only AWS baseline. It does not deploy, scan DynamoDB, or delete records.
 
 ## Local preparation
 
@@ -26,7 +25,7 @@ under `.aws-sam/` are ignored by Git.
 
 ## Read-only AWS baseline
 
-The baseline command requires AWS credentials with these read permissions:
+The baseline command requires these read permissions:
 
 - `cloudformation:DescribeStacks`
 - `cloudformation:ListStackResources`
@@ -44,11 +43,11 @@ uv run python scripts/capture_migration_baseline.py \
 ```
 
 The output contains stack and resource identifiers, Lambda role ARNs, Lambda
-environment-variable names, and DynamoDB table identity. It excludes stack
-output values, Lambda environment values, table records, and table item
-counts. Treat the file as internal deployment metadata.
+environment-variable names, and DynamoDB table identity. It excludes output
+values, environment values, table records, and item counts. Treat the file as
+internal deployment metadata.
 
 The command never invokes DynamoDB item operations or AWS mutation APIs. It
-does not delete the legacy Planner Lambda because CloudFormation owns that
-resource. It also leaves historical plan, grocery, batch, repair, and revision
-records untouched.
+does not remove resources owned by CloudFormation, and it leaves existing
+DynamoDB records untouched. Historical completed plan documents remain under
+`docs/plans/completed/` and are not active deployment instructions.

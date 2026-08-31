@@ -29,8 +29,8 @@ def _clients() -> tuple[MagicMock, MagicMock, MagicMock]:
                 "StackStatus": "UPDATE_COMPLETE",
                 "Outputs": [
                     {
-                        "OutputKey": "PlannerFunctionName",
-                        "OutputValue": "meal-planner-test-planner",
+                        "OutputKey": "PlanChatFunctionName",
+                        "OutputValue": "meal-planner-test-plan-chat",
                     },
                     {
                         "OutputKey": "WebhookUrl",
@@ -61,8 +61,8 @@ def _clients() -> tuple[MagicMock, MagicMock, MagicMock]:
         {
             "StackResourceSummaries": [
                 {
-                    "LogicalResourceId": "PlannerFunction",
-                    "PhysicalResourceId": "meal-planner-test-planner",
+                    "LogicalResourceId": "PlanChatFunction",
+                    "PhysicalResourceId": "meal-planner-test-plan-chat",
                     "ResourceType": "AWS::Lambda::Function",
                     "ResourceStatus": "UPDATE_COMPLETE",
                 }
@@ -136,7 +136,7 @@ def test_capture_baseline_records_only_read_only_non_secret_metadata() -> None:
 
     assert result["captured_at"] == "2026-08-28T12:00:00+00:00"
     assert result["stack"]["output_keys"] == [
-        "PlannerFunctionName",
+        "PlanChatFunctionName",
         "WebhookUrl",
     ]
     assert result["lambdas"][0]["environment_variable_names"] == [
@@ -167,7 +167,7 @@ def test_capture_baseline_records_only_read_only_non_secret_metadata() -> None:
     lambda_client.get_function_configuration.assert_has_calls(
         [
             call(FunctionName="meal-planner-test-bot"),
-            call(FunctionName="meal-planner-test-planner"),
+            call(FunctionName="meal-planner-test-plan-chat"),
         ]
     )
     dynamodb.describe_table.assert_called_once_with(

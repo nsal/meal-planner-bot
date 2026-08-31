@@ -424,19 +424,19 @@ Rename the worker module and deployment concepts to plan chat:
 - Modify: `src/meal_planner/llm/prompts.py`
 - Modify: `tests/test_prompts.py`
 
-- [ ] write failing prompt tests for every household member and available
+- [x] write failing prompt tests for every household member and available
   calorie, protein, and fibre target
-- [ ] write failing tests for raw constraints, raw preferences, and submitted
+- [x] write failing tests for raw constraints, raw preferences, and submitted
   meals grouped over the inclusive 21-day window
-- [ ] write failing follow-up tests for original request, latest response, and
+- [x] write failing follow-up tests for original request, latest response, and
   current instruction, including the no-previous-response case
-- [ ] implement `build_plan_chat_prompt()` and only the small rendering helpers
+- [x] implement `build_plan_chat_prompt()` and only the small rendering helpers
   it needs, without a JSON schema, rule rendering, or validation language
-- [ ] instruct the model about draft status, history semantics, clarification,
+- [x] instruct the model about draft status, history semantics, clarification,
   plain headings and bullets, calorie estimates, and no Markdown tables
-- [ ] test empty dietary lists, no history, optional nutrition targets,
+- [x] test empty dietary lists, no history, optional nutrition targets,
   Unicode text, boundary lengths, and delimiter-safe rendering
-- [ ] run `uv run pytest tests/test_prompts.py`; then run `uv run pytest`; both
+- [x] run `uv run pytest tests/test_prompts.py`; then run `uv run pytest`; both
   must pass before Task 3
 
 ### Task 3: Add session-scoped Telegram controls
@@ -448,19 +448,19 @@ Rename the worker module and deployment concepts to plan chat:
 - Modify: `tests/test_router.py`
 - Modify: `tests/test_telegram_api.py`
 
-- [ ] write failing tests for `plan_chat:end:<session_id>` parsing, Telegram's
+- [x] write failing tests for `plan_chat:end:<session_id>` parsing, Telegram's
   64-byte callback limit, canonical UUID spelling, and malformed callbacks
-- [ ] add a typed plan-chat callback and a parser that accepts only the end
+- [x] add a typed plan-chat callback and a parser that accepts only the end
   action and one session ID
-- [ ] add an `End planning` inline keyboard and ensure `send_message()` attaches
+- [x] add an `End planning` inline keyboard and ensure `send_message()` attaches
   it only to the final chunk of a split response
-- [ ] add a small plan-chat send helper only if it removes repeated keyboard
+- [x] add a small plan-chat send helper only if it removes repeated keyboard
   assembly without coupling message transport to state logic
-- [ ] write success tests for initial prompts, generated responses, error
+- [x] write success tests for initial prompts, generated responses, error
   messages, and split output with the button on the last chunk
-- [ ] write error tests for stale-looking data, oversized callback data, and
+- [x] write error tests for stale-looking data, oversized callback data, and
   Telegram API failures
-- [ ] run `uv run pytest tests/test_router.py tests/test_telegram_api.py`; then
+- [x] run `uv run pytest tests/test_router.py tests/test_telegram_api.py`; then
   run `uv run pytest`; both must pass before Task 4
 
 ### Task 4: Implement the asynchronous Plan Chat worker
@@ -472,21 +472,21 @@ Rename the worker module and deployment concepts to plan chat:
 - Modify: `src/meal_planner/llm/client.py`
 - Modify: `tests/test_llm_client.py`
 
-- [ ] write failing worker tests for a valid event, consistent state load,
+- [x] write failing worker tests for a valid event, consistent state load,
   current profile load, and exactly 21 days of meal-history retrieval
-- [ ] write failing tests proving the worker makes one text request, does not
+- [x] write failing tests proving the worker makes one text request, does not
   request JSON, and sends the response unchanged with `End planning`
-- [ ] implement the typed event entry point, ownership recheck, prompt build,
+- [x] implement the typed event entry point, ownership recheck, prompt build,
   one provider request, conditional ready transition, and Telegram delivery
-- [ ] configure the client for one application-level attempt and retain only
+- [x] configure the client for one application-level attempt and retain only
   bounded technical failure classification needed for user retry messages
-- [ ] write stale-result tests for missing, replaced, cancelled, wrong-step,
+- [x] write stale-result tests for missing, replaced, cancelled, wrong-step,
   wrong-request, and wrong-revision states; none may send model output
-- [ ] write provider timeout, transient, permanent, blank-output, persistence,
+- [x] write provider timeout, transient, permanent, blank-output, persistence,
   and Telegram delivery failure tests without inspecting generated semantics
-- [ ] test first-request failure versus follow-up failure state restoration and
+- [x] test first-request failure versus follow-up failure state restoration and
   verify prompts, profile content, meals, IDs, and generated text are not logged
-- [ ] run `uv run pytest tests/test_plan_chat_handler.py
+- [x] run `uv run pytest tests/test_plan_chat_handler.py
   tests/test_llm_client.py`; then run `uv run pytest`; both must pass before
   Task 5
 
@@ -499,21 +499,21 @@ Rename the worker module and deployment concepts to plan chat:
 - Modify: `tests/test_bot_handler.py`
 - Modify: `tests/test_telegram_commands.py`
 
-- [ ] write failing tests for `/plan` creating an awaiting-request session and
+- [x] write failing tests for `/plan` creating an awaiting-request session and
   replacing any older workflow with a new session ID
-- [ ] write failing tests for an initial request transitioning to generating,
+- [x] write failing tests for an initial request transitioning to generating,
   creating a fresh request ID, and invoking Plan Chat with identifiers only
-- [ ] write failing tests for ready-state follow-ups, refreshed context dates,
+- [x] write failing tests for ready-state follow-ups, refreshed context dates,
   retained initial request/latest response, and no follow-up queue while busy
-- [ ] route `/plan` and plan-chat conversational messages through the new state
+- [x] route `/plan` and plan-chat conversational messages through the new state
   path and `_invoke_plan_chat`, bypassing preference interpretation entirely
-- [ ] handle invocation failure by conditionally restoring a usable state and
+- [x] handle invocation failure by conditionally restoring a usable state and
   returning a bounded technical retry message
-- [ ] write idempotency, duplicate-update, concurrent-transition, expiry,
+- [x] write idempotency, duplicate-update, concurrent-transition, expiry,
   malformed-state, and invocation-error tests
-- [ ] update `/start` and `/help` text to describe conversational drafts without
+- [x] update `/start` and `/help` text to describe conversational drafts without
   confirmation, tracking, groceries, check-ins, or validation guarantees
-- [ ] run `uv run pytest tests/test_bot_handler.py
+- [x] run `uv run pytest tests/test_bot_handler.py
   tests/test_telegram_commands.py`; then run `uv run pytest`; both must pass
   before Task 6
 
@@ -528,19 +528,19 @@ Rename the worker module and deployment concepts to plan chat:
 - Modify: `tests/test_telegram_commands.py`
 - Modify: `tests/test_router.py`
 
-- [ ] write failing tests for ending awaiting, generating, and ready plan-chat
+- [x] write failing tests for ending awaiting, generating, and ready plan-chat
   sessions through an inline callback
-- [ ] conditionally delete only a matching `PLAN_CHAT` session ID and
+- [x] conditionally delete only a matching `PLAN_CHAT` session ID and
   acknowledge successful, stale, already-ended, and persistence-failure paths
-- [ ] prove a button from a replaced session cannot end the current session or
+- [x] prove a button from a replaced session cannot end the current session or
   suppress its valid worker
-- [ ] remove `cancel` from `BOT_COMMANDS`, `SUPPORTED_COMMANDS`, command
+- [x] remove `cancel` from `BOT_COMMANDS`, `SUPPORTED_COMMANDS`, command
   dispatch, help output, and `_cmd_cancel`
-- [ ] retain meal-review `Cancel` and profile `Close` behavior with regression
+- [x] retain meal-review `Cancel` and profile `Close` behavior with regression
   tests proving they remain scoped to their own state
-- [ ] write tests proving `/cancel` is now an unknown command and plan prompts,
+- [x] write tests proving `/cancel` is now an unknown command and plan prompts,
   responses, and failure messages carry the end button
-- [ ] run `uv run pytest tests/test_bot_handler.py
+- [x] run `uv run pytest tests/test_bot_handler.py
   tests/test_telegram_commands.py tests/test_router.py`; then run
   `uv run pytest`; both must pass before Task 7
 
@@ -557,23 +557,28 @@ Rename the worker module and deployment concepts to plan chat:
 - Modify: `tests/test_router.py`
 - Modify: `tests/test_telegram_api.py`
 
-- [ ] write target-surface tests proving only `start`, `help`, `profile`,
+- [x] write target-surface tests proving only `start`, `help`, `profile`,
   `plan`, and `submit_meals` are registered commands
-- [ ] remove `_cmd_grocery`, `_cmd_today`, `_cmd_checkin`, check-in callback
+- [x] remove `_cmd_grocery`, `_cmd_today`, `_cmd_checkin`, check-in callback
   dispatch, `_get_todays_plan_day`, and their command mappings
-- [ ] remove old preference collection, interpretation, obligation snapshot,
+- [x] remove old preference collection, interpretation, obligation snapshot,
   retry-ready, confirmation, edit, revision, and old planner invocation helpers
   listed in the concrete deletion inventory
-- [ ] remove generic conversational plan intents so ordinary text is handled
+- [x] remove generic conversational plan intents so ordinary text is handled
   only by an active setup, profile, meal-log, or plan-chat workflow
-- [ ] remove `CheckinCallback`, `parse_checkin_callback`, `send_plan`,
+- [x] remove `CheckinCallback`, `parse_checkin_callback`, `send_plan`,
   `send_grocery_list`, and `send_meal_checkin`
-- [ ] delete obsolete bot/router/API test cases and add negative route/callback
+- [x] delete obsolete bot/router/API test cases and add negative route/callback
   tests for every removed command and check-in payload
-- [ ] run `uv run pytest tests/test_bot_handler.py
+- [x] run `uv run pytest tests/test_bot_handler.py
   tests/test_telegram_commands.py tests/test_router.py
   tests/test_telegram_api.py`; then run `uv run pytest`; both must pass before
   Task 8
+
+⚠️ Task 7 removes the active Telegram `send_plan` API before Task 12 deletes
+the unreachable legacy worker. Two documented Mypy suppressions remain only
+on that worker's old delivery calls and must disappear with
+`planner_handler.py` in Task 12.
 
 ### Task 8: Store raw profile constraints and preferences
 
@@ -589,24 +594,62 @@ Rename the worker module and deployment concepts to plan chat:
 - Modify: `tests/test_bot_handler.py`
 - Modify: `tests/test_telegram_api.py`
 
-- [ ] write failing migration tests for saved raw strings, legacy constraint
+- [x] write failing migration tests for saved raw strings, legacy constraint
   mappings, legacy preference mappings, missing/null `source_text`, no-value
   phrases, duplicates, oversize values, and ignored `batch_rules`
-- [ ] change `UserProfile` and its draft type to bounded raw-text dietary lists
+- [x] change `UserProfile` and its draft type to bounded raw-text dietary lists
   with one small legacy read normalizer and no interpreted-rule models
-- [ ] simplify profile repository canonicalization and guarded updates to
+- [x] simplify profile repository canonicalization and guarded updates to
   preserve revision concurrency without dietary conflict resolution
-- [ ] remove pending-rule encoding, LLM interpretation, confirmation callbacks,
+- [x] remove pending-rule encoding, LLM interpretation, confirmation callbacks,
   rule review messages, batch-rule profile presentation, and related helpers
-- [ ] make `/profile` add and remove raw constraints/preferences directly while
+- [x] make `/profile` add and remove raw constraints/preferences directly while
   retaining indexed removal revision guards and existing family-target edits
-- [ ] write success tests for raw add/remove/display, legacy read followed by
+- [x] write success tests for raw add/remove/display, legacy read followed by
   simplified write, concurrent edit rejection, and empty categories
-- [ ] write error tests for malformed saved data, invalid list entries, stale
+- [x] write error tests for malformed saved data, invalid list entries, stale
   buttons, duplicate input, and persistence failures
-- [ ] run `uv run pytest tests/test_schemas.py tests/test_dynamo.py
+- [x] stabilize the Task 8 verification boundary by removing only obsolete
+  legacy tests and unreachable `batch_rules` planner usage exposed by the raw
+  profile migration; update stale SAM test artifacts only as required by the
+  current source template
+- [x] verify every early cleanup target is unreachable from retained `/plan`,
+  `/profile`, and `/submit_meals` workflows and record the work pulled forward
+  from Tasks 12 and 13 without adding compatibility fields or shims
+- [x] run `uv run pytest tests/test_schemas.py tests/test_dynamo.py
   tests/test_bot_handler.py tests/test_telegram_api.py`; then run
   `uv run pytest`; both must pass before Task 9
+
+⚠️ Task 8 retry 2: focused tests pass (711 passed), Ruff and formatting pass,
+and `uv run mypy` still reports the pre-existing
+`src/meal_planner/planner_handler.py:1485` reference to removed
+`UserProfile.batch_rules`. The full suite passes 1,751 tests but still fails
+the same 11 pre-existing legacy planner revision tests (7), one legacy prompt
+test, one reset-profile repair test, and two stale SAM artifact tests. The
+failures require later planned deletion and deployment tasks; no later-task
+behavior was changed in this retry. The final checklist item remains open, so
+Task 8 is not accepted under the plan's requirement that both test commands
+pass before Task 9.
+
+⚠️ Task 8 final retry 3: validated the raw profile migration and direct edit
+paths from scratch without finding a Task 8-scoped defect. Focused tests pass
+(711 passed, 3 legacy-fixture serializer warnings); Ruff and formatting pass.
+`uv run pytest` passes 1,751 tests and fails the same 11 legacy tests: seven
+planner revision tests, one obsolete structured-profile prompt test, one
+legacy profile-repair test, and two stale SAM artifact tests. `uv run mypy`
+still reports only `src/meal_planner/planner_handler.py:1485`, where the
+unremoved legacy worker references `UserProfile.batch_rules`. No later-task
+behavior was changed. The final checklist item remains open because the full
+suite and type gate require later planned cleanup/deployment tasks.
+
+⚠️ Task 8 stabilization completed after the validated plan amendment. Seven
+obsolete legacy planner-revision test cases, one structured-profile prompt
+test, and one obsolete repair-script test were removed. The unreachable legacy
+planner reads only optional in-memory legacy fixtures without restoring
+`batch_rules` to `UserProfile`, and SAM artifacts were rebuilt from current
+source. Focused tests pass (711), the full suite passes (1,753), Ruff and format
+checks pass, and Mypy reports no issues. Tasks 12 and 13 retain their complete
+deletion, rename, least-privilege, and audit responsibilities.
 
 ### Task 9: Replace LLM onboarding with deterministic profile setup
 
@@ -621,22 +664,28 @@ Rename the worker module and deployment concepts to plan chat:
 - Modify: `tests/test_dynamo.py`
 - Modify: `tests/test_telegram_api.py`
 
-- [ ] write failing tests for the new-user sequence: family name, household
+- [x] write failing tests for the new-user sequence: family name, household
   size, one member/target line per person, constraints, preferences, and save
-- [ ] add minimal typed setup steps and reuse the profile draft item rather
+- [x] add minimal typed setup steps and reuse the profile draft item rather
   than adding another persistence aggregate
-- [ ] implement deterministic parsing for member lines and newline-separated
+- [x] implement deterministic parsing for member lines and newline-separated
   dietary text, including explicit `none`, bounds, and retry prompts
-- [ ] make `/start` begin or resume setup for an incomplete profile and retain
+- [x] make `/start` begin or resume setup for an incomplete profile and retain
   the welcome/menu behavior for complete profiles
-- [ ] remove generic conversational LLM onboarding, intent metadata,
+- [x] remove generic conversational LLM onboarding, intent metadata,
   conversational profile updates, and all Bot LLM calls
-- [ ] write tests for optional protein/fibre targets, multiple members,
+- [x] write tests for optional protein/fibre targets, multiple members,
   duplicate names, invalid counts, malformed targets, cancellation through the
   profile control, stale state, persistence failure, and restart behavior
-- [ ] run `uv run pytest tests/test_schemas.py tests/test_bot_handler.py
+- [x] run `uv run pytest tests/test_schemas.py tests/test_bot_handler.py
   tests/test_dynamo.py tests/test_telegram_api.py`; then run `uv run pytest`;
   both must pass before Task 10
+
+⚠️ Task 9 deviation: focused verification passes (725 tests); the full suite
+reports 1,765 passed and two pre-existing stale SAM artifact assertions in
+`tests/test_template.py` for `BotFunction` and `PlannerFunction`. Refreshing
+those artifacts belongs to planned deployment cleanup and was not changed in
+Task 9. Ruff check, Ruff format, and strict Mypy pass.
 
 ### Task 10: Remove batch coupling from `/submit_meals`
 
@@ -653,22 +702,29 @@ Rename the worker module and deployment concepts to plan chat:
 - Modify: `tests/test_dynamo.py`
 - Modify: `tests/test_telegram_api.py`
 
-- [ ] preserve characterization tests for `/submit_meals` history display,
+- [x] preserve characterization tests for `/submit_meals` history display,
   structured input, review, confirm, cancel, add-more, done, duplicate update,
   stale callback, and conditional persistence behavior
-- [ ] remove planned-batch lookup from `_handle_structured_meal_input` and
+- [x] remove planned-batch lookup from `_handle_structured_meal_input` and
   batch-role validation/conversion from `_confirm_meal_callback`
-- [ ] remove pending/submitted batch fields from meal state and log entries,
+- [x] remove pending/submitted batch fields from meal state and log entries,
   batch suffixes from `MealCallback`, and batch arguments from review UI
-- [ ] simplify `confirm_meal_and_transition` to write only the meal item and
+- [x] simplify `confirm_meal_and_transition` to write only the meal item and
   next conversation state atomically, preserving duplicate-meal semantics
-- [ ] delete batch-specific meal tests and add negative tests proving old
+- [x] delete batch-specific meal tests and add negative tests proving old
   four-part batch callbacks are rejected without changing ordinary callbacks
-- [ ] verify user-visible meal prompts and success/error messages remain
+- [x] verify user-visible meal prompts and success/error messages remain
   unchanged except for text that explicitly described planned batch roles
-- [ ] run `uv run pytest tests/test_schemas.py tests/test_router.py
+- [x] run `uv run pytest tests/test_schemas.py tests/test_router.py
   tests/test_bot_handler.py tests/test_dynamo.py tests/test_telegram_api.py`;
   then run `uv run pytest`; both must pass before Task 11
+
+Task 10 verification completed after rebuilding the ignored local SAM
+artifacts with `uvx --from aws-sam-cli sam build --beta-features`. The focused
+suite passes 820 tests and the full suite passes 1,729 tests. `uv run ruff
+check .`, `uv run ruff format --check .`, and `uv run mypy` also pass. The
+meal confirmation transaction writes only the meal and conversation state;
+duplicate confirmations remain handled by state/revision guards.
 
 ### Task 11: Delete plan, grocery, batch, and repair persistence
 
@@ -678,23 +734,39 @@ Rename the worker module and deployment concepts to plan chat:
 - Modify: `tests/test_dynamo.py`
 - Modify: `tests/factories.py`
 
-- [ ] add retained repository coverage for profile CRUD, profile drafts,
+- [x] add retained repository coverage for profile CRUD, profile drafts,
   conversation save/transition/delete, ordinary meal confirmation, and exact
   21-day history retrieval before deleting other tests
-- [ ] delete every repository method and helper named in the concrete deletion
+- [x] delete every repository method and helper named in the concrete deletion
   inventory after confirming there are no retained production callers
-- [ ] delete plan, grocery, batch, obligation, repair, active-plan, outcome, and
+- [x] delete plan, grocery, batch, obligation, repair, active-plan, outcome, and
   revision repository tests and fixtures with their implementations
-- [ ] remove now-unused imports, exception classifiers, conditional-expression
+- [x] remove now-unused imports, exception classifiers, conditional-expression
   fragments, constants, aliases, and transaction helpers proven unreachable
-- [ ] add negative source/reference assertions only where they guard an
-  architectural boundary rather than duplicating implementation details
-- [ ] test history boundaries, ordering, empty history, duplicate meal
+- [x] audit negative source/reference assertions and add them only where they
+  guard an architectural boundary rather than duplicating implementation
+  details; no Task 11 assertion was warranted
+- [x] test history boundaries, ordering, empty history, duplicate meal
   submission, stale state, expired state, profile revision, and Dynamo failures
-- [ ] run `uv run pytest tests/test_dynamo.py`; then run `uv run pytest`; both
-  must pass before Task 12
+- [x] run `uv run pytest tests/test_dynamo.py`; the focused repository suite
+  must pass before beginning the coupled Task 12 deletion boundary
+
+⚠️ Tasks 11 and 12 form one coupled deletion and verification boundary. Task
+11's focused repository suite passes 68 tests, and its implementation inventory
+is complete. A negative source-string assertion was not added because retained
+repository tests and production callers already enforce the boundary. The full
+suite cannot collect while Task 12's legacy `tests/test_planner_handler.py`
+imports the deleted `RepairPublicationOutcome`, and strict Mypy reports only
+legacy `planner_handler.py` calls to the deleted repository API. Task 12 is
+therefore authorized to proceed before the shared full-suite gate. Neither task
+is considered release-ready until Task 12 reruns both focused suites, the full
+suite, Ruff lint and formatting, and strict Mypy successfully.
 
 ### Task 12: Delete the legacy generation and validation stack
+
+⚠️ Task 8 stabilization may remove narrowly identified obsolete tests and the
+unreachable planner `batch_rules` dependency early. Task 12 must still audit
+and complete every listed module, symbol, fixture, and import deletion.
 
 **Files:**
 
@@ -717,23 +789,41 @@ Rename the worker module and deployment concepts to plan chat:
 - Modify: `tests/test_prompts.py`
 - Modify: `tests/factories.py`
 
-- [ ] write retained-contract tests that enumerate the small public model and
+- [x] write retained-contract tests that enumerate the small public model and
   LLM surface needed by profile, meal log, plan chat, and Telegram routing
-- [ ] delete all production and test modules listed above rather than leaving
+- [x] delete all production and test modules listed above rather than leaving
   forwarding imports, deprecated aliases, skipped tests, or dead functions
-- [ ] remove every obsolete model family, alias, constant, normalizer, and
+- [x] remove every obsolete model family, alias, constant, normalizer, and
   application-owned rule ID helper named in the deletion inventory
-- [ ] reduce `llm/prompts.py` to the plan-chat prompt and its directly used
+- [x] reduce `llm/prompts.py` to the plan-chat prompt and its directly used
   rendering helpers; reduce `llm/__init__.py` to live client exports only
-- [ ] prune `models/__init__.py`, factories, schema tests, and prompt tests to
+- [x] prune `models/__init__.py`, factories, schema tests, and prompt tests to
   imports and behavior used by the retained application
-- [ ] add import-smoke tests and run `rg` audits proving active source and tests
+- [x] add import-smoke tests and run `rg` audits proving active source and tests
   contain no imports of deleted modules or deleted symbol families
-- [ ] run `uv run pytest tests/test_schemas.py tests/test_prompts.py
+- [x] rerun `uv run pytest tests/test_dynamo.py` to revalidate Task 11 after
+  deleting the final legacy persistence callers
+- [x] run `uv run pytest tests/test_schemas.py tests/test_prompts.py
   tests/test_llm_client.py tests/test_plan_chat_handler.py`; then run
-  `uv run pytest`; both must pass before Task 13
+  `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`, and
+  `uv run mypy`; all shared Task 11/12 gates must pass before Task 13
+
+Task 12 verification completed. The listed legacy modules, script, and test
+modules were deleted; retained schemas, profile drafts, plain-text prompts,
+and the text-only LLM client were pruned and covered by import-smoke tests.
+`rg` audits found no deleted-module imports, obsolete model families, or
+obsolete prompt/parser exports in active Python source, tests, or scripts.
+The repository suite passes 68 tests, the Task 12 focused suite passes 37
+tests, and the full suite passes 436 tests. Ruff lint, Ruff formatting, and
+strict Mypy pass. The ignored SAM build artifacts were rebuilt to match the
+current source; deployment naming and settings remain assigned to Task 13.
 
 ### Task 13: Simplify configuration, SAM, and deployment tooling
+
+⚠️ Task 8 stabilization may refresh stale SAM test artifacts needed to restore
+a green verification boundary. The Planner-to-Plan-Chat rename, least-
+privilege review, settings cleanup, and deployment-tool simplification remain
+fully in Task 13.
 
 **Files:**
 
@@ -748,27 +838,38 @@ Rename the worker module and deployment concepts to plan chat:
 - Modify: `tests/test_deploy.py`
 - Modify: `tests/test_verify_transaction_permission.py`
 
-- [ ] write failing settings tests for the minimal Bot configuration and the
+- [x] write failing settings tests for the minimal Bot configuration and the
   separate Plan Chat model, timeout, retry, Telegram, LLM, and Dynamo settings
-- [ ] rename the worker module/resource/output/function environment variables
+- [x] rename the worker module/resource/output/function environment variables
   and deployment data structures from Planner to Plan Chat
-- [ ] remove conversational Bot model settings, grocery settings, repair/self-
+- [x] remove conversational Bot model settings, grocery settings, repair/self-
   invocation settings, unused budget branches, and legacy property aliases
-- [ ] scope secrets and IAM: LLM key only on Plan Chat, webhook secret and
+- [x] scope secrets and IAM: LLM key only on Plan Chat, webhook secret and
   allowlist only on Bot, no worker self-invocation, and no worker transaction
   permission
-- [ ] update deployment settings, SAM parameter overrides, stack output
+- [x] update deployment settings, SAM parameter overrides, stack output
   resolution, command registration, and safe diagnostic tests for renamed data
-- [ ] simplify the transaction-permission verifier to the retained Bot
+- [x] simplify the transaction-permission verifier to the retained Bot
   transaction requirement or delete it if SAM policy tests fully replace its
   external purpose; record the evidence for the selected branch in this plan
-- [ ] test invalid budgets, missing secrets, removed environment variables,
+- [x] test invalid budgets, missing secrets, removed environment variables,
   least-privilege resources, stack outputs, build artifacts, and deployment
   command construction
-- [ ] run `uv run pytest tests/test_config.py tests/test_llm_client.py
+- [x] run `uv run pytest tests/test_config.py tests/test_llm_client.py
   tests/test_template.py tests/test_deploy.py
   tests/test_verify_transaction_permission.py`; then run `uv run pytest`; both
   must pass before Task 14
+
+Task 13 verification completed. Configuration now separates the minimal Bot
+settings from Plan Chat's LLM, timeout, retry, Telegram, and DynamoDB inputs;
+legacy Planner and conversational settings, Bot LLM settings, repair/grocery
+budgets, and unused aliases were removed. SAM and deployment tooling use
+`PlanChatFunction`, `PLAN_CHAT_*`, and `PlanChatFunctionName`; secrets and
+permissions are function-scoped, with the explicit transaction grant retained
+only for Bot and the transaction verifier reduced to Bot. The focused suite
+passes 78 tests and the complete suite passes 411 tests. Ruff lint,
+format-check, and strict Mypy pass; SAM build artifacts were refreshed and
+verified against the checked-in template.
 
 ### Task 14: Audit the deletion boundary and verify acceptance criteria
 
@@ -778,28 +879,47 @@ Rename the worker module and deployment concepts to plan chat:
 - Modify:
   `docs/plans/2026-08-28-simplify-meal-planning-to-conversational-drafts.md`
 
-- [ ] write or update active-documentation boundary tests for the retained
+- [x] write or update active-documentation boundary tests for the retained
   command set, 21-day history, draft disclaimer, and removed feature names
-- [ ] verify `/plan` uses current raw profile data, exactly the previous 21
+- [x] verify `/plan` uses current raw profile data, exactly the previous 21
   calendar days of submitted meals, the initial request, and latest follow-up
   context in one plain-text generation request
-- [ ] verify generated output is displayed unchanged with light Telegram
+- [x] verify generated output is displayed unchanged with light Telegram
   formatting controls and is never parsed, validated, repaired, confirmed, or
   stored as a plan
-- [ ] verify `/submit_meals` visible behavior remains intact and the registered
+- [x] verify `/submit_meals` visible behavior remains intact and the registered
   command set is exactly `start`, `help`, `profile`, `plan`, and
   `submit_meals`
-- [ ] verify `End planning`, meal `Cancel`, and profile `Close` are scoped and
+- [x] verify `End planning`, meal `Cancel`, and profile `Close` are scoped and
   stale-safe; verify no top-level `/cancel` remains
-- [ ] use `rg`, import tests, file counts, and symbol inventories to confirm all
+- [x] use `rg`, import tests, file counts, and symbol inventories to confirm all
   listed modules, functions, methods, models, tests, scripts, settings,
   permissions, outputs, and docs references are removed or rewritten
-- [ ] run `uv run pytest` and fix every failure
-- [ ] run `uv run ruff check .` and `uv run ruff format --check .` and fix
+- [x] run `uv run pytest` and fix every failure
+- [x] run `uv run ruff check .` and `uv run ruff format --check .` and fix
   every issue
-- [ ] run `uv run mypy` and fix every issue
-- [ ] record final source/test line counts and the deletion audit result in this
+- [x] run `uv run mypy` and fix every issue
+- [x] record final source/test line counts and the deletion audit result in this
   plan before Task 15
+
+Task 14 verification completed. Boundary tests in `tests/test_readme.py` cover
+the exact retained command menu, draft disclaimer, raw profile and follow-up
+prompt context, inclusive 21-day history, unchanged text delivery,
+workflow-scoped controls, and Plan Chat deployment settings. The source
+inventory is 16 Python files and 6,174 lines; the test inventory is 22 Python
+files and 7,382 lines. `rg` and AST import/symbol audits found no deleted
+module imports or retained definitions/imports for the removed plan, grocery,
+batch, repair, parser, legacy worker, or old Telegram API surfaces in active
+Python. All eleven files in the concrete deletion inventory are absent.
+Infrastructure audit also verified the exact retained resources and outputs,
+Plan Chat-only LLM secret, Bot-only transaction grant, and absence of retired
+settings and permissions.
+
+Task 14 identified three active-documentation handoffs for Task 15. The final
+active-documentation audit is recorded after Task 15: README, prompt guidance,
+and migration pre-work describe only the retained Plan Chat, profile, and
+submitted-meal workflows. Historical completed plans remain excluded from the
+active documentation audit.
 
 ### Task 15: Finalize active documentation and completion records
 
@@ -814,21 +934,97 @@ Rename the worker module and deployment concepts to plan chat:
   `docs/plans/2026-08-28-simplify-meal-planning-to-conversational-drafts.md`
   to `docs/plans/completed/`
 
-- [ ] rewrite README architecture, commands, workflows, configuration,
+- [x] rewrite README architecture, commands, workflows, configuration,
   deployment outputs, failure behavior, privacy notes, and development guidance
   around temporary conversational drafts
-- [ ] rewrite `docs/prompt.md` to document the five prompt sections, 21-day
+- [x] rewrite `docs/prompt.md` to document the five prompt sections, 21-day
   history semantics, follow-up context, clarification behavior, and lack of
   validation guarantees
-- [ ] remove active documentation for plans, confirmation, revision, grocery,
+- [x] remove active documentation for plans, confirmation, revision, grocery,
   today, check-in, outcomes, batch leftovers, interpretation, validation,
   repair, and obsolete settings without rewriting historical completed plans
-- [ ] update environment examples and operator commands to the Plan Chat names
+- [x] update environment examples and operator commands to the Plan Chat names
   and remove unused variables
-- [ ] update every checkbox and any recorded deviations, rerun
+- [x] update every checkbox and any recorded deviations, rerun
   `uv run pytest tests/test_readme.py`, then rerun the complete verification
   commands from Task 14
-- [ ] move this fully completed plan to `docs/plans/completed/`
+- [x] move this fully completed plan to `docs/plans/completed/`
+
+Task 15 verification completed. Active README, prompt, and migration
+documentation now describe temporary conversational Plan Chat drafts, raw
+profile context, submitted meal history, and the five retained Telegram
+commands. They contain no retired workflow commands, old worker names, legacy
+settings, or removed generation contracts. Environment examples and operator
+commands use `PLAN_CHAT_*` and `PlanChatFunction` names. The completed-plan
+move is pending the follow-up remediation's final acceptance gates; this plan
+remains at its active path while the documentation/test contract is
+unresolved.
+
+Final verification results:
+`uv run pytest tests/test_readme.py` passes 12 tests; `uv run pytest` passes
+407 tests; `uv run ruff check .`, `uv run ruff format --check .`, `uv run
+mypy`, and `git diff --check` pass. The active-documentation audit found no
+retired workflow, worker, setting, or generation-contract markers. The final
+inventory is 16 source files and 6,174 source lines, 22 test files and 7,414
+test lines, and 5 script files and 1,597 script lines. No `.env.example` file
+exists in this repository; the tracked README deployment example is the
+authoritative environment example.
+
+The earlier `⚠️` entries document intermediate attempts and their observed
+failures. Tasks 12–15 resolved those temporary collection, stale-artifact,
+type-check, and documentation-test issues. The follow-up Task 5 reconciliation
+has one unresolved documentation/test contract blocker recorded below.
+
+⚠️ Final reconciliation verification (2026-08-31): The follow-up remediation
+plan's Task 5 ran the final gates against the accumulated working tree. Ruff,
+formatting, strict Mypy, and `git diff --check` passed. The active-source,
+test, and script `rg` import audit found no direct imports of the deleted
+planner, parser, dietary-rule, preference, or normalization modules.
+`.aws-sam/build` has no built handler files, so its conditional import check
+was skipped as an existing optional skip and was not executed. The final
+`uv run pytest` gate reported 480 passed, 1 failed, and 1 skipped because
+`tests/test_readme.py::test_original_plan_remains_active_until_external_gates_complete`
+requires the original plan to remain active and unchanged while Task 5
+requires updating and moving it. The independent executor review has not
+been reported and remains pending; no review outcome is inferred. The plan
+move is therefore unresolved.
+
+⚠️ Task 5 retry verification (2026-08-31): `uv run pytest` collected 482
+tests and reported 480 passed, 1 failed, and 1 skipped (exit 1). The sole
+failure was
+`tests/test_readme.py::test_original_plan_remains_active_until_external_gates_complete`;
+the final gate rerun observed active file hash
+`98994c86d33f05bb31e8bf24fed05f42032de3709843fdbb4c1eb4d622f2c257`, but
+the test requires
+`b2c03866c50eb295c77ffcde5fd6bb9165c55f769a344f5e33666ea34f2e7e6e`.
+The deletion-import `rg` audit exited 1 with zero matches. `uv run ruff
+check .`, `uv run ruff format --check .`, `uv run mypy`, and `git diff --check`
+all exited 0. `.aws-sam/build` contained no built Python handler artifacts,
+so its conditional import check was skipped and not executed. The original
+plan and remediation plan were not moved. The contracts cannot both be
+satisfied: leaving the original active violates Task 5's move requirement,
+moving it violates the test's active-path and completed-path requirements,
+and editing it violates the test's fixed-byte hash requirement. No symlink or
+other workaround was used.
+
+Additional final gate rerun evidence: the same `uv run pytest` invocation also
+observed the pre-existing concurrency test
+`tests/test_dynamo.py::test_competing_ordinary_saves_allow_only_one_revision_owner`
+fail with `[True, True]` instead of the expected `[False, True]`. That run
+therefore reported 479 passed, 2 failed, and 1 skipped. This unrelated
+concurrency failure was not changed because the follow-up Task 5 authorizes
+documentation and final verification only.
+
+Final completion reconciliation (2026-08-31): The follow-up remediation
+authorized replacing the superseded active-path and fixed-hash test with a
+completed-plan contract. The focused documentation suite passed all 16 tests,
+and the complete suite passed 481 tests with one existing optional SAM
+artifact test skipped. Ruff lint, Ruff formatting, strict Mypy, the
+deleted-module import audit, and `git diff --check` passed. The intermittent
+DynamoDB concurrency failure did not recur in five isolated runs or the final
+suite. This plan and its remediation plan now reside in
+`docs/plans/completed/`; the preceding blocker notes are retained as historical
+attempt evidence and are superseded by this final reconciliation.
 
 ## Post-Completion
 
