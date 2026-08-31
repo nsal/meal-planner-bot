@@ -11,7 +11,6 @@ from scripts import verify_transaction_permission as verifier
 STACK_NAME = "meal-planner-test"
 REGION = "us-east-1"
 BOT_ROLE_ARN = "arn:aws:iam::123456789012:role/bot-role"
-PLANNER_ROLE_ARN = "arn:aws:iam::123456789012:role/planner-role"
 TABLE_ARN = "arn:aws:dynamodb:us-east-1:123456789012:table/test-table"
 
 
@@ -29,8 +28,8 @@ def _clients(
                 or [
                     {"OutputKey": "BotFunctionName", "OutputValue": "bot"},
                     {
-                        "OutputKey": "PlannerFunctionName",
-                        "OutputValue": "planner",
+                        "OutputKey": "PlanChatFunctionName",
+                        "OutputValue": "plan-chat",
                     },
                     {
                         "OutputKey": "MealPlannerTableName",
@@ -41,10 +40,9 @@ def _clients(
         ]
     }
     lambda_client = MagicMock()
-    lambda_client.get_function_configuration.side_effect = [
-        {"Role": BOT_ROLE_ARN},
-        {"Role": PLANNER_ROLE_ARN},
-    ]
+    lambda_client.get_function_configuration.return_value = {
+        "Role": BOT_ROLE_ARN
+    }
     dynamodb = MagicMock()
     dynamodb.describe_table.return_value = {"Table": {"TableArn": TABLE_ARN}}
     iam = MagicMock()
@@ -86,11 +84,11 @@ def test_allowed_transaction_permission_returns_zero(
     _patch_clients(mocker, clients)
 
     assert verifier.main(["--stack-name", STACK_NAME, "--region", REGION]) == 0
-    assert "BotFunction and PlannerFunction roles" in capsys.readouterr().out
+    assert "BotFunction role" in capsys.readouterr().out
     clients["lambda"].get_function_configuration.assert_has_calls(
-        [call(FunctionName="bot"), call(FunctionName="planner")]
+        [call(FunctionName="bot")]
     )
-    assert clients["lambda"].get_function_configuration.call_count == 2
+    assert clients["lambda"].get_function_configuration.call_count == 1
     clients["iam"].simulate_principal_policy.assert_has_calls(
         [
             call(
@@ -98,14 +96,9 @@ def test_allowed_transaction_permission_returns_zero(
                 ActionNames=["dynamodb:TransactWriteItems"],
                 ResourceArns=[TABLE_ARN],
             ),
-            call(
-                PolicySourceArn=PLANNER_ROLE_ARN,
-                ActionNames=["dynamodb:TransactWriteItems"],
-                ResourceArns=[TABLE_ARN],
-            ),
         ]
     )
-    assert clients["iam"].simulate_principal_policy.call_count == 2
+    assert clients["iam"].simulate_principal_policy.call_count == 1
 
 
 @pytest.mark.parametrize(
@@ -142,19 +135,12 @@ def test_denied_or_malformed_authorization_returns_nonzero(
     assert "IAM transaction permission" in error or "malformed" in error
 
 
-def test_planner_denied_transaction_permission_returns_nonzero(
+def test_bot_denied_transaction_permission_returns_nonzero(
     mocker: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A denied Planner role fails the whole deployment verification."""
+    """A denied Bot role fails the deployment verification."""
     clients = _clients(
         evaluation_results_by_call=[
-            [
-                {
-                    "EvalActionName": "dynamodb:TransactWriteItems",
-                    "EvalResourceName": TABLE_ARN,
-                    "EvalDecision": "allowed",
-                }
-            ],
             [
                 {
                     "EvalActionName": "dynamodb:TransactWriteItems",
@@ -168,7 +154,7 @@ def test_planner_denied_transaction_permission_returns_nonzero(
 
     assert verifier.main(["--stack-name", STACK_NAME, "--region", REGION]) == 1
     assert "implicitDeny" in capsys.readouterr().err
-    assert clients["iam"].simulate_principal_policy.call_count == 2
+    assert clients["iam"].simulate_principal_policy.call_count == 1
 
 
 def test_botocore_error_returns_safe_type_and_message(
@@ -215,7 +201,7 @@ def test_missing_stack_output_returns_nonzero(
     clients = _clients(
         outputs=[
             {"OutputKey": "BotFunctionName", "OutputValue": "bot"},
-            {"OutputKey": "PlannerFunctionName", "OutputValue": "planner"},
+            {"OutputKey": "PlanChatFunctionName", "OutputValue": "plan-chat"},
         ]
     )
     _patch_clients(mocker, clients)
@@ -292,4 +278,4 @@ def test_explicit_profile_uses_profile_aware_session(
     session_factory.assert_called_once_with(
         profile_name="meal-planner", region_name="eu-west-1"
     )
-    assert "BotFunction and PlannerFunction roles" in capsys.readouterr().out
+    assert "BotFunction role" in capsys.readouterr().out

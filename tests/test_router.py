@@ -10,8 +10,6 @@ from uuid import UUID
 import pytest
 
 from meal_planner.models.schemas import (
-    BatchMealRole,
-    MealOutcome,
     MealType,
     ProfileEditCategory,
     ProfileEditOperation,
@@ -19,13 +17,16 @@ from meal_planner.models.schemas import (
 from meal_planner.router import (
     MAX_PROFILE_REMOVAL_INDEX,
     MAX_PROFILE_REVISION,
+    SUPPORTED_COMMANDS,
     MealCallbackAction,
+    PlanChatCallback,
+    PlanChatCallbackAction,
     ProfileCallback,
     ProfileCallbackAction,
     RouteType,
-    parse_checkin_callback,
     parse_meal_callback,
     parse_meal_input,
+    parse_plan_chat_callback,
     parse_profile_callback,
     route_update,
 )
@@ -193,13 +194,76 @@ def test_route_malformed_chat_type_fails_open_to_no_type(
     assert route_update(update).chat_type is None
 
 
-def test_parse_plan_specific_checkin_callback() -> None:
-    callback = parse_checkin_callback("checkin:2026-08-10:7:dinner:swapped")
-    assert callback is not None
-    assert callback.week_start == "2026-08-10"
-    assert callback.day == 7
-    assert callback.meal_type is MealType.DINNER
-    assert callback.outcome is MealOutcome.SWAPPED
+def test_removed_checkin_payload_has_no_callback_parser() -> None:
+    assert not hasattr(
+        __import__("meal_planner.router").router, "parse_checkin_callback"
+    )
+
+
+def test_parse_plan_chat_end_callback_returns_typed_canonical_uuid() -> None:
+    session_id = "123e4567-e89b-12d3-a456-426614174000"
+
+    callback = parse_plan_chat_callback(f"plan_chat:end:{session_id}")
+
+    assert callback == PlanChatCallback(
+        action=PlanChatCallbackAction.END,
+        session_id=session_id,
+    )
+
+
+def test_removed_cancel_command_is_not_supported() -> None:
+    """The router's command catalogue excludes the global cancellation path."""
+    assert "cancel" not in SUPPORTED_COMMANDS
+
+
+def test_supported_commands_match_the_retained_bot_surface() -> None:
+    """Only the five retained workflows are routable as slash commands."""
+    assert SUPPORTED_COMMANDS == {
+        "start",
+        "help",
+        "profile",
+        "plan",
+        "submit_meals",
+    }
+
+
+def test_plan_chat_callback_model_allows_only_end_and_session_id() -> None:
+    session_id = "123e4567-e89b-12d3-a456-426614174000"
+
+    with pytest.raises(ValueError):
+        PlanChatCallback(
+            action=PlanChatCallbackAction.END,
+            session_id=session_id,
+            extra="unexpected",
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "plan_chat:end:123E4567-e89b-12d3-a456-426614174000",
+        "plan_chat:end:123e4567-e89b-12d3-a456-42661417400",
+        "plan_chat:end:not-a-uuid",
+        "plan_chat:cancel:123e4567-e89b-12d3-a456-426614174000",
+        "plan_chat:end:123e4567-e89b-12d3-a456-426614174000:extra",
+        "plan_chat:end:",
+        "plan:end:123e4567-e89b-12d3-a456-426614174000",
+        "x" * 65,
+        "é" * 33,
+    ],
+)
+def test_parse_plan_chat_callback_rejects_malformed_or_oversized_payload(
+    payload: str,
+) -> None:
+    assert parse_plan_chat_callback(payload) is None
+
+
+def test_plan_chat_callback_parser_enforces_64_byte_limit() -> None:
+    session_id = "123e4567-e89b-12d3-a456-426614174000"
+    payload = f"plan_chat:end:{session_id}:{'é' * 8}"
+
+    assert len(payload.encode("utf-8")) > 64
+    assert parse_plan_chat_callback(payload) is None
 
 
 @pytest.mark.parametrize(
@@ -287,8 +351,12 @@ def test_parse_meal_input_reports_overlong_description_error() -> None:
     ("submitted", "expected_message"),
     [
         ("2026-08-22, lunch, soup", ""),
-        ("2026-08-16, lunch, soup", ""),
-        ("2026-08-15, lunch, soup", "date must be within the last 7 days"),
+        ("2026-08-15, lunch, soup", ""),
+        (
+            "2026-08-14, lunch, soup",
+            "date must be from UTC today through the previous seven dates, "
+            "inclusive (eight calendar dates)",
+        ),
         ("2026-08-23, lunch, soup", "date cannot be in the future"),
         ("2026/08/22, lunch, soup", "date must be YYYY-MM-DD"),
         ("2026-2-2, lunch, soup", "date must be YYYY-MM-DD"),
@@ -323,23 +391,33 @@ def test_parse_meal_callback_accepts_all_actions(action: str) -> None:
     assert UUID(callback.submission_id)
 
 
-def test_parse_batch_meal_confirmation_callback_is_bounded_and_typed() -> None:
-    callback = parse_meal_callback(
-        "meal:confirm:123e4567-e89b-12d3-a456-426614174000:preparation"
+def test_parse_meal_callback_rejects_four_part_batch_payloads() -> None:
+    """Legacy batch callback payloads are no longer accepted."""
+    assert (
+        parse_meal_callback(
+            "meal:confirm:123e4567-e89b-12d3-a456-426614174000:preparation"
+        )
+        is None
     )
-
-    assert callback is not None
-    assert callback.action is MealCallbackAction.CONFIRM
-    assert callback.batch_role is BatchMealRole.PREPARATION
-
-
-def test_parse_batch_role_is_rejected_for_non_confirmation_callbacks() -> None:
     assert (
         parse_meal_callback(
             "meal:add:123e4567-e89b-12d3-a456-426614174000:leftover"
         )
         is None
     )
+
+
+def test_ordinary_meal_callback_has_no_batch_role() -> None:
+    """Ordinary meal callbacks contain only action and submission ID."""
+    callback = parse_meal_callback(
+        "meal:confirm:123e4567-e89b-12d3-a456-426614174000"
+    )
+
+    assert callback is not None
+    assert callback.model_dump() == {
+        "action": MealCallbackAction.CONFIRM,
+        "submission_id": "123e4567-e89b-12d3-a456-426614174000",
+    }
 
 
 @pytest.mark.parametrize(
@@ -420,7 +498,6 @@ def test_parse_profile_removal_selection_callbacks(
     assert callback.index == index
     assert callback.profile_revision == 42
     assert callback.operation is None
-    assert callback.token is None
 
 
 def test_profile_removal_selection_model_requires_all_selection_fields() -> (
@@ -601,21 +678,6 @@ def test_profile_callbacks_remain_within_telegram_byte_limit() -> None:
 
     assert len(payload.encode("utf-8")) <= 64
     assert parse_profile_callback(payload) is not None
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        "checkin:1:lunch:cooked",
-        "checkin:not-a-date:1:lunch:cooked",
-        "checkin:2026-08-10:0:lunch:cooked",
-        "checkin:2026-08-10:1:brunch:cooked",
-        "checkin:2026-08-10:1:lunch:liked",
-        "x" * 65,
-    ],
-)
-def test_reject_malformed_or_old_callbacks(payload: str) -> None:
-    assert parse_checkin_callback(payload) is None
 
 
 def test_route_unknown_updates() -> None:

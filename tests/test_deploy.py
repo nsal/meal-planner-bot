@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from pytest_mock import MockerFixture
 
+from meal_planner.telegram.commands import BOT_COMMANDS
 from scripts import deploy
 
 
@@ -107,9 +108,9 @@ class FakeRunner(deploy.CommandRunner):
                                         "OutputValue": "meal-planner-test-bot",
                                     },
                                     {
-                                        "OutputKey": "PlannerFunctionName",
+                                        "OutputKey": "PlanChatFunctionName",
                                         "OutputValue": (
-                                            "meal-planner-test-planner"
+                                            "meal-planner-test-plan-chat"
                                         ),
                                     },
                                 ]
@@ -143,7 +144,7 @@ class FakeTelegram:
         assert token == "bot-secret"
 
     def set_my_commands(self, commands: Any) -> dict[str, Any]:
-        assert len(commands) == 9
+        assert len(commands) == len(BOT_COMMANDS)
         self.calls.append("commands")
         return {"ok": True}
 
@@ -163,7 +164,7 @@ def _stack_outputs() -> deploy.StackOutputs:
         webhook_url="https://example/webhook",
         table_name="meal-planner-test-table",
         bot_function_name="meal-planner-test-bot",
-        planner_function_name="meal-planner-test-planner",
+        plan_chat_function_name="meal-planner-test-plan-chat",
     )
 
 
@@ -290,8 +291,7 @@ def test_settings_load_env_file_and_environment_override(
         ("STACK_NAME", ""),
         ("TELEGRAM_ALLOWED_USER_IDS", "0,abc"),
         ("ENVIRONMENT", "test"),
-        ("CONVERSATIONAL_LLM_REASONING_EFFORT", "invalid"),
-        ("PLANNER_LLM_REASONING_EFFORT", "invalid"),
+        ("PLAN_CHAT_LLM_REASONING_EFFORT", "invalid"),
         ("APP_SECRETS_SECRET_NAME", "   "),
     ],
 )
@@ -546,10 +546,8 @@ def test_routine_sam_deploy_resolves_an_artifact_bucket() -> None:
     runner = FakeRunner()
     settings = _settings()
 
-    assert settings.conversational_llm_model == "gpt-5.6-luna"
-    assert settings.conversational_llm_reasoning_effort == "medium"
-    assert settings.planner_llm_model == "gpt-5.6-luna"
-    assert settings.planner_llm_reasoning_effort == "high"
+    assert settings.plan_chat_llm_model == "gpt-5.6-luna"
+    assert settings.plan_chat_llm_reasoning_effort == "high"
 
     deploy.deploy_sam(
         runner,
@@ -562,8 +560,8 @@ def test_routine_sam_deploy_resolves_an_artifact_bucket() -> None:
     assert "--resolve-s3" in command
     assert "--no-confirm-changeset" in command
     assert "--no-fail-on-empty-changeset" in command
-    assert "PlannerLlmModel=gpt-5.6-luna" in command
-    assert "PlannerLlmReasoningEffort=high" in command
+    assert "PlanChatLlmModel=gpt-5.6-luna" in command
+    assert "PlanChatLlmReasoningEffort=high" in command
     assert "AppSecretsSecretName=meal-planner/app-secrets" in command
     assert not any(
         "SecretName=" in argument and "AppSecretsSecretName=" not in argument

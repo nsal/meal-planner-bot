@@ -250,13 +250,16 @@ def _assert_built_template_is_current() -> None:
     built_globals = built_template["Globals"]["Function"]
 
     built_global_variables = built_globals["Environment"]["Variables"]
-    for variable_name in (
-        "TELEGRAM_BOT_TOKEN",
-        "LLM_API_KEY",
-    ):
-        dynamic_reference = built_global_variables[variable_name]
-        assert _contains_text(dynamic_reference, "secretsmanager")
-        assert _contains_text(dynamic_reference, "AppSecretsSecretName")
+    dynamic_reference = built_global_variables["TELEGRAM_BOT_TOKEN"]
+    assert _contains_text(dynamic_reference, "secretsmanager")
+    assert _contains_text(dynamic_reference, "AppSecretsSecretName")
+
+    built_plan_chat_variables = built_template["Resources"]["PlanChatFunction"][
+        "Properties"
+    ]["Environment"]["Variables"]
+    dynamic_reference = built_plan_chat_variables["LLM_API_KEY"]
+    assert _contains_text(dynamic_reference, "secretsmanager")
+    assert _contains_text(dynamic_reference, "AppSecretsSecretName")
 
     built_bot_variables = built_template["Resources"]["BotFunction"][
         "Properties"
@@ -265,13 +268,9 @@ def _assert_built_template_is_current() -> None:
     assert _contains_text(webhook_reference, "secretsmanager")
     assert _contains_text(webhook_reference, "AppSecretsSecretName")
 
-    for logical_id in ("BotFunction", "PlannerFunction"):
-        variables = built_template["Resources"][logical_id]["Properties"][
-            "Environment"
-        ]["Variables"]
-        assert variables["SECRET_REFRESH_TOKEN"] == {
-            "Ref": "SecretRefreshToken"
-        }
+    assert built_global_variables["SECRET_REFRESH_TOKEN"] == {
+        "Ref": "SecretRefreshToken"
+    }
 
 
 def _assert_source_files_match_artifact(artifact: Path) -> None:
@@ -336,26 +335,19 @@ def test_lambda_build_configuration() -> None:
     template = _load_template()
     resources = template["Resources"]
 
-    expected_handlers = {
-        "BotFunction": "meal_planner.bot_handler.lambda_handler",
-        "PlannerFunction": "meal_planner.planner_handler.lambda_handler",
-    }
-    for logical_id, handler in expected_handlers.items():
-        resource = resources[logical_id]
-        assert resource["Metadata"]["BuildMethod"] == "python-uv"
-        assert resource["Properties"]["CodeUri"] == "./"
-        assert resource["Properties"]["Handler"] == handler
+    resource = resources["BotFunction"]
+    assert resource["Metadata"]["BuildMethod"] == "python-uv"
+    assert resource["Properties"]["CodeUri"] == "./"
+    assert resource["Properties"]["Handler"] == (
+        "meal_planner.bot_handler.lambda_handler"
+    )
 
     function_globals = template["Globals"]["Function"]
     assert function_globals["Runtime"] == "python3.14"
     assert function_globals["Architectures"] == ["arm64"]
     parameters = template["Parameters"]
-    assert parameters["ConversationalLlmModel"]["Default"] == ("gpt-5.6-luna")
-    assert parameters["ConversationalLlmReasoningEffort"]["Default"] == (
-        "medium"
-    )
-    assert parameters["PlannerLlmModel"]["Default"] == "gpt-5.6-luna"
-    assert parameters["PlannerLlmReasoningEffort"]["Default"] == "high"
+    assert parameters["PlanChatLlmModel"]["Default"] == "gpt-5.6-luna"
+    assert parameters["PlanChatLlmReasoningEffort"]["Default"] == "high"
     variables = function_globals["Environment"]["Variables"]
     assert "TELEGRAM_REQUEST_TIMEOUT_SECONDS" not in variables
     assert "LLM_REQUEST_TIMEOUT_SECONDS" not in variables
@@ -364,38 +356,39 @@ def test_lambda_build_configuration() -> None:
     bot_variables = resources["BotFunction"]["Properties"]["Environment"][
         "Variables"
     ]
-    assert bot_variables["BOT_FUNCTION_TIMEOUT_SECONDS"] == "30"
-    assert bot_variables["BOT_LLM_MAX_RETRIES"] == "2"
-    planner_variables = resources["PlannerFunction"]["Properties"][
+    assert all(not name.startswith("BOT_LLM_") for name in bot_variables)
+    plan_chat_variables = resources["PlanChatFunction"]["Properties"][
         "Environment"
     ]["Variables"]
-    planner_properties = resources["PlannerFunction"]["Properties"]
-    assert planner_properties["Timeout"] == 310
-    assert planner_properties["MemorySize"] == 512
-    assert planner_variables["PLANNER_FUNCTION_TIMEOUT_SECONDS"] == "300"
-    assert planner_variables["PLANNER_TELEGRAM_REQUEST_TIMEOUT_SECONDS"] == (
-        "10"
+    plan_chat_properties = resources["PlanChatFunction"]["Properties"]
+    assert plan_chat_properties["Handler"] == (
+        "meal_planner.plan_chat_handler.lambda_handler"
     )
-    assert planner_variables["PLANNER_LLM_REQUEST_TIMEOUT_SECONDS"] == "240"
-    assert planner_variables["PLANNER_LLM_MAX_RETRIES"] == "1"
-    assert planner_variables["PLANNER_LLM_INITIAL_BACKOFF_SECONDS"] == "1"
+    assert plan_chat_properties["Timeout"] == 310
+    assert plan_chat_properties["MemorySize"] == 512
     assert (
-        planner_variables["PLANNER_GROCERY_LLM_REQUEST_TIMEOUT_SECONDS"]
-        == "120"
+        plan_chat_variables["PLAN_CHAT_TELEGRAM_REQUEST_TIMEOUT_SECONDS"]
+        == "10"
     )
-    assert planner_variables["PLANNER_GROCERY_LLM_MAX_RETRIES"] == "2"
-    assert planner_variables["PLANNER_HANDLER_SAFETY_MARGIN_SECONDS"] == "20"
-    for function_variables in (bot_variables, planner_variables):
-        assert function_variables["SECRET_REFRESH_TOKEN"] == {
-            "Ref": "SecretRefreshToken"
-        }
+    assert plan_chat_variables["PLAN_CHAT_LLM_REQUEST_TIMEOUT_SECONDS"] == (
+        "240"
+    )
+    assert "PLAN_CHAT_LLM_MAX_RETRIES" not in plan_chat_variables
+    assert "LLM_API_KEY" not in bot_variables
+    assert "TELEGRAM_WEBHOOK_SECRET" not in plan_chat_variables
+    assert "TELEGRAM_ALLOWED_USER_IDS" not in plan_chat_variables
+    assert "PLAN_CHAT_FUNCTION_NAME" in bot_variables
+    assert all(
+        not name.startswith(("PLANNER_", "CONVERSATIONAL_"))
+        for name in (*bot_variables, *plan_chat_variables)
+    )
 
 
-def test_planner_can_invoke_only_its_own_function_for_repair() -> None:
-    """Repair permission is narrow and does not reference the resource ARN."""
+def test_plan_chat_has_no_repair_or_transaction_permissions() -> None:
+    """Plan Chat cannot self-invoke or write transactions."""
     template = _load_template()
-    planner = template["Resources"]["PlannerFunction"]
-    policies = planner["Properties"]["Policies"]
+    plan_chat = template["Resources"]["PlanChatFunction"]
+    policies = plan_chat["Properties"]["Policies"]
     statements = [
         statement
         for policy in policies
@@ -403,56 +396,74 @@ def test_planner_can_invoke_only_its_own_function_for_repair() -> None:
         for statement in policy["Statement"]
     ]
 
-    repair_statements = [
-        statement
+    restricted_actions = [
+        action
         for statement in statements
-        if statement.get("Action") == "lambda:InvokeFunction"
-    ]
-    assert repair_statements == [
-        {
-            "Effect": "Allow",
-            "Action": "lambda:InvokeFunction",
-            "Resource": {
-                "Fn::Sub": (
-                    "arn:${AWS::Partition}:lambda:${AWS::Region}:"
-                    "${AWS::AccountId}:function:${AWS::StackName}-planner"
-                )
-            },
+        for action in (
+            statement["Action"]
+            if isinstance(statement.get("Action"), list)
+            else [statement.get("Action")]
+        )
+        if action
+        in {
+            "lambda:InvokeFunction",
+            "dynamodb:TransactWriteItems",
         }
     ]
-    assert "GetAtt" not in str(repair_statements[0]["Resource"])
-    assert planner["Properties"]["Timeout"] == 310
-    assert planner["Properties"]["MemorySize"] == 512
-    variables = planner["Properties"]["Environment"]["Variables"]
-    assert variables["PLANNER_LLM_MAX_RETRIES"] == "1"
+    assert restricted_actions == []
 
 
-def test_readme_documents_single_attempt_planner_diagnostics() -> None:
-    """Operational documentation matches the deployed Planner policy."""
-    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+def test_plan_chat_has_exact_table_scoped_dynamodb_permissions() -> None:
+    """Plan Chat receives only the DynamoDB operations it performs."""
+    template = _load_template()
+    plan_chat = template["Resources"]["PlanChatFunction"]
+    policies = plan_chat["Properties"]["Policies"]
 
-    assert "`PLANNER_LLM_REQUEST_TIMEOUT_SECONDS` | `240`" in readme
-    assert "`PLANNER_LLM_MAX_RETRIES` | `1`" in readme
-    assert "`PLANNER_GROCERY_LLM_REQUEST_TIMEOUT_SECONDS` | `120`" in readme
-    assert "`PLANNER_GROCERY_LLM_MAX_RETRIES` | `2`" in readme
-    assert "one 240-second whole-plan provider attempt" in readme
-    normalized_readme = " ".join(readme.split())
-    assert "one automatic repair in a fresh asynchronous" in normalized_readme
-    assert "Preference interpretation is LLM-assisted" in normalized_readme
-    assert (
-        "Application code is authoritative for the measurable parts"
-        in normalized_readme
+    assert all(
+        not (isinstance(policy, dict) and "DynamoDBCrudPolicy" in policy)
+        for policy in policies
     )
-    assert "Grocery generation retains two" in readme
-    assert "`attempt`, `elapsed_ms`, `model`, and a" in readme
-    assert "These diagnostics do not include prompts" in readme
-    assert "credentials, raw events, chat IDs, or user IDs." in readme
-    assert "at most two whole-week provider requests" not in readme
-    assert "second request" not in readme
+
+    statements = [
+        statement
+        for policy in policies
+        if isinstance(policy, dict)
+        for statement in policy.get("Statement", [])
+        if isinstance(statement, dict)
+    ]
+    assert statements == [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:GetItem",
+                "dynamodb:Query",
+                "dynamodb:PutItem",
+                "dynamodb:DeleteItem",
+            ],
+            "Resource": {"Fn::GetAtt": "MealPlannerTable.Arn"},
+        }
+    ]
+    assert all(
+        statement["Resource"] == {"Fn::GetAtt": "MealPlannerTable.Arn"}
+        for statement in statements
+    )
+    assert all(
+        action
+        not in {
+            "dynamodb:Scan",
+            "dynamodb:UpdateItem",
+            "dynamodb:BatchGetItem",
+            "dynamodb:BatchWriteItem",
+            "dynamodb:TransactGetItems",
+            "dynamodb:TransactWriteItems",
+        }
+        for statement in statements
+        for action in statement["Action"]
+    )
 
 
 def test_transaction_permission_is_explicit_and_table_scoped() -> None:
-    """Both functions can transact only against the application table."""
+    """Only Bot can explicitly transact against the application table."""
     template = _load_template()
     resources = template["Resources"]
 
@@ -461,20 +472,24 @@ def test_transaction_permission_is_explicit_and_table_scoped() -> None:
         "Action": "dynamodb:TransactWriteItems",
         "Resource": {"Fn::GetAtt": "MealPlannerTable.Arn"},
     }
-    for function_name in ("BotFunction", "PlannerFunction"):
-        policies = resources[function_name]["Properties"]["Policies"]
-        transaction_statements = [
-            statement
-            for policy in policies
-            if isinstance(policy, dict)
-            for statement in policy.get("Statement", [])
-            if isinstance(statement, dict)
-            and statement.get("Action") == "dynamodb:TransactWriteItems"
-        ]
-        assert transaction_statements == [expected_statement]
-        assert all(
-            statement["Resource"] != "*" for statement in transaction_statements
-        )
+    bot_policies = resources["BotFunction"]["Properties"]["Policies"]
+    transaction_statements = [
+        statement
+        for policy in bot_policies
+        if isinstance(policy, dict)
+        for statement in policy.get("Statement", [])
+        if isinstance(statement, dict)
+        and statement.get("Action") == "dynamodb:TransactWriteItems"
+    ]
+    assert transaction_statements == [expected_statement]
+    plan_chat_policies = resources["PlanChatFunction"]["Properties"]["Policies"]
+    assert all(
+        statement.get("Action") != "dynamodb:TransactWriteItems"
+        for policy in plan_chat_policies
+        if isinstance(policy, dict)
+        for statement in policy.get("Statement", [])
+        if isinstance(statement, dict)
+    )
 
 
 @pytest.mark.parametrize(
@@ -563,12 +578,20 @@ def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
 
     variables = template["Globals"]["Function"]["Environment"]["Variables"]
     assert variables["SECRET_REFRESH_TOKEN"] == {"Ref": "SecretRefreshToken"}
-    expected_references = {
-        "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
-        "LLM_API_KEY": "llm_api_key",
+    dynamic_reference = variables["TELEGRAM_BOT_TOKEN"]
+    assert isinstance(dynamic_reference, dict)
+    dynamic_reference = dynamic_reference["Fn::Sub"]
+    assert isinstance(dynamic_reference, list)
+    assert dynamic_reference[0].endswith(":telegram_bot_token}}")
+    assert dynamic_reference[1] == {
+        "SecretName": {"Ref": "AppSecretsSecretName"}
     }
-    for variable_name, json_key in expected_references.items():
-        dynamic_reference = variables[variable_name]
+
+    plan_chat_variables = template["Resources"]["PlanChatFunction"][
+        "Properties"
+    ]["Environment"]["Variables"]
+    for variable_name, json_key in (("LLM_API_KEY", "llm_api_key"),):
+        dynamic_reference = plan_chat_variables[variable_name]
         assert isinstance(dynamic_reference, dict)
         dynamic_reference = dynamic_reference["Fn::Sub"]
         assert isinstance(dynamic_reference, list)
@@ -602,13 +625,8 @@ def test_secret_inputs_are_secret_names_and_dynamic_references() -> None:
 def test_secret_refresh_updates_both_lambda_configurations() -> None:
     """Both functions use the deployment refresh marker."""
     template = _load_template()
-    for logical_id in ("BotFunction", "PlannerFunction"):
-        variables = template["Resources"][logical_id]["Properties"][
-            "Environment"
-        ]["Variables"]
-        assert variables["SECRET_REFRESH_TOKEN"] == {
-            "Ref": "SecretRefreshToken"
-        }
+    variables = template["Globals"]["Function"]["Environment"]["Variables"]
+    assert variables["SECRET_REFRESH_TOKEN"] == {"Ref": "SecretRefreshToken"}
 
 
 def test_secret_values_are_not_runtime_retrieved_or_whole_secret_injected() -> (
@@ -626,13 +644,18 @@ def test_secret_values_are_not_runtime_retrieved_or_whole_secret_injected() -> (
     bot_variables = template["Resources"]["BotFunction"]["Properties"][
         "Environment"
     ]["Variables"]
-    all_variables = {**global_variables, **bot_variables}
-    for variable_name, json_key in (
-        ("TELEGRAM_BOT_TOKEN", "telegram_bot_token"),
-        ("TELEGRAM_WEBHOOK_SECRET", "telegram_webhook_secret"),
-        ("LLM_API_KEY", "llm_api_key"),
+    for variable_name, json_key, function_variables in (
+        ("TELEGRAM_BOT_TOKEN", "telegram_bot_token", global_variables),
+        ("TELEGRAM_WEBHOOK_SECRET", "telegram_webhook_secret", bot_variables),
+        (
+            "LLM_API_KEY",
+            "llm_api_key",
+            template["Resources"]["PlanChatFunction"]["Properties"][
+                "Environment"
+            ]["Variables"],
+        ),
     ):
-        reference = all_variables[variable_name]
+        reference = function_variables[variable_name]
         assert isinstance(reference, dict)
         substitution = reference["Fn::Sub"]
         assert isinstance(substitution, list)
@@ -657,9 +680,10 @@ def test_telegram_allowlist_is_required_and_bot_scoped() -> None:
     assert bot_variables["TELEGRAM_ALLOWED_USER_IDS"] == {
         "Ref": "TelegramAllowedUserIds"
     }
-    planner_variables = template["Resources"]["PlannerFunction"]["Properties"]
-    planner_variables = planner_variables["Environment"]["Variables"]
-    assert "TELEGRAM_ALLOWED_USER_IDS" not in planner_variables
+    plan_chat_variables = template["Resources"]["PlanChatFunction"][
+        "Properties"
+    ]["Environment"]["Variables"]
+    assert "TELEGRAM_ALLOWED_USER_IDS" not in plan_chat_variables
 
 
 def test_python_314_project_contract() -> None:
@@ -764,23 +788,14 @@ def test_artifact_import_failure_preserves_subprocess_diagnostics(
     assert "stderr diagnostic" in message
 
 
-@pytest.mark.parametrize(
-    ("logical_id", "module_name"),
-    [
-        ("BotFunction", "meal_planner.bot_handler"),
-        ("PlannerFunction", "meal_planner.planner_handler"),
-    ],
-)
-def test_built_artifact_imports_lambda_handler(
-    logical_id: str, module_name: str
-) -> None:
+def test_built_artifact_imports_lambda_handler() -> None:
     """Import each handler from the source copied into the SAM artifact."""
     contract = _deployment_contract()
     compatibility = _host_compatibility(contract)
     if not compatibility.compatible:
         pytest.skip(compatibility.reason)
 
-    artifact = _built_artifact(logical_id)
+    artifact = _built_artifact("BotFunction")
     _require_artifact(artifact)
     _assert_built_template_is_current()
     _assert_source_files_match_artifact(artifact)
@@ -795,4 +810,4 @@ def test_built_artifact_imports_lambda_handler(
         assert (artifact / dependency).exists(), dependency
     assert (artifact / "meal_planner" / "__init__.py").is_file()
 
-    _import_lambda_handler(artifact, module_name)
+    _import_lambda_handler(artifact, "meal_planner.bot_handler")

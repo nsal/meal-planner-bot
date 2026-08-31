@@ -1,7 +1,6 @@
 """Telegram API safety, formatting, and failure tests."""
 
 import json
-from datetime import date
 from io import BytesIO
 from urllib.error import HTTPError, URLError
 from uuid import UUID
@@ -10,11 +9,7 @@ import pytest
 from pytest_mock import MockerFixture
 
 from meal_planner.models.schemas import (
-    BatchMealRole,
     FamilyMember,
-    MealOutcome,
-    MealType,
-    PlannedBatchLink,
     ProfileEditCategory,
     ProfileEditOperation,
     UserProfile,
@@ -25,17 +20,12 @@ from meal_planner.telegram.api import (
     TelegramAPIError,
     meal_continuation_keyboard,
     meal_review_keyboard,
+    plan_chat_keyboard,
     profile_presentation_items,
     split_text,
 )
-from meal_planner.telegram.commands import TelegramCommand
-from tests.factories import (
-    make_batch_rule,
-    make_constraint,
-    make_plan,
-    make_preference,
-    make_profile,
-)
+from meal_planner.telegram.commands import BOT_COMMANDS, TelegramCommand
+from tests.factories import make_profile
 
 
 def _response() -> BytesIO:
@@ -84,7 +74,7 @@ def test_set_my_commands_posts_canonical_payload_and_uses_timeout(
         "command": "start",
         "description": "Start onboarding or view what to do next",
     }
-    assert len(payload["commands"]) == 9
+    assert len(payload["commands"]) == len(BOT_COMMANDS)
     assert urlopen.call_args.kwargs["timeout"] == 4.5
 
 
@@ -168,7 +158,46 @@ def test_api_error_and_partial_chunk_failure_raise(
     assert urlopen.call_count == 2
 
 
-def test_plan_and_checkin_use_safe_text_and_specific_week(
+def test_plan_chat_keyboard_uses_canonical_uuid_and_fits_limit() -> None:
+    session_id = UUID("12345678-1234-5678-1234-567812345678")
+
+    keyboard = plan_chat_keyboard(session_id)
+
+    button = keyboard["inline_keyboard"][0][0]
+    assert button == {
+        "text": "End planning",
+        "callback_data": ("plan_chat:end:12345678-1234-5678-1234-567812345678"),
+        "style": "danger",
+    }
+    assert len(button["callback_data"].encode("utf-8")) <= 64
+
+
+@pytest.mark.parametrize("session_id", ["not-a-uuid", "é" * 64])
+def test_plan_chat_keyboard_rejects_invalid_session_id(session_id: str) -> None:
+    with pytest.raises(ValueError):
+        plan_chat_keyboard(session_id)
+
+
+def test_send_plan_chat_attaches_end_button_to_final_split_chunk(
+    mocker: MockerFixture,
+) -> None:
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+    session_id = UUID("12345678-1234-5678-1234-567812345678")
+    text = "first line\n" + "x" * 4090
+
+    TelegramAPI("token").send_plan_chat(1, text, session_id)
+
+    assert urlopen.call_count == 2
+    first_payload = json.loads(urlopen.call_args_list[0].args[0].data)
+    last_payload = json.loads(urlopen.call_args_list[-1].args[0].data)
+    assert "reply_markup" not in first_payload
+    assert last_payload["reply_markup"] == plan_chat_keyboard(session_id)
+
+
+def test_send_plan_chat_sends_initial_generated_and_error_text_with_control(
     mocker: MockerFixture,
 ) -> None:
     urlopen = mocker.patch(
@@ -176,69 +205,33 @@ def test_plan_and_checkin_use_safe_text_and_specific_week(
         side_effect=lambda *args, **kwargs: _response(),
     )
     api = TelegramAPI("token")
-    plan = make_plan()
-    plan.days[0].meals[0].name = "Soup_*[]"
-    api.send_plan(1, plan)
-    plan_payload = json.loads(urlopen.call_args.args[0].data.decode())
-    assert "parse_mode" not in plan_payload
-    assert "Soup_*[]" in plan_payload["text"]
-    api.send_meal_checkin(
-        1,
-        plan.days[0].meals,
-        week_start=plan.week_start_date,
-        day=1,
-    )
-    checkin_payload = json.loads(urlopen.call_args.args[0].data.decode())
-    callback = checkin_payload["reply_markup"]["inline_keyboard"][0][0]
-    assert callback["callback_data"] == (
-        f"checkin:{plan.week_start_date}:1:lunch:cooked"
-    )
-    assert len(callback["callback_data"].encode()) <= 64
+    session_id = "12345678-1234-5678-1234-567812345678"
+
+    for message in (
+        "Tell me what information you need.",
+        "Draft response",
+        "I could not generate a draft. Please try again.",
+    ):
+        api.send_plan_chat(1, message, session_id)
+        payload = json.loads(urlopen.call_args.args[0].data)
+        assert payload["text"] == message
+        assert payload["reply_markup"] == plan_chat_keyboard(session_id)
 
 
-@pytest.mark.parametrize("plan_days", [1, 3])
-def test_short_plan_rendering_stops_at_persisted_last_day(
-    mocker: MockerFixture, plan_days: int
-) -> None:
-    """Plan rendering includes exactly the days stored in the plan."""
-    urlopen = mocker.patch(
-        "urllib.request.urlopen",
-        side_effect=lambda *args, **kwargs: _response(),
-    )
-
-    TelegramAPI("token").send_plan(1, make_plan(plan_days=plan_days))
-
-    payload = json.loads(urlopen.call_args.args[0].data.decode())
-    assert "Meal Plan" in payload["text"]
-    assert f"Day {plan_days}" in payload["text"]
-    assert f"Day {plan_days + 1}" not in payload["text"]
-
-
-def test_maximum_valid_plan_fits_one_notification(
+def test_send_plan_chat_propagates_telegram_api_failure(
     mocker: MockerFixture,
 ) -> None:
-    urlopen = mocker.patch(
+    mocker.patch(
         "urllib.request.urlopen",
-        side_effect=lambda *args, **kwargs: _response(),
+        side_effect=HTTPError("url", 500, "error", {}, BytesIO()),
     )
-    plan = make_plan()
-    template_meal = plan.days[0].meals[0]
-    for day in plan.days:
-        day.meals = [
-            template_meal.model_copy(
-                update={
-                    "meal_type": MealType.BREAKFAST,
-                    "name": "x" * 100,
-                    "est_calories": 10_000,
-                    "outcome": MealOutcome.SKIPPED,
-                }
-            )
-            for _ in range(4)
-        ]
 
-    TelegramAPI("token").send_plan(1, plan)
-
-    assert urlopen.call_count == 1
+    with pytest.raises(TelegramAPIError):
+        TelegramAPI("token").send_plan_chat(
+            1,
+            "Draft response",
+            "12345678-1234-5678-1234-567812345678",
+        )
 
 
 def test_answer_callback_query(mocker: MockerFixture) -> None:
@@ -313,44 +306,13 @@ def test_profile_summary_renders_optional_targets_and_not_set_copy(
     assert "- Alex (2000 kcal/day, " + expected_targets + ")" in payload["text"]
 
 
-def test_profile_summary_renders_bounded_batch_rules_without_storage_id(
-    mocker: MockerFixture,
-) -> None:
-    """Profile display includes batch semantics but never its internal ID."""
-    urlopen = mocker.patch(
-        "urllib.request.urlopen",
-        side_effect=lambda *args, **kwargs: _response(),
-    )
-    rule = make_batch_rule(
-        source_text="cook chicken once for two lunches",
-        identifier="storage-only-batch-id",
-        total_yield=2,
-    )
-    profile = make_profile().model_copy(update={"batch_rules": [rule]})
-
-    TelegramAPI("token").send_profile(1, profile)
-
-    payload = _last_payload(urlopen)
-    assert (
-        "Batch rules:\n1. cook chicken once for two lunches "
-        "(prepare dinner; reuse lunch, dinner; 2 meals)"
-    ) in payload["text"]
-    assert "storage-only-batch-id" not in payload["text"]
-
-
 def test_profile_presentation_items_keep_stored_order_and_type_labels() -> None:
-    """The removal projection combines preferences and batches
-    deterministically.
-    """
+    """The removal projection preserves raw preference order."""
     profile = make_profile().model_copy(
         update={
             "dietary_preferences": [
-                make_preference("first preference", identifier="pref-1"),
-                make_preference("second preference", identifier="pref-2"),
-            ],
-            "batch_rules": [
-                make_batch_rule("first batch", identifier="batch-1"),
-                make_batch_rule("second batch", identifier="batch-2"),
+                "first preference",
+                "second preference",
             ],
         }
     )
@@ -363,12 +325,11 @@ def test_profile_presentation_items_keep_stored_order_and_type_labels() -> None:
     assert [item.label for item in items] == [
         "Dietary preference: first preference",
         "Dietary preference: second preference",
-        "Batch rule: first batch (prepare dinner; reuse lunch, dinner; "
-        "2 meals)",
-        "Batch rule: second batch (prepare dinner; reuse lunch, dinner; "
-        "2 meals)",
     ]
-    assert all(item.value.id not in item.label for item in items)
+    assert [item.value for item in items] == [
+        "first preference",
+        "second preference",
+    ]
 
 
 def test_profile_presentation_items_keep_family_order() -> None:
@@ -394,16 +355,12 @@ def test_profile_summary_numbers_rules_in_stored_order(
     profile = make_profile().model_copy(
         update={
             "dietary_constraints": [
-                make_constraint("first constraint", identifier="constraint-1"),
-                make_constraint("second constraint", identifier="constraint-2"),
+                "first constraint",
+                "second constraint",
             ],
             "dietary_preferences": [
-                make_preference("first preference", identifier="pref-1"),
-                make_preference("second preference", identifier="pref-2"),
-            ],
-            "batch_rules": [
-                make_batch_rule("first batch", identifier="batch-1"),
-                make_batch_rule("second batch", identifier="batch-2"),
+                "first preference",
+                "second preference",
             ],
         }
     )
@@ -419,11 +376,10 @@ def test_profile_summary_numbers_rules_in_stored_order(
         "Dietary preferences:\n1. first preference\n2. second preference"
         in text
     )
-    assert "Batch rules:\n1. first batch" in text
-    assert "\n2. second batch" in text
+    assert "Batch rules" not in text
 
 
-def test_profile_removal_operation_renders_wrapped_number_buttons(
+def test_profile_removal_operation_renders_raw_numbered_buttons(
     mocker: MockerFixture,
 ) -> None:
     """Combined dietary removal buttons are numbered and revision-stamped."""
@@ -435,12 +391,7 @@ def test_profile_removal_operation_renders_wrapped_number_buttons(
         update={
             "profile_revision": 17,
             "dietary_preferences": [
-                make_preference(f"preference {index}", identifier=f"p-{index}")
-                for index in range(1, 5)
-            ],
-            "batch_rules": [
-                make_batch_rule(f"batch {index}", identifier=f"b-{index}")
-                for index in range(1, 4)
+                f"preference {index}" for index in range(1, 5)
             ],
         }
     )
@@ -455,22 +406,19 @@ def test_profile_removal_operation_renders_wrapped_number_buttons(
     payload = _last_payload(urlopen)
     assert "1. Dietary preference: preference 1" in payload["text"]
     assert "4. Dietary preference: preference 4" in payload["text"]
-    assert "5. Batch rule: batch 1" in payload["text"]
-    assert "7. Batch rule: batch 3" in payload["text"]
     buttons = payload["reply_markup"]["inline_keyboard"]
     assert [[button["text"] for button in row] for row in buttons] == [
-        ["1", "2", "3", "4", "5"],
-        ["6", "7"],
+        ["1", "2", "3", "4"],
         ["Back"],
         ["Done"],
         ["Close"],
     ]
     callbacks = [
-        button["callback_data"] for row in buttons[:2] for button in row
+        button["callback_data"] for row in buttons[:1] for button in row
     ]
     assert callbacks == [
         f"profile:remove:dietary_preferences:{index}:17"
-        for index in range(1, 8)
+        for index in range(1, 5)
     ]
     assert all(len(callback.encode("utf-8")) < 64 for callback in callbacks)
 
@@ -487,8 +435,8 @@ def test_profile_removal_keeps_duplicate_labels_at_distinct_indices(
         update={
             "profile_revision": 3,
             "dietary_preferences": [
-                make_preference("same wording", identifier="pref-1"),
-                make_preference("same wording", identifier="pref-2"),
+                "same wording",
+                "same wording",
             ],
         }
     )
@@ -525,7 +473,7 @@ def test_profile_removal_keeps_duplicate_labels_at_distinct_indices(
         ),
         (
             ProfileEditCategory.DIETARY_PREFERENCES,
-            {"dietary_preferences": [], "batch_rules": []},
+            {"dietary_preferences": []},
             "There are no dietary preferences to remove.",
         ),
     ],
@@ -718,33 +666,6 @@ def test_profile_operations_render_target_guidance(
         assert fragment in payload["text"]
 
 
-def test_profile_rule_review_renders_batch_rules_without_storage_id(
-    mocker: MockerFixture,
-) -> None:
-    """Batch review shows user wording and yield, not provider identifiers."""
-    urlopen = mocker.patch(
-        "urllib.request.urlopen",
-        side_effect=lambda *args, **kwargs: _response(),
-    )
-    rule = make_batch_rule(
-        source_text="cook chicken once for two lunches",
-        identifier="provider-only-batch-id",
-    )
-
-    TelegramAPI("token").send_profile_rule_review(
-        1,
-        ProfileEditCategory.DIETARY_PREFERENCES,
-        rule.source_text,
-        [rule],
-        "review-token",
-    )
-
-    payload = _last_payload(urlopen)
-    assert rule.source_text in payload["text"]
-    assert "2 meals" in payload["text"]
-    assert rule.id not in payload["text"]
-
-
 def test_send_meal_review_renders_exact_text_and_review_buttons(
     mocker: MockerFixture,
 ) -> None:
@@ -783,82 +704,6 @@ def test_send_meal_review_renders_exact_text_and_review_buttons(
             ]
         ]
     }
-
-
-def test_send_meal_review_renders_one_explicit_batch_role_confirmation(
-    mocker: MockerFixture,
-) -> None:
-    urlopen = mocker.patch("urllib.request.urlopen", return_value=_response())
-    submission_id = UUID("12345678-1234-5678-1234-567812345678")
-    link = PlannedBatchLink(
-        batch_id="storage-hidden-batch",
-        role=BatchMealRole.LEFTOVER,
-        source_date=date(2026, 8, 21),
-        source_meal_type=MealType.DINNER,
-        portion=2,
-    )
-
-    TelegramAPI("token").send_meal_review(
-        1,
-        "today, dinner, roast chicken",
-        submission_id,
-        batch_link=link,
-    )
-
-    payload = json.loads(urlopen.call_args.args[0].data.decode())
-    assert "planned batch leftover" in payload["text"].lower()
-    callbacks = [
-        button["callback_data"]
-        for row in payload["reply_markup"]["inline_keyboard"]
-        for button in row
-    ]
-    assert (
-        "meal:confirm:12345678-1234-5678-1234-567812345678:leftover"
-        in callbacks
-    )
-    assert all("storage-hidden-batch" not in callback for callback in callbacks)
-
-
-def test_send_plan_labels_batch_preparation_and_leftover_without_ownership(
-    mocker: MockerFixture,
-) -> None:
-    """Draft text makes batch intent clear without storage-only fields."""
-    urlopen = mocker.patch("urllib.request.urlopen", return_value=_response())
-    plan = make_plan(week_start=date(2026, 8, 10))
-    plan.days[0].meals[0].batch_link = PlannedBatchLink(
-        batch_id="batch-chicken", role="preparation"
-    )
-    plan.days[1].meals[0].batch_link = PlannedBatchLink(
-        batch_id="batch-chicken",
-        role="leftover",
-        source_date="2026-08-10",
-        source_meal_type="dinner",
-        portion=2,
-    )
-
-    TelegramAPI("token").send_plan(1, plan)
-
-    payload = json.loads(urlopen.call_args.args[0].data.decode())
-    assert "Batch preparation" in payload["text"]
-    assert "Batch leftover" in payload["text"]
-    assert "batch-chicken" not in payload["text"]
-
-
-def test_send_plan_labels_explicit_batch_yield_without_ownership(
-    mocker: MockerFixture,
-) -> None:
-    """Draft text uses the preparation yield without storage identifiers."""
-    urlopen = mocker.patch("urllib.request.urlopen", return_value=_response())
-    plan = make_plan(week_start=date(2026, 8, 10))
-    plan.days[0].meals[0].batch_link = PlannedBatchLink(
-        batch_id="batch-chicken", role="preparation", total_yield=3
-    )
-
-    TelegramAPI("token").send_plan(1, plan)
-
-    payload = json.loads(urlopen.call_args.args[0].data.decode())
-    assert "Batch preparation; makes 3 meals" in payload["text"]
-    assert "batch-chicken" not in payload["text"]
 
 
 def test_send_meal_saved_renders_continuation_buttons(
@@ -905,3 +750,26 @@ def test_meal_keyboard_callbacks_fit_telegram_byte_limit() -> None:
             assert len(row) == 2
             for button in row:
                 assert len(button["callback_data"].encode("utf-8")) <= 64
+
+
+def test_profile_summary_renders_raw_dietary_text_without_batch_section(
+    mocker: MockerFixture,
+) -> None:
+    """Profile output displays the retained raw lists only."""
+    urlopen = mocker.patch(
+        "urllib.request.urlopen",
+        side_effect=lambda *args, **kwargs: _response(),
+    )
+    profile = make_profile().model_copy(
+        update={
+            "dietary_constraints": ["Peanuts"],
+            "dietary_preferences": ["More vegetables"],
+        }
+    )
+
+    TelegramAPI("token").send_profile(1, profile)
+
+    payload = _last_payload(urlopen)
+    assert "Dietary constraints:\n1. Peanuts" in payload["text"]
+    assert "Dietary preferences:\n1. More vegetables" in payload["text"]
+    assert "Batch rules" not in payload["text"]

@@ -14,10 +14,8 @@ def mock_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LLM_API_KEY", "test-api-key")
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "test-webhook-secret")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "1, 2")
-    monkeypatch.setenv("CONVERSATIONAL_LLM_MODEL", "gpt-5.6-luna")
-    monkeypatch.setenv("CONVERSATIONAL_LLM_REASONING_EFFORT", "medium")
-    monkeypatch.setenv("PLANNER_LLM_MODEL", "gpt-5.6-luna")
-    monkeypatch.setenv("PLANNER_LLM_REASONING_EFFORT", "high")
+    monkeypatch.setenv("PLAN_CHAT_LLM_MODEL", "gpt-5.6-luna")
+    monkeypatch.setenv("PLAN_CHAT_LLM_REASONING_EFFORT", "high")
     monkeypatch.setenv("DYNAMODB_TABLE_NAME", "test-meal-planner")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
 

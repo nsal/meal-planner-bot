@@ -100,17 +100,11 @@ class DeploymentSettings(BaseSettings):
     )
     app_secrets_secret_name: str = Field(..., alias="APP_SECRETS_SECRET_NAME")
     sync_secrets: bool = Field(default=False, alias="SYNC_SECRETS")
-    conversational_llm_model: str = Field(
-        default="gpt-5.6-luna", alias="CONVERSATIONAL_LLM_MODEL"
+    plan_chat_llm_model: str = Field(
+        default="gpt-5.6-luna", alias="PLAN_CHAT_LLM_MODEL"
     )
-    conversational_llm_reasoning_effort: str = Field(
-        default="medium", alias="CONVERSATIONAL_LLM_REASONING_EFFORT"
-    )
-    planner_llm_model: str = Field(
-        default="gpt-5.6-luna", alias="PLANNER_LLM_MODEL"
-    )
-    planner_llm_reasoning_effort: str = Field(
-        default="high", alias="PLANNER_LLM_REASONING_EFFORT"
+    plan_chat_llm_reasoning_effort: str = Field(
+        default="high", alias="PLAN_CHAT_LLM_REASONING_EFFORT"
     )
 
     @field_validator(
@@ -122,10 +116,8 @@ class DeploymentSettings(BaseSettings):
         "telegram_webhook_secret",
         "llm_api_key",
         "app_secrets_secret_name",
-        "conversational_llm_model",
-        "conversational_llm_reasoning_effort",
-        "planner_llm_model",
-        "planner_llm_reasoning_effort",
+        "plan_chat_llm_model",
+        "plan_chat_llm_reasoning_effort",
     )
     @classmethod
     def _require_text(cls, value: str) -> str:
@@ -143,8 +135,7 @@ class DeploymentSettings(BaseSettings):
         return value
 
     @field_validator(
-        "conversational_llm_reasoning_effort",
-        "planner_llm_reasoning_effort",
+        "plan_chat_llm_reasoning_effort",
     )
     @classmethod
     def _validate_reasoning_effort(cls, value: str) -> str:
@@ -703,10 +694,8 @@ def deploy_sam(
         f"Environment={settings.environment}",
         f"AppSecretsSecretName={settings.app_secrets_secret_name}",
         f"TelegramAllowedUserIds={settings.allowed_user_ids_value}",
-        f"ConversationalLlmModel={settings.conversational_llm_model}",
-        f"ConversationalLlmReasoningEffort={settings.conversational_llm_reasoning_effort}",
-        f"PlannerLlmModel={settings.planner_llm_model}",
-        f"PlannerLlmReasoningEffort={settings.planner_llm_reasoning_effort}",
+        f"PlanChatLlmModel={settings.plan_chat_llm_model}",
+        f"PlanChatLlmReasoningEffort={settings.plan_chat_llm_reasoning_effort}",
         f"SecretRefreshToken={refresh_token_factory()}",
     ]
     command = _aws_sam_command(
@@ -745,7 +734,7 @@ class StackOutputs:
     webhook_url: str
     table_name: str
     bot_function_name: str
-    planner_function_name: str
+    plan_chat_function_name: str
 
 
 def _required_output(outputs: object, key: str) -> str:
@@ -793,7 +782,9 @@ def resolve_stack_outputs(
         webhook_url=_required_output(outputs, "WebhookUrl"),
         table_name=_required_output(outputs, "MealPlannerTableName"),
         bot_function_name=_required_output(outputs, "BotFunctionName"),
-        planner_function_name=_required_output(outputs, "PlannerFunctionName"),
+        plan_chat_function_name=_required_output(
+            outputs, "PlanChatFunctionName"
+        ),
     )
 
 

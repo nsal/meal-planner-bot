@@ -1,971 +1,204 @@
-"""Tests for prompt builders and context assembly."""
+"""Tests for the retained plain-text plan-chat prompt."""
 
 from datetime import date, datetime, timedelta, timezone
 
-import pytest
-
 from meal_planner.llm.prompts import (
-    build_conversational_prompt,
-    build_grocery_prompt,
-    build_plan_prompt,
-    build_plan_revision_prompt,
-    build_preference_interpretation_prompt,
+    MAX_MEAL_HISTORY_CHARACTERS,
+    MAX_MEAL_HISTORY_RECORDS,
+    _render_history,
+    build_plan_chat_prompt,
 )
-from meal_planner.models.schemas import (
-    BatchLedgerEntry,
-    BatchLedgerState,
-    ConstraintEntry,
-    ConversationState,
-    ConversationWorkflowKind,
-    ConversationWorkflowStep,
-    DietaryObligation,
-    DietaryPreferenceEntry,
-    DietaryRule,
+from meal_planner.models import (
     FamilyMember,
-    Ingredient,
-    MealLogDraft,
     MealLogEntry,
-    MealOutcome,
-    PlanDay,
-    PlannedMeal,
-    PreferenceRequirement,
-    ProfileUpdateEntities,
+    MealType,
     UserProfile,
-    WeeklyPlan,
 )
 
 
-def test_build_conversational_prompt_empty() -> None:
-    """Test build_conversational_prompt with None/empty parameters."""
-    prompt = build_conversational_prompt()
-    assert "No user profile established yet." in prompt
-    assert "No active meal plan." in prompt
-
-
-def test_conversational_prompt_renders_pending_meal_without_defaults() -> None:
-    """Pending meal context gives extraction rules and today's date."""
-    now = datetime.now(timezone.utc)
-    state = ConversationState(
-        workflow_kind=ConversationWorkflowKind.MEAL_LOG,
-        step=ConversationWorkflowStep.AWAITING_DATE,
-        meal_draft=MealLogDraft(),
-        created_at=now,
-        updated_at=now,
-        expires_at=now + timedelta(hours=24),
+def _meal(day: date, meal_type: MealType, description: str) -> MealLogEntry:
+    """Return a prompt-history entry."""
+    return MealLogEntry(
+        date=day,
+        meal_type=meal_type,
+        description=description,
+        created_at=datetime(2026, 8, 28, tzinfo=timezone.utc),
     )
-    prompt = build_conversational_prompt(
-        conversation_state=state, current_date=date(2026, 8, 15)
-    )
-    assert "Today's date is 2026-08-15" in prompt
-    assert "never invent a date" in prompt
-    assert "Step: awaiting_date" in prompt
-    assert "No recent meal history logged." in prompt
-    assert "log_meal" in prompt
 
 
-def test_build_conversational_prompt_with_context() -> None:
-    """Test build_conversational_prompt with full user context."""
-    member = FamilyMember(name="Alice", calorie_target=1800)
+def test_prompt_contains_all_household_targets_and_raw_profile_text() -> None:
+    """Every member and raw dietary entry is represented."""
     profile = UserProfile(
-        name="John",
-        family_members=[
-            member,
-            FamilyMember(name="John", calorie_target=2100),
-        ],
-        dietary_constraints=["peanuts", "dairy-free"],
-        dietary_preferences=[
-            DietaryPreferenceEntry(
-                id="preference-low-carb",
-                source_text="low-carb",
-                rule=DietaryRule(
-                    id="rule-low-carb",
-                    source_text="low-carb",
-                    foods_any_of=["low-carb"],
-                    count=1,
-                ),
-            )
-        ],
+        name="The García household",
         people_count=2,
-    )
-    meal = PlannedMeal(meal_type="lunch", name="Salad")
-    day = PlanDay(day=1, meals=[meal])
-    days = [day, *(PlanDay(day=value) for value in range(2, 8))]
-    plan = WeeklyPlan(week_start="2026-08-10", status="confirmed", days=days)
-    history = [
-        MealLogEntry(
-            date="2026-08-04",
-            meal_type="dinner",
-            description="Tacos",
-            created_at="2026-08-04T18:00:00Z",
-        )
-    ]
-
-    prompt = build_conversational_prompt(
-        profile=profile, current_plan=plan, recent_meals=history
-    )
-    assert "John" in prompt
-    assert "Alice (1800 kcal)" in prompt
-    assert "Dietary constraints: peanuts, dairy-free" in prompt
-    assert "Allergies:" not in prompt
-    assert "Restrictions:" not in prompt
-    assert "low-carb" in prompt
-    assert "Status: confirmed" in prompt
-    assert "Day 1: lunch: Salad" in prompt
-    assert "Tacos" in prompt
-
-
-def test_build_conversational_prompt_with_partial_profile_draft() -> None:
-    prompt = build_conversational_prompt(
-        profile_draft=ProfileUpdateEntities(name="Alex", people_count=2)
-    )
-
-    assert "--- Saved Profile ---" in prompt
-    assert "--- Pending Profile Updates ---" in prompt
-    assert "Family Name: Alex" in prompt
-    assert "People Count: 2" in prompt
-    assert "Family Members: Missing" in prompt
-    assert "Dietary Constraints: Missing" in prompt
-    assert "Allergies:" not in prompt
-    assert "Restrictions:" not in prompt
-    assert "Family Members: None specified" not in prompt
-
-
-def test_conversational_prompt_distinguishes_family_and_member_names() -> None:
-    prompt = build_conversational_prompt(
-        profile_draft=ProfileUpdateEntities(
-            name="Nick",
-            family_members=[{"name": "Val", "calorie_target": 1800}],
-        )
-    )
-
-    assert "Family Name: Nick" in prompt
-    assert "Family Members: Val (1800 kcal)" in prompt
-    assert "top-level 'name' field means the household's family name" in prompt
-    assert "individual member's name" in prompt
-    assert "'name'" in prompt
-    assert "people_count" in prompt
-
-
-def test_conversational_prompt_contracts_optional_member_targets() -> None:
-    """Profile extraction keeps optional targets on each member."""
-    prompt = build_conversational_prompt()
-    normalized = prompt.casefold()
-
-    assert "family_members" in normalized
-    assert "protein_target" in normalized
-    assert "fibre_target" in normalized
-    assert "optional" in normalized
-    assert "grams/day" in normalized
-    assert "only when the user explicitly provides" in normalized
-    assert "never invent" in normalized
-    assert "top-level 'protein_target'" not in normalized
-    assert "top-level 'fibre_target'" not in normalized
-
-
-def test_conversational_prompt_keeps_targets_with_correct_member() -> None:
-    """Different optional targets remain attached to their source member."""
-    prompt = build_conversational_prompt(
-        profile_draft=ProfileUpdateEntities(
-            family_members=[
-                {"name": "Alex", "calorie_target": 2000},
-                {
-                    "name": "Sam",
-                    "calorie_target": 1800,
-                    "protein_target": 120,
-                },
-                {
-                    "name": "Lee",
-                    "calorie_target": 1600,
-                    "fibre_target": 30,
-                },
-            ]
-        )
-    )
-
-    assert (
-        "Alex (2000 kcal) [protein target: not set; fibre target: not set]"
-        in prompt
-    )
-    assert (
-        "Sam (1800 kcal) [protein target: 120 g/day; fibre target: not set]"
-        in prompt
-    )
-    assert (
-        "Lee (1600 kcal) [protein target: not set; fibre target: 30 g/day]"
-        in prompt
-    )
-
-
-def test_prompt_separates_saved_and_pending_values() -> None:
-    profile = UserProfile(name="Alex", dietary_constraints=["shellfish"])
-    draft = ProfileUpdateEntities(dietary_constraints=["peanuts"])
-
-    prompt = build_conversational_prompt(
-        profile=profile,
-        profile_draft=draft,
-    )
-
-    saved_start = prompt.index("--- Saved Profile ---")
-    pending_start = prompt.index("--- Pending Profile Updates ---")
-    assert "Dietary constraints: shellfish" in prompt[saved_start:pending_start]
-    assert "Dietary Constraints: peanuts" in prompt[pending_start:]
-    assert "Allergies:" not in prompt
-    assert "Restrictions:" not in prompt
-
-
-def test_build_conversational_prompt_renders_pending_family_members() -> None:
-    prompt = build_conversational_prompt(
-        profile_draft=ProfileUpdateEntities(
-            family_members=[{"name": "Sam", "calorie_target": 1800}]
-        )
-    )
-
-    assert "Family Members: Sam (1800 kcal)" in prompt
-
-
-@pytest.mark.parametrize(
-    ("protein_target", "fibre_target", "protein_text", "fibre_text"),
-    [
-        (None, None, "not set", "not set"),
-        (120, None, "120 g/day", "not set"),
-        (None, 30, "not set", "30 g/day"),
-        (120, 30, "120 g/day", "30 g/day"),
-    ],
-)
-def test_conversational_prompts_render_all_member_targets(
-    protein_target: int | None,
-    fibre_target: int | None,
-    protein_text: str,
-    fibre_text: str,
-) -> None:
-    """Saved and pending members expose every target without defaults."""
-    member = FamilyMember(
-        name="Sam",
-        calorie_target=1800,
-        protein_target=protein_target,
-        fibre_target=fibre_target,
-    )
-    profile = UserProfile(name="Household", family_members=[member])
-
-    saved_prompt = build_conversational_prompt(profile=profile)
-    pending_prompt = build_conversational_prompt(
-        profile_draft=ProfileUpdateEntities(family_members=[member])
-    )
-
-    for prompt in (saved_prompt, pending_prompt):
-        assert "Sam (1800 kcal)" in prompt
-        assert f"protein target: {protein_text}" in prompt
-        assert f"fibre target: {fibre_text}" in prompt
-    assert "protein target: 0" not in saved_prompt
-    assert "fibre target: 0" not in pending_prompt
-
-
-def test_build_plan_prompt_empty() -> None:
-    """Test build_plan_prompt with default/empty parameters."""
-    prompt = build_plan_prompt()
-    assert "General profile" in prompt
-    assert "2000 kcal/day" in prompt
-    assert "Week Start Date: 2026-08-10" in prompt
-    assert "at most four meals per day" in prompt
-    assert "OUTPUT JSON SCHEMA" in prompt
-
-
-@pytest.mark.parametrize(
-    ("plan_days", "end_date"),
-    [(1, "2026-08-10"), (3, "2026-08-12"), (7, "2026-08-16")],
-)
-def test_build_plan_prompt_uses_exact_requested_duration(
-    plan_days: int, end_date: str
-) -> None:
-    """Generation prompts describe the exact dates and day sequence."""
-    prompt = build_plan_prompt(
-        week_start="2026-08-10",
-        plan_days=plan_days,
-    )
-
-    assert f"Generate a {plan_days}-day meal plan" in prompt
-    assert f"Inclusive Plan Date Range: 2026-08-10 through {end_date}" in prompt
-    day_sequence = ", ".join(str(day) for day in range(1, plan_days + 1))
-    assert f"with day numbers: {day_sequence}" in prompt
-    if plan_days < 7:
-        assert "7-day meal plan" not in prompt
-        assert "of the 7 days" not in prompt
-
-
-def test_build_plan_prompt_states_complete_generated_plan_contract() -> None:
-    """Initial generation prompts state all validator-aligned invariants."""
-    prompt = build_plan_prompt()
-
-    assert "exactly one breakfast, one lunch, and one dinner" in prompt
-    assert "each of the 7 days" in prompt
-    assert "Snack is optional" in prompt
-    assert "at least one non-empty ingredient item" in prompt
-    assert "positive est_calories" in prompt
-
-
-def test_build_plan_prompt_states_batch_generation_contract() -> None:
-    """Batch output names its role, yield, scope, and complete ingredients."""
-    prompt = build_plan_prompt()
-
-    assert "batch_link" in prompt
-    assert "preparation" in prompt and "leftover" in prompt
-    assert "batch IDs are application-owned" in prompt
-    assert "lunch or dinner" in prompt
-    assert "source_date" in prompt
-    assert "portion" in prompt
-    assert "total_yield" in prompt
-    assert "2 or 3 total portions" in prompt
-    assert "Never use a batch link on an ordinary meal" in prompt
-
-
-def test_build_plan_prompt_renders_available_batch_reservations() -> None:
-    """The model receives bounded available inventory without ownership data."""
-    entry = BatchLedgerEntry(
-        batch_id="batch-chicken",
-        source_plan_id="private-plan",
-        source_request_id="private-request",
-        source_revision=4,
-        preparation_date=date(2026, 8, 18),
-        preparation_meal_type="dinner",
-        food="chicken",
-        meal_name="Roast chicken",
-        total_portions=3,
-        remaining_portions=2,
-        state=BatchLedgerState.AVAILABLE,
-        week_end=date(2026, 8, 23),
-    )
-
-    prompt = build_plan_prompt(
-        week_start="2026-08-19", available_batches=[entry]
-    )
-
-    assert "AVAILABLE BATCH PORTIONS" in prompt
-    assert "batch-chicken" in prompt
-    assert "2026-08-18" in prompt
-    assert "2 portions" in prompt
-    assert "private-plan" not in prompt
-    assert "private-request" not in prompt
-
-
-def test_repair_plan_prompt_states_same_complete_generated_plan_contract() -> (
-    None
-):
-    """Repair prompts retain the complete generation contract."""
-    prompt = build_plan_prompt(repair_feedback="fix the missing meal")
-
-    assert "exactly one breakfast, one lunch, and one dinner" in prompt
-    assert "each of the 7 days" in prompt
-    assert "Snack is optional" in prompt
-    assert "at least one non-empty ingredient item" in prompt
-    assert "positive est_calories" in prompt
-
-
-def test_build_plan_prompt_with_context() -> None:
-    """Test build_plan_prompt with full profile, history, and previous plan."""
-    member = FamilyMember(name="Bob", calorie_target=2200)
-    profile = UserProfile(
-        name="Alice",
         family_members=[
-            member,
-            FamilyMember(name="Alice", calorie_target=1800),
-            FamilyMember(name="Charlie", calorie_target=2000),
+            FamilyMember(name="Zoë", calorie_target=1_800, protein_target=90),
+            FamilyMember(name="李明", calorie_target=2_200, fibre_target=35),
         ],
-        dietary_constraints=["shellfish"],
-        dietary_preferences=[
-            DietaryPreferenceEntry(
-                id="preference-keto",
-                source_text="keto",
-                rule=DietaryRule(
-                    id="rule-keto",
-                    source_text="keto",
-                    foods_any_of=["keto"],
-                    count=1,
-                ),
-            )
-        ],
-        people_count=3,
+        dietary_constraints=["No peanuts"],
+        dietary_preferences=["Prefer simple meals"],
     )
-    history = [
-        MealLogEntry(
-            date="2026-08-03",
-            meal_type="dinner",
-            description="Salmon",
-            created_at="2026-08-03T18:00:00Z",
-        )
-    ]
-    prev_meal_cooked = PlannedMeal(
-        meal_type="dinner", name="Steak", outcome=MealOutcome.COOKED
-    )
-    prev_meal_skipped = PlannedMeal(
-        meal_type="lunch", name="Soup", outcome=MealOutcome.SKIPPED
-    )
-    prev_meal_swapped = PlannedMeal(
-        meal_type="dinner", name="Pasta", outcome=MealOutcome.SWAPPED
-    )
-    prev_meal_unreported = PlannedMeal(
-        meal_type="snack", name="Fruit", outcome=MealOutcome.UNREPORTED
-    )
-    prev_plan = WeeklyPlan(
-        week_start="2026-08-03",
-        status="confirmed",
-        days=[
-            PlanDay(day=1, meals=[prev_meal_cooked]),
-            PlanDay(day=2, meals=[prev_meal_skipped]),
-            PlanDay(day=3, meals=[prev_meal_swapped, prev_meal_unreported]),
-            *(PlanDay(day=value) for value in range(4, 8)),
-        ],
-    )
+    prompt = build_plan_chat_prompt(profile, initial_request="Dinners")
 
-    prompt = build_plan_prompt(
-        profile=profile,
-        meal_history=history,
-        previous_plan=prev_plan,
-        week_start="2026-08-10",
-    )
-    assert "Family Name: Alice" in prompt
-    assert "Bob (2200 kcal/day)" in prompt
-    assert "shellfish" in prompt
-    assert "Salmon" in prompt
-    assert "Cooked: Steak" in prompt
-    assert "Skipped: Soup" in prompt
-    assert "Swapped: Pasta" in prompt
-    assert "Fruit" not in prompt
+    assert "The García household" in prompt
+    assert "Zoë" in prompt and "1800 kcal/day" in prompt
+    assert "protein target: 90 g/day" in prompt
+    assert "李明" in prompt and "2200 kcal/day" in prompt
+    assert "fibre target: 35 g/day" in prompt
+    assert "No peanuts" in prompt
+    assert "Prefer simple meals" in prompt
 
 
-@pytest.mark.parametrize(
-    ("protein_target", "fibre_target", "protein_text", "fibre_text"),
-    [
-        (None, None, "not set", "not set"),
-        (120, None, "120 g/day", "not set"),
-        (None, 30, "not set", "30 g/day"),
-        (120, 30, "120 g/day", "30 g/day"),
-    ],
-)
-def test_plan_prompt_renders_all_member_targets(
-    protein_target: int | None,
-    fibre_target: int | None,
-    protein_text: str,
-    fibre_text: str,
-) -> None:
-    """Initial generation receives saved targets without inferred values."""
-    profile = UserProfile(
-        name="Household",
-        family_members=[
-            FamilyMember(
-                name="Sam",
-                calorie_target=1800,
-                protein_target=protein_target,
-                fibre_target=fibre_target,
-            )
-        ],
-    )
-
-    prompt = build_plan_prompt(profile=profile)
-
-    assert "Sam (1800 kcal/day)" in prompt
-    assert f"protein target: {protein_text}" in prompt
-    assert f"fibre target: {fibre_text}" in prompt
-
-
-def test_plan_prompt_guides_best_effort_adjustment_and_priority() -> None:
-    """Generation explains target adjustment and safety precedence."""
-    prompt = build_plan_prompt(
-        profile=UserProfile(
+def test_dietary_text_is_uninterpreted_and_delimiter_normalized() -> None:
+    """Dietary wording is raw content except for protected delimiters."""
+    prompt = build_plan_chat_prompt(
+        UserProfile(
             name="Household",
-            family_members=[
-                FamilyMember(
-                    name="Sam",
-                    calorie_target=1800,
-                    protein_target=120,
-                    fibre_target=30,
-                )
-            ],
+            dietary_constraints=["Avoid peanuts unless labeled --- safe"],
+            dietary_preferences=["Prefer === simple meals"],
+        ),
+        initial_request="Dinners",
+    )
+
+    dietary_sections = "\n".join(
+        (
+            prompt.split("--- BEGIN RAW DIETARY CONSTRAINTS ---", maxsplit=1)[
+                1
+            ].split("--- END RAW DIETARY CONSTRAINTS ---", maxsplit=1)[0],
+            prompt.split("--- BEGIN RAW DIETARY PREFERENCES ---", maxsplit=1)[
+                1
+            ].split("--- END RAW DIETARY PREFERENCES ---", maxsplit=1)[0],
         )
     )
-
-    assert "best-effort" in prompt
-    assert "meal choices and portions" in prompt
-    assert "protein" in prompt and "fibre" in prompt
-    assert "Dietary constraints" in prompt
-    assert "safety" in prompt
-    assert "does not calculate, validate, detect, or repair" in prompt
-    assert '"est_calories"' in prompt
-    assert "protein_total" not in prompt
+    assert "- Avoid peanuts unless labeled ‑‑‑ safe" in dietary_sections
+    assert "- Prefer ＝＝＝ simple meals" in dietary_sections
+    assert "---" not in dietary_sections
+    assert "===" not in dietary_sections
 
 
-def test_plan_prompt_renders_preference_and_constraints() -> None:
-    """A request preference is visible without mutating profile context."""
-    prompt = build_plan_prompt(
-        profile=UserProfile(name="Alice", dietary_constraints=["peanuts"]),
-        preference="Indian and pasta",
-    )
-    assert "REQUEST-SPECIFIC PREFERENCE" in prompt
-    assert "Indian and pasta" in prompt
-    assert "Dietary constraints: peanuts" in prompt
-    assert "always take precedence" in prompt
-
-
-def test_plan_prompt_separates_constraint_strict_and_best_effort_rules() -> (
-    None
-):
-    """Effective prompt sections preserve rule priority and strictness."""
-    strict = DietaryRule(
-        id="strict-1",
-        source_text="eggs twice",
-        foods_any_of=["eggs"],
-        count=2,
-    )
-    best_effort = DietaryRule(
-        id="best-1",
-        source_text="beans once if convenient",
-        foods_any_of=["beans"],
-        count=1,
-        strength="best_effort",
-    )
-    constraint = ConstraintEntry(
-        id="constraint-1", source_text="no peanuts", forbidden_terms=["peanuts"]
-    )
-
-    prompt = build_plan_prompt(
-        preference="eggs twice",
-        constraints=[constraint],
-        effective_rules=[strict, best_effort],
-    )
-
-    assert "=== DIETARY CONSTRAINTS (HIGHEST PRIORITY) ===" in prompt
-    assert "=== HORIZON OBLIGATIONS (APPLICATION-OWNED) ===" in prompt
-    assert "EFFECTIVE STRICT RULES" not in prompt
-    assert "EFFECTIVE BEST-EFFORT RULES" not in prompt
-    assert "no peanuts" in prompt
-    assert "strict-1" not in prompt
-    assert "best-1" not in prompt
-    assert "Goals" not in prompt
-
-
-def test_plan_prompt_renders_raw_preference_and_every_exact_rule() -> None:
-    """The planner sees raw wording and the application interpretation."""
-    prompt = build_plan_prompt(
-        profile=UserProfile(name="Alice", dietary_constraints=["peanuts"]),
-        preference="crepes or pancakes once at breakfast, eggs three times",
-        requirements=[
-            PreferenceRequirement(
-                id="r1",
-                source_text="crepes or pancakes once at breakfast",
-                foods_any_of=["crepes", "pancakes"],
-                meal_type="breakfast",
-                exact_count=1,
-            ),
-            PreferenceRequirement(
-                id="r2",
-                source_text="eggs three times",
-                foods_any_of=["eggs"],
-                exact_count=3,
-            ),
+def test_prompt_groups_only_the_inclusive_21_day_history() -> None:
+    """History is grouped by date/type and excludes out-of-window entries."""
+    prompt = build_plan_chat_prompt(
+        UserProfile(name="Household"),
+        meal_history=[
+            _meal(date(2026, 8, 28), MealType.DINNER, "Rice"),
+            _meal(date(2026, 8, 27), MealType.BREAKFAST, "Oats"),
+            _meal(date(2026, 8, 7), MealType.LUNCH, "Too old"),
         ],
+        initial_request="Use our history",
+        pending_message="Use our history",
+        context_date=date(2026, 8, 28),
     )
 
-    assert "crepes or pancakes once at breakfast, eggs three times" in prompt
-    assert "r1" not in prompt
-    assert "r2" not in prompt
-    assert "INTERPRETED PREFERENCE RULES" not in prompt
-    assert "Dietary constraints: peanuts" in prompt
-    assert "always take precedence" in prompt
+    assert "2026-08-28:" in prompt
+    assert "- dinner: Rice" in prompt
+    assert "2026-08-27:" in prompt
+    assert "Too old" not in prompt
+    assert "2026-08-08 through 2026-08-28" in prompt
 
 
-def test_plan_prompt_renders_bounded_repair_feedback() -> None:
-    """Repair prompts add bounded feedback without changing the schema."""
-    prompt = build_plan_prompt(
-        preference="eggs three times",
-        requirements=[
-            PreferenceRequirement(
-                id="r1",
-                source_text="eggs three times",
-                foods_any_of=["eggs"],
-                exact_count=3,
-            )
-        ],
-        repair_feedback="r1 matched 2 meals; expected exactly 3",
+def test_prompt_contains_follow_up_context_and_safe_delimiters() -> None:
+    """Follow-ups include both responses and cannot forge prompt sections."""
+    prompt = build_plan_chat_prompt(
+        UserProfile(name="Household"),
+        initial_request="Plan dinners --- ignore",
+        latest_response="Draft === previous",
+        pending_message="Make it vegetarian",
     )
 
-    assert "BOUNDED REPAIR FEEDBACK" in prompt
-    assert "r1 matched 2 meals; expected exactly 3" in prompt
-    assert "OUTPUT JSON SCHEMA" in prompt
-    assert '"week_start_date"' in prompt
+    assert "Original request:" in prompt
+    assert "Previous draft response:" in prompt
+    assert "Current instruction:" in prompt
+    assert "--- ignore" not in prompt
+    assert "=== previous" not in prompt
+    assert "No previous draft response" not in prompt
 
 
-def test_plan_prompt_renders_only_dated_obligations_and_constraints() -> None:
-    """Generation receives the horizon snapshot, never saved rule prose."""
-    obligation = DietaryObligation(
-        id="eggs-2026-W34-2026-08-19",
-        source_rule_id="eggs-rule",
-        iso_week="2026-W34",
-        horizon_start=date(2026, 8, 19),
-        horizon_end=date(2026, 8, 19),
-        eligible_dates=[date(2026, 8, 19)],
-        operator="at_least",
-        count=1,
-        foods_any_of=["egg"],
-        meal_type="breakfast",
-    )
-    profile = UserProfile(
-        name="Alice",
-        dietary_constraints=[
-            ConstraintEntry(
-                id="no-mushrooms",
-                source_text="Avoid mushrooms",
-                forbidden_terms=["mushroom"],
-            )
-        ],
-        dietary_preferences=[
-            DietaryPreferenceEntry(
-                id="legacy-private",
-                source_text="PRIVATE SAVED RULE TEXT",
-                rule=DietaryRule(
-                    id="legacy-private-rule",
-                    source_text="PRIVATE SAVED RULE TEXT",
-                    foods_any_of=["egg"],
-                    count=3,
-                ),
-            )
-        ],
+def test_prompt_states_draft_disclaimer_and_plain_text_contract() -> None:
+    """The model receives operational guidance without validation rules."""
+    prompt = build_plan_chat_prompt(
+        UserProfile(name="Household"),
+        initial_request="Help",
+        pending_message="Help",
     )
 
-    prompt = build_plan_prompt(
-        profile=profile,
-        week_start="2026-08-17",
-        plan_days=3,
-        stored_rules=[profile.dietary_preferences[0].rule],
-        effective_rules=[profile.dietary_preferences[0].rule],
-        obligations=[obligation],
-        constraints=profile.dietary_constraints,
-    )
-
-    assert "2026-08-19" in prompt
-    assert "eggs-2026-W34-2026-08-19" in prompt
-    assert "Avoid mushrooms" in prompt
-    assert "PRIVATE SAVED RULE TEXT" not in prompt
-    assert "STORED PREFERENCE WORDING" not in prompt
-    assert "reinterpret" not in prompt.casefold()
+    assert "editable draft" in prompt
+    assert "preference evidence, not an obligation" in prompt
+    assert "one focused clarification question" in prompt
+    assert "Do not use Markdown tables" in prompt
+    assert "No dietary constraints provided." in prompt
+    assert "No submitted meals in the supplied 21-day window." in prompt
 
 
-def test_plan_revision_prompt_does_not_receive_generation_rules() -> None:
-    """Plan revisions retain their existing amendment-only contract."""
-    profile = UserProfile(name="Alex")
-    plan = WeeklyPlan(
-        week_start="2026-08-10",
-        planning_instructions=["Keep it vegetarian"],
-        days=[PlanDay(day=value) for value in range(1, 8)],
-    )
-
-    prompt = build_plan_revision_prompt(profile, plan, "Avoid mushrooms")
-
-    assert "Keep it vegetarian" in prompt
-    assert "Avoid mushrooms" in prompt
-    assert "INTERPRETED PREFERENCE RULES" not in prompt
-
-
-def test_preference_interpretation_prompt_defines_measurable_contract() -> None:
-    prompt = build_preference_interpretation_prompt(
-        "Have crepes or pancakes once at breakfast, eggs three times, "
-        "and salmon for dinner once."
-    )
-
-    assert "Have crepes or pancakes once at breakfast" in prompt
-    assert "foods_any_of" in prompt
-    assert "exact_count" in prompt
-    assert "meal_type" in prompt
-    assert "Combine alternative foods" in prompt
-    assert "Every meaningful clause" in prompt
-    assert "unparsed_text" in prompt
-
-
-def test_preference_interpretation_prompt_defines_batch_contract() -> None:
-    """Profile interpretation includes a separate bounded batch contract."""
-    prompt = build_preference_interpretation_prompt(
-        "cook one dinner batch for two lunches"
-    )
-
-    assert '"batch_rules"' in prompt
-    assert "total_yield 2 or 3" in prompt
-    assert "preparation_meal_types" in prompt
-    assert "reuse_meal_types" in prompt
-    assert "Batch rules belong in batch_rules" in prompt
-
-
-@pytest.mark.parametrize(
-    ("mode", "required_text"),
-    [
-        ("constraint", "forbidden_terms"),
-        ("stored_preference", "stored dietary preference"),
-        ("current_plan_preference", "current plan preference"),
-    ],
-)
-def test_interpretation_prompt_has_mode_specific_rule_contract(
-    mode: str, required_text: str
-) -> None:
-    """Interpretation prompts describe the selected shared-rule mode."""
-    prompt = build_preference_interpretation_prompt(
-        "I'd like eggs for breakfast twice on Monday and Wednesday if "
-        "convenient; no peanuts",
-        mode=mode,
-    )
-
-    assert f'"mode": "{mode}"' in prompt
-    assert required_text in prompt
-    assert "exactly" in prompt
-    assert "at_least" in prompt
-    assert "at_most" in prompt
-    assert "weekdays" in prompt
-    assert "best_effort" in prompt
-    assert "unparsed_text" in prompt
-    assert "never silently discard" in prompt
-
-
-def test_interpretation_prompt_documents_wording_strength_defaults() -> None:
-    """Prompt makes implicit strictness rules explicit to the provider."""
-    prompt = build_preference_interpretation_prompt(
-        "I'd like eggs for breakfast if convenient"
-    )
-
-    assert "I'd like" in prompt
-    assert "at_least 1" in prompt
-    assert "if convenient" in prompt
-    assert "best_effort" in prompt
-
-
-@pytest.mark.parametrize(
-    "mode", ["stored_preference", "current_plan_preference"]
-)
-def test_interpretation_prompt_defaults_unqualified_positive_foods(
-    mode: str,
-) -> None:
-    """Bare positive food preferences use the application minimum."""
-    prompt = build_preference_interpretation_prompt(
-        "eggs for breakfast",
-        mode=mode,  # type: ignore[arg-type]
-    )
-
-    assert f'"mode": "{mode}"' in prompt
-    assert (
-        "Every unqualified positive food preference without an explicit "
-        "count or operator means strict at_least 1."
-    ) in prompt
-
-
-def test_interpretation_prompt_preserves_explicit_and_negative_intent() -> None:
-    """Explicit provider fields and exclusions are not replaced by defaults."""
-    prompt = build_preference_interpretation_prompt("no eggs twice a week")
-
-    assert "Preserve every explicit count and operator from the user" in prompt
-    assert (
-        "Do not apply that default to negative or exclusion wording such as "
-        "'no', 'avoid', 'without', or 'exclude'."
-    ) in prompt
-    assert (
-        "Do not invent a count or operator unless applying the "
-        "application-owned default above"
-    ) in prompt
-
-
-def test_preference_interpretation_prompt_requires_clarification() -> None:
-    prompt = build_preference_interpretation_prompt("Make it healthy and fun")
-
-    assert "ambiguous" in prompt
-    assert "conflicting" in prompt
-    assert "unsupported" in prompt
-    assert "subjective" in prompt
-    assert "clarification" in prompt
-    assert "silently discard" in prompt
-
-
-def test_preference_interpretation_does_not_change_conversational_intent() -> (
-    None
-):
-    prompt = build_conversational_prompt()
-
-    assert "append a JSON block" in prompt
-    assert "foods_any_of" not in prompt
-    assert "unparsed_text" not in prompt
-
-
-def test_conversational_prompt_contracts_draft_revision() -> None:
-    prompt = build_conversational_prompt(
-        current_plan=WeeklyPlan(
-            week_start="2026-08-10",
-            days=[PlanDay(day=value) for value in range(1, 8)],
+def test_history_limits_records_and_rendered_characters() -> None:
+    """Large histories stay within both independent renderer bounds."""
+    meals = [
+        _meal(
+            date(2026, 7, 1) + timedelta(days=index),
+            MealType.DINNER,
+            f"history-{index:03d} " + "x" * 488,
         )
-    )
-    assert "revise_plan" in prompt
-    assert "only {'amendment': '<faithful request>'}" in prompt
-    assert "Keep edit_plan for one targeted day and meal" in prompt
+        for index in range(MAX_MEAL_HISTORY_RECORDS + 5)
+    ]
 
+    rendered = _render_history(meals, context_date=None)
 
-def test_build_plan_revision_prompt_contains_trusted_full_context() -> None:
-    profile = UserProfile(
-        name="Alex",
-        family_members=[FamilyMember(name="Alex", calorie_target=2000)],
-        dietary_constraints=["peanuts"],
-    )
-    plan = WeeklyPlan(
-        week_start="2026-08-10",
-        planning_instructions=["Three egg breakfasts"],
-        days=[
-            PlanDay(
-                day=1,
-                meals=[
-                    PlannedMeal(
-                        meal_type="breakfast",
-                        name="Eggs",
-                        ingredients=[Ingredient(item="Eggs", amount="2")],
-                    )
-                ],
-            ),
-            *(PlanDay(day=value) for value in range(2, 8)),
-        ],
-    )
-    amendment = (
-        "Make breakfasts waffles, crepes, or eggs three times, keep an open "
-        "day, and avoid cauliflower"
-    )
-    prompt = build_plan_revision_prompt(profile, plan, amendment)
-    assert "Dietary constraints: peanuts" in prompt
-    assert "Allergies:" not in prompt
-    assert "Restrictions:" not in prompt
-    assert '"ingredients"' in prompt
-    assert "Three egg breakfasts" in prompt
-    assert amendment in prompt
-    assert "2026-08-10" in prompt
-    assert "seven days" in prompt
-    assert "Do not return a patch" in prompt
-
-
-@pytest.mark.parametrize("plan_days", [1, 3, 7])
-def test_revision_prompt_preserves_existing_length_and_date_range(
-    plan_days: int,
-) -> None:
-    week_start = date(2026, 8, 10)
-    plan = WeeklyPlan(
-        week_start=week_start,
-        days=[PlanDay(day=value) for value in range(1, plan_days + 1)],
-    )
-
-    prompt = build_plan_revision_prompt(
-        UserProfile(name="Alex"), plan, "Avoid mushrooms"
-    )
-
-    week_end = week_start + timedelta(days=plan_days - 1)
-    assert f"{plan_days}-day draft" in prompt
-    assert f"days 1 through {plan_days}" in prompt
+    records = [line for line in rendered.splitlines() if line.startswith("-")]
+    assert len(records) <= MAX_MEAL_HISTORY_RECORDS
+    assert len(rendered) <= MAX_MEAL_HISTORY_CHARACTERS
+    assert "history-054" in rendered
+    assert "history-000" not in rendered
     assert (
-        f"from {week_start.isoformat()} through {week_end.isoformat()}"
-        in prompt
-    )
-    if plan_days < 7:
-        assert "seven-day" not in prompt
-        assert "seven days" not in prompt
-
-
-@pytest.mark.parametrize(
-    ("protein_target", "fibre_target", "protein_text", "fibre_text"),
-    [
-        (None, None, "not set", "not set"),
-        (120, None, "120 g/day", "not set"),
-        (None, 30, "not set", "30 g/day"),
-        (120, 30, "120 g/day", "30 g/day"),
-    ],
-)
-def test_revision_prompt_renders_all_member_targets(
-    protein_target: int | None,
-    fibre_target: int | None,
-    protein_text: str,
-    fibre_text: str,
-) -> None:
-    """Whole-plan revision receives every saved target."""
-    profile = UserProfile(
-        name="Household",
-        family_members=[
-            FamilyMember(
-                name="Sam",
-                calorie_target=1800,
-                protein_target=protein_target,
-                fibre_target=fibre_target,
-            )
-        ],
-    )
-    plan = WeeklyPlan(
-        week_start="2026-08-10",
-        days=[PlanDay(day=value) for value in range(1, 8)],
+        f"Older meal history omitted: {len(meals) - len(records)} records."
+        in (rendered)
     )
 
-    prompt = build_plan_revision_prompt(profile, plan, "Keep the plan simple")
 
-    assert "Sam (1800 kcal/day)" in prompt
-    assert f"protein target: {protein_text}" in prompt
-    assert f"fibre target: {fibre_text}" in prompt
+def test_history_retains_newest_records_and_renders_them_chronologically() -> (
+    None
+):
+    """Selection is newest-first while output remains chronological."""
+    meals = [
+        _meal(
+            date(2026, 8, 1) + timedelta(days=index),
+            MealType.DINNER,
+            f"meal-{index:02d}",
+        )
+        for index in range(MAX_MEAL_HISTORY_RECORDS + 2)
+    ]
+
+    rendered = _render_history(meals, context_date=None)
+
+    assert "meal-00" not in rendered
+    assert "meal-01" not in rendered
+    assert "meal-02" in rendered
+    assert "meal-51" in rendered
+    assert "Older meal history omitted: 2 records." in rendered
+    assert rendered.index("2026-08-03:") < rendered.index("2026-08-28:")
+    assert rendered.index("meal-02") < rendered.index("meal-51")
 
 
-def test_revision_prompt_guides_best_effort_adjustment_and_priority() -> None:
-    """Revision explains target adjustment without changing output schema."""
-    profile = UserProfile(
-        name="Household",
-        family_members=[
-            FamilyMember(
-                name="Sam",
-                calorie_target=1800,
-                protein_target=120,
-                fibre_target=30,
-            )
-        ],
+def test_history_truncation_keeps_marker_and_escapes_complete_records() -> None:
+    """Character truncation never cuts content or structural delimiters."""
+    meals = [
+        _meal(
+            date(2026, 8, 1) + timedelta(days=index),
+            MealType.DINNER,
+            f"meal-{index:02d} --- " + "x" * 480,
+        )
+        for index in range(MAX_MEAL_HISTORY_RECORDS)
+    ]
+
+    rendered = _render_history(meals, context_date=None)
+
+    retained = sum(
+        f"meal-{index:02d}" in rendered
+        for index in range(MAX_MEAL_HISTORY_RECORDS)
     )
-    plan = WeeklyPlan(
-        week_start="2026-08-10",
-        days=[PlanDay(day=value) for value in range(1, 8)],
-    )
-
-    prompt = build_plan_revision_prompt(profile, plan, "Keep the plan simple")
-
-    assert "best-effort" in prompt
-    assert "meal choices and portions" in prompt
-    assert "Dietary constraints" in prompt
-    assert "safety" in prompt
-    assert "does not calculate, validate, detect, or repair" in prompt
-    assert '"est_calories"' in prompt
-    assert "protein_total" not in prompt
-
-
-def test_revision_prompt_requires_complete_batch_yield_contract() -> None:
-    """Revision batch links retain the initial generation contract."""
-    profile = UserProfile(name="Household")
-    plan = WeeklyPlan(
-        week_start="2026-08-10",
-        days=[PlanDay(day=value) for value in range(1, 8)],
-    )
-
-    prompt = build_plan_revision_prompt(profile, plan, "Keep the batch meals")
-
-    assert "total_yield 2 or 3 total portions" in prompt
-    assert '"total_yield": 2' in prompt
-    assert "role preparation" in prompt
-    assert "role leftover" in prompt
-    assert "portion 1" in prompt
-    assert "portion 2 or 3" in prompt
-    assert "at most two linked leftovers" in prompt
-
-
-def test_build_grocery_prompt() -> None:
-    """Test build_grocery_prompt context scaling and formatting."""
-    ing1 = Ingredient(item="Chicken", amount="500g")
-    ing2 = Ingredient(item="Rice", amount="200g")
-    meal = PlannedMeal(
-        meal_type="dinner", name="Chicken Rice", ingredients=[ing1, ing2]
-    )
-    day = PlanDay(day=1, meals=[meal])
-    plan = WeeklyPlan(
-        week_start="2026-08-10",
-        days=[day, *(PlanDay(day=value) for value in range(2, 8))],
-    )
-
-    prompt = build_grocery_prompt(plan=plan, people_count=4)
-    assert "Scale quantities for 4 people." in prompt
-    assert "Day 1 dinner (Chicken Rice): 500g Chicken, 200g Rice" in prompt
-    assert "Produce, Dairy, Pantry" in prompt
+    assert retained < MAX_MEAL_HISTORY_RECORDS
+    assert (
+        f"Older meal history omitted: "
+        f"{MAX_MEAL_HISTORY_RECORDS - retained} records."
+    ) in rendered
+    assert len(rendered) <= MAX_MEAL_HISTORY_CHARACTERS
+    assert "---" not in rendered

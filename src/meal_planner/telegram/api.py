@@ -10,20 +10,12 @@ from typing import Any
 from uuid import UUID
 
 from meal_planner.models.schemas import (
-    BatchMealRole,
-    BatchRule,
-    ConstraintEntry,
-    DietaryPreferenceEntry,
+    ConversationWorkflowStep,
     FamilyMember,
-    GrocerySection,
     MealCallbackAction,
-    MealOutcome,
-    PlannedBatchLink,
-    PlannedMeal,
     ProfileEditCategory,
     ProfileEditOperation,
     UserProfile,
-    WeeklyPlan,
 )
 from meal_planner.telegram.commands import (
     BOT_COMMANDS,
@@ -34,6 +26,7 @@ from meal_planner.telegram.commands import (
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 4096
+MAX_CALLBACK_DATA_BYTES = 64
 PROFILE_NUMBER_BUTTONS_PER_ROW = 5
 
 
@@ -44,9 +37,7 @@ class TelegramAPIError(RuntimeError):
 InlineKeyboard = dict[str, list[list[dict[str, str]]]]
 
 
-ProfilePresentationValue = (
-    FamilyMember | ConstraintEntry | DietaryPreferenceEntry | BatchRule
-)
+ProfilePresentationValue = FamilyMember | str
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,16 +46,6 @@ class ProfilePresentationItem:
 
     label: str
     value: ProfilePresentationValue
-
-
-def _batch_rule_label(rule: BatchRule) -> str:
-    """Render the user-facing semantics of a stored batch rule."""
-    preparation = ", ".join(item.value for item in rule.preparation_meal_types)
-    reuse = ", ".join(item.value for item in rule.reuse_meal_types)
-    return (
-        f"{rule.source_text} (prepare {preparation}; reuse {reuse}; "
-        f"{rule.total_yield} meals)"
-    )
 
 
 def _family_member_label(member: FamilyMember) -> str:
@@ -84,10 +65,7 @@ def profile_presentation_items(
 ) -> list[ProfilePresentationItem]:
     """Return the deterministic, category-relative profile projection.
 
-    Dietary preferences are followed by batch rules because both are removed
-    through the same profile preference operation.  The source object is
-    retained for the handler while its persisted identifier is omitted from
-    the presentation label and callback contract.
+    Dietary entries are presented in their persisted order.
     """
     if category is ProfileEditCategory.FAMILY:
         return [
@@ -100,7 +78,7 @@ def profile_presentation_items(
     if category is ProfileEditCategory.DIETARY_CONSTRAINTS:
         return [
             ProfilePresentationItem(
-                label=constraint.source_text,
+                label=constraint,
                 value=constraint,
             )
             for constraint in profile.dietary_constraints
@@ -109,26 +87,15 @@ def profile_presentation_items(
     preference_items = [
         ProfilePresentationItem(
             label=(
-                f"Dietary preference: {preference.source_text}"
+                f"Dietary preference: {preference}"
                 if include_type_labels
-                else preference.source_text
+                else preference
             ),
             value=preference,
         )
         for preference in profile.dietary_preferences
     ]
-    batch_items = [
-        ProfilePresentationItem(
-            label=(
-                f"Batch rule: {_batch_rule_label(rule)}"
-                if include_type_labels
-                else _batch_rule_label(rule)
-            ),
-            value=rule,
-        )
-        for rule in profile.batch_rules
-    ]
-    return preference_items + batch_items
+    return preference_items
 
 
 def _numbered_lines(items: Sequence[ProfilePresentationItem]) -> str:
@@ -147,6 +114,15 @@ def _profile_navigation_keyboard() -> InlineKeyboard:
             [{"text": "Back", "callback_data": "profile:back"}],
             [{"text": "Done", "callback_data": "profile:done"}],
             [{"text": "Close", "callback_data": "profile:close"}],
+        ]
+    }
+
+
+def _profile_setup_keyboard() -> InlineKeyboard:
+    """Return the only control available while setting up a profile."""
+    return {
+        "inline_keyboard": [
+            [{"text": "Close", "callback_data": "profile:close"}]
         ]
     }
 
@@ -189,15 +165,13 @@ def _format_nutrient_target(label: str, target: int | None) -> str:
 def _meal_callback_data(
     action: MealCallbackAction,
     submission_id: UUID | str,
-    batch_role: BatchMealRole | None = None,
 ) -> str:
-    """Build a canonical, Telegram-safe callback for a meal submission."""
+    """Build a canonical, Telegram-safe meal callback."""
     try:
         canonical_id = str(UUID(str(submission_id)))
     except (AttributeError, ValueError) as exc:
         raise ValueError("submission_id must be a valid UUID") from exc
-    role_suffix = f":{batch_role.value}" if batch_role is not None else ""
-    callback_data = f"meal:{action.value}:{canonical_id}{role_suffix}"
+    callback_data = f"meal:{action.value}:{canonical_id}"
     if len(callback_data.encode("utf-8")) > 64:
         raise ValueError("meal callback data exceeds Telegram's byte limit")
     return callback_data
@@ -205,23 +179,16 @@ def _meal_callback_data(
 
 def meal_review_keyboard(
     submission_id: UUID | str,
-    batch_link: PlannedBatchLink | None = None,
 ) -> InlineKeyboard:
     """Return one-row Confirm and Cancel buttons for a staged meal."""
-    confirm_text = "✅ Confirm"
-    confirm_role: BatchMealRole | None = None
-    if batch_link is not None:
-        confirm_role = batch_link.role
-        confirm_text = f"✅ Confirm {batch_link.role.value}"
     return {
         "inline_keyboard": [
             [
                 {
-                    "text": confirm_text,
+                    "text": "✅ Confirm",
                     "callback_data": _meal_callback_data(
                         MealCallbackAction.CONFIRM,
                         submission_id,
-                        confirm_role,
                     ),
                     "style": "success",
                 },
@@ -258,6 +225,35 @@ def meal_continuation_keyboard(
                     ),
                     "style": "success",
                 },
+            ]
+        ]
+    }
+
+
+def _plan_chat_callback_data(session_id: UUID | str) -> str:
+    """Build a canonical, Telegram-safe callback for ending a session."""
+    try:
+        canonical_id = str(UUID(str(session_id)))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("session_id must be a valid UUID") from exc
+    callback_data = f"plan_chat:end:{canonical_id}"
+    if len(callback_data.encode("utf-8")) > MAX_CALLBACK_DATA_BYTES:
+        raise ValueError(
+            "plan-chat callback data exceeds Telegram's byte limit"
+        )
+    return callback_data
+
+
+def plan_chat_keyboard(session_id: UUID | str) -> InlineKeyboard:
+    """Return the session-scoped plan-chat exit control."""
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "End planning",
+                    "callback_data": _plan_chat_callback_data(session_id),
+                    "style": "danger",
+                }
             ]
         ]
     }
@@ -353,6 +349,19 @@ class TelegramAPI:
             results.append(self._post("sendMessage", payload))
         return results
 
+    def send_plan_chat(
+        self,
+        chat_id: int | str,
+        text: str,
+        session_id: UUID | str,
+    ) -> list[dict[str, Any]]:
+        """Send plan-chat text with its session-scoped exit control."""
+        return self.send_message(
+            chat_id,
+            text,
+            reply_markup=plan_chat_keyboard(session_id),
+        )
+
     def set_my_commands(
         self,
         commands: Sequence[TelegramCommand] = BOT_COMMANDS,
@@ -366,6 +375,55 @@ class TelegramAPI:
                     command.to_payload() for command in validated_commands
                 ]
             },
+        )
+
+    def send_profile_setup_prompt(
+        self,
+        chat_id: int | str,
+        step: ConversationWorkflowStep,
+        *,
+        people_count: int | None = None,
+        text: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Send the deterministic prompt for one profile setup step."""
+        prompts = {
+            ConversationWorkflowStep.AWAITING_PROFILE_FAMILY_NAME: (
+                "What is your family name?"
+            ),
+            ConversationWorkflowStep.AWAITING_PROFILE_HOUSEHOLD_SIZE: (
+                "How many people are in your household? Reply with a number "
+                "from 1 to 20."
+            ),
+            ConversationWorkflowStep.AWAITING_PROFILE_MEMBERS: (
+                "Send one line for each household member using: name "
+                "calories [protein] [fibre]. Calories are required; protein "
+                "and fibre are optional grams/day. For example:\n"
+                "Alex 2000 120 30\nSam 1800"
+            ),
+            ConversationWorkflowStep.AWAITING_PROFILE_CONSTRAINTS: (
+                "List dietary constraints, one per line. Reply 'none' if "
+                "there are no constraints."
+            ),
+            ConversationWorkflowStep.AWAITING_PROFILE_PREFERENCES: (
+                "List dietary preferences, one per line. Reply 'none' if "
+                "there are no preferences."
+            ),
+        }
+        if text is not None:
+            prompt = text
+        elif step is ConversationWorkflowStep.AWAITING_PROFILE_MEMBERS:
+            prompt = prompts[step]
+            if people_count is not None:
+                prompt = f"There are {people_count} people. " + prompt
+        else:
+            prompt = prompts.get(
+                step,
+                "Please continue setting up your profile.",
+            )
+        return self.send_message(
+            chat_id,
+            prompt,
+            reply_markup=_profile_setup_keyboard(),
         )
 
     def set_webhook(self, url: str, secret_token: str) -> dict[str, Any]:
@@ -401,16 +459,12 @@ class TelegramAPI:
                 profile, ProfileEditCategory.DIETARY_CONSTRAINTS
             )
         )
-        preference_items = profile_presentation_items(
-            profile,
-            ProfileEditCategory.DIETARY_PREFERENCES,
-            include_type_labels=False,
-        )
         preferences = _numbered_lines(
-            preference_items[: len(profile.dietary_preferences)]
-        )
-        batch_rules = _numbered_lines(
-            preference_items[len(profile.dietary_preferences) :]
+            profile_presentation_items(
+                profile,
+                ProfileEditCategory.DIETARY_PREFERENCES,
+                include_type_labels=False,
+            )
         )
         family_items = profile_presentation_items(
             profile, ProfileEditCategory.FAMILY
@@ -422,7 +476,6 @@ class TelegramAPI:
             *(f"- {item.label}" for item in family_items),
             f"Dietary constraints:\n{constraints}",
             f"Dietary preferences:\n{preferences}",
-            f"Batch rules:\n{batch_rules}",
         ]
         keyboard = {
             "inline_keyboard": [
@@ -598,96 +651,22 @@ class TelegramAPI:
         keyboard = _profile_navigation_keyboard()
         return self.send_message(chat_id, prompt, reply_markup=keyboard)
 
-    def send_profile_rule_review(
-        self,
-        chat_id: int | str,
-        category: ProfileEditCategory,
-        source_text: str,
-        rules: list[Any],
-        token: str | None,
-    ) -> list[dict[str, Any]]:
-        """Show an interpreted dietary rule before durable profile write."""
-        if not token:
-            raise ValueError(
-                "rule review requires a supported category and token"
-            )
-        lines = [
-            "Review this dietary profile change:",
-            source_text,
-            "",
-            "Meaning:",
-        ]
-        for rule in rules:
-            if isinstance(rule, BatchRule):
-                preparation = ", ".join(
-                    meal_type.value for meal_type in rule.preparation_meal_types
-                )
-                reuse = ", ".join(
-                    meal_type.value for meal_type in rule.reuse_meal_types
-                )
-                lines.append(
-                    f"- Batch: prepare for {preparation}; reuse for {reuse}; "
-                    f"{rule.total_yield} meals"
-                )
-            elif hasattr(rule, "forbidden_terms"):
-                lines.append("- Exclude: " + ", ".join(rule.forbidden_terms))
-            else:
-                scope = (
-                    f" for {rule.meal_type.value}"
-                    if rule.meal_type is not None
-                    else ""
-                )
-                lines.append(
-                    f"- {rule.operator.value} {rule.count} of "
-                    f"{' or '.join(rule.foods_any_of)}{scope} "
-                    f"({rule.strength.value})"
-                )
-        return self.send_message(
-            chat_id,
-            "\n".join(lines),
-            reply_markup={
-                "inline_keyboard": [
-                    [
-                        {
-                            "text": "Confirm",
-                            "callback_data": f"profile:confirm:{token}",
-                        },
-                        {
-                            "text": "Cancel",
-                            "callback_data": f"profile:cancel:{token}",
-                        },
-                    ],
-                    [{"text": "Back", "callback_data": "profile:back"}],
-                ]
-            },
-        )
-
     def send_meal_review(
         self,
         chat_id: int | str,
         submitted_text: str,
         submission_id: UUID | str,
-        *,
-        batch_link: PlannedBatchLink | None = None,
     ) -> list[dict[str, Any]]:
         """Echo a submitted meal and ask whether it should be saved."""
-        batch_prompt = ""
-        if batch_link is not None:
-            batch_prompt = (
-                "\n\nThis matches a planned batch "
-                f"{batch_link.role.value}. Confirm it as the "
-                f"batch {batch_link.role.value} or cancel."
-            )
         text = (
             "Review this meal submission:\n"
             f"{submitted_text}\n\n"
             "Confirm to save it or cancel."
-            f"{batch_prompt}"
         )
         return self.send_message(
             chat_id,
             text,
-            reply_markup=meal_review_keyboard(submission_id, batch_link),
+            reply_markup=meal_review_keyboard(submission_id),
         )
 
     def send_meal_saved(
@@ -701,103 +680,4 @@ class TelegramAPI:
             chat_id,
             f"✅ Meal saved: {meal_description}",
             reply_markup=meal_continuation_keyboard(submission_id),
-        )
-
-    def send_plan(
-        self, chat_id: int | str, plan: WeeklyPlan
-    ) -> list[dict[str, Any]]:
-        batch_yields: dict[str, int] = {}
-        for plan_day in plan.days:
-            for meal in plan_day.meals:
-                if meal.batch_link is None:
-                    continue
-                link = meal.batch_link
-                inferred_yield = link.total_yield or link.portion
-                batch_yields[link.batch_id] = max(
-                    2, batch_yields.get(link.batch_id, 0), inferred_yield
-                )
-        lines = [
-            f"Meal Plan (starting {plan.week_start_date})",
-            f"Status: {plan.status.value}",
-            "",
-        ]
-        for plan_day in plan.days:
-            lines.append(f"Day {plan_day.day}")
-            for meal in plan_day.meals:
-                outcome = (
-                    ""
-                    if meal.outcome is MealOutcome.UNREPORTED
-                    else f" [{meal.outcome.value}]"
-                )
-                batch_label = ""
-                if meal.batch_link is not None:
-                    if meal.batch_link.role is BatchMealRole.PREPARATION:
-                        batch_label = (
-                            f" [Batch preparation; makes "
-                            f"{batch_yields[meal.batch_link.batch_id]} meals]"
-                        )
-                    else:
-                        batch_label = " [Batch leftover]"
-                lines.append(
-                    f"• {meal.meal_type.value.capitalize()}: {meal.name} "
-                    f"({meal.est_calories} kcal){batch_label}{outcome}"
-                )
-            lines.append("")
-        return self.send_message(chat_id, "\n".join(lines).strip())
-
-    def send_grocery_list(
-        self, chat_id: int | str, sections: list[GrocerySection]
-    ) -> list[dict[str, Any]]:
-        if not sections:
-            return self.send_message(chat_id, "Your grocery list is empty.")
-        lines = ["🛒 Grocery List", ""]
-        for section in sections:
-            lines.append(section.name)
-            lines.extend(f"• {item}" for item in section.items)
-            lines.append("")
-        return self.send_message(chat_id, "\n".join(lines).strip())
-
-    def send_meal_checkin(
-        self,
-        chat_id: int | str,
-        meals_today: list[PlannedMeal],
-        *,
-        week_start: str,
-        day: int,
-    ) -> list[dict[str, Any]]:
-        if not meals_today:
-            return self.send_message(
-                chat_id, "No meals planned for today to check in on."
-            )
-        lines = ["📋 Daily Meal Check-in", "How did today's meals go?", ""]
-        keyboard: list[list[dict[str, str]]] = []
-        for meal in meals_today:
-            meal_type = meal.meal_type.value
-            lines.append(f"• {meal_type.capitalize()}: {meal.name}")
-            keyboard.append(
-                [
-                    {
-                        "text": f"✅ {meal_type.capitalize()}",
-                        "callback_data": (
-                            f"checkin:{week_start}:{day}:{meal_type}:cooked"
-                        ),
-                    },
-                    {
-                        "text": f"❌ Skip {meal_type.capitalize()}",
-                        "callback_data": (
-                            f"checkin:{week_start}:{day}:{meal_type}:skipped"
-                        ),
-                    },
-                    {
-                        "text": f"🔄 Swap {meal_type.capitalize()}",
-                        "callback_data": (
-                            f"checkin:{week_start}:{day}:{meal_type}:swapped"
-                        ),
-                    },
-                ]
-            )
-        return self.send_message(
-            chat_id,
-            "\n".join(lines).strip(),
-            reply_markup={"inline_keyboard": keyboard},
         )
